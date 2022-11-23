@@ -45,7 +45,10 @@ img_initial = np.ones((Nx,Ny))
 # reconstruct
 
 maxiter=100
-img4,frames, residuals_AP = Alternating_projections(img_initial, illumination, Overlap, Split, data, maxiter = maxiter, img_truth = truth)
+img4,frames, residuals_AP = Alternating_projections(img_initial, illumination, Overlap, Split, data, refine_illumination = False, maxiter = maxiter, img_truth = truth)
+
+
+
 
 ############################
 

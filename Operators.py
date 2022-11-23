@@ -9,41 +9,38 @@ import numpy_groupies
 
 #import multiprocessing as mp
 
-# timers
+# timers: keep track of timing for different operators
 from timeit import default_timer as timer
 timers={'Overlap':0, 'Split':0, 'Project_data':0, 'Gramiam':0, 'Gramiam_completion':0, 'Precondition':0, 'Eigensolver':0, 'Sync_setup':0}
 
-def get_times():
+def get_times(): 
     return timers
 def reset_times():
     for keys in timers: timers[keys]=0
 
 
-def crop_center(img, cropx, cropy):
-    # crop an image
-       y, x = img.shape
-       startx = x // 2 - (cropx // 2)
-       starty = y // 2 - (cropy // 2)
-       return img[starty:starty + cropy, startx:startx + cropx]
+def make_probe(nx,ny, r1= 0.03, r2=0.06, fx = 0., fy = 0.):
+    """
+    make an illumination (probe) in a (nx, ny) frame shape
+    r1,r2 fractions of of the frame width 
+    fx,fy:  x-y quadradic fase (focus)
 
-
-def cropmat(img,size):
-    # crop an image to a given size
-    left0=math.floor((np.size(img,0)-size[0])/2)
-    right0=(size[0]+math.floor((np.size(img,0)-size[0])/2))
-    left1=math.floor((np.size(img,1)-size[1])/2)
-    right1=(size[1]+math.floor((np.size(img,1)-size[1])/2))
-    crop_img= img[left0:right0,left1:right1]
-    return crop_img
-
-
-def make_probe(nx,ny):
-    # make an illumination (probe)
-    xi=np.reshape(np.arange(1,nx+1)-nx/2,(nx,1))
+    """
+    xi=np.reshape(np.arange(0,nx)-nx/2,(nx,1))
+    
+    xi = np.fft.ifftshift(xi)
+    
     rr=np.sqrt(xi**2+(xi.T)**2)
-    r1= 0.030*nx #define zone plate circles
-    r2= 0.060*nx
-    Fprobe=np.fft.fftshift((rr>=r1) & (rr<=r2))
+    r1= r1*nx #define zone plate circles
+    r2= r2*nx
+
+    Fprobe=((rr>=r1) & (rr<=r2))
+    
+    
+    phase = np.exp(1j*fx*np.pi*((xi/nx)**2)) * np.exp(1j*fy*np.pi*((xi.T/nx)**2))
+    
+    Fprobe = Fprobe * phase
+    
     probe=np.fft.fftshift(np.fft.ifft2(Fprobe))
     probe=probe/max(abs(probe).flatten())
     return probe
@@ -51,10 +48,16 @@ def make_probe(nx,ny):
 
 # close packing translations    
 def make_translations(Dx,Dy,nnx,nny,Nx,Ny):
-    # make scan position
+    """ 
+     make scan positions using spacing Dx,Dy, number of steps nnx, nny, 
+     image width Nx,Ny. The lattice is periodic with close-packing arrangement
+     
+    """
+    
     ix,iy=np.meshgrid(np.arange(0,Dx*nnx,Dx)+Nx/2-Dx*nnx/2+1,
                       np.arange(0,Dy*nny,Dy)+Ny/2-Dy*nny/2+1)
     xshift=math.floor(Dx/2)*np.mod(np.arange(1,np.size(ix,1)+1),2)
+    # adding shift in the x-direction to make close-packing lattice 
     ix=np.transpose(np.add(np.transpose(ix),xshift))
     
     ix=ix-np.min(ix)
@@ -64,11 +67,15 @@ def make_translations(Dx,Dy,nnx,nny,Nx,Ny):
     ix=np.reshape(ix,(nnx*nny,1,1))
     iy=np.reshape(iy,(nnx*nny,1,1))
     
-    #+1 to account for counting
+    
     return ix,iy
     
 
 def map_frames(translations_x,translations_y,nx,ny,Nx,Ny):
+    """
+    return frame mapping: frames = image[mapid]
+    """
+
     # map frames to image indices 
     translations_x=np.reshape(np.transpose(translations_x),(np.size(translations_x),1,1))
     translations_y=np.reshape(np.transpose(translations_y),(np.size(translations_y),1,1))
@@ -111,6 +118,25 @@ def Overlap_plan(translations_x,translations_y,nx,ny,Nx,Ny):
     mapid=map_frames(translations_x,translations_y,nx,ny,Nx,Ny)  
     Overlap = lambda frames: Overlapc(frames,Nx,Ny,mapid)
     return Overlap
+
+
+
+def crop_center(img, cropx, cropy):
+    # crop an image
+       y, x = img.shape
+       startx = x // 2 - (cropx // 2)
+       starty = y // 2 - (cropy // 2)
+       return img[starty:starty + cropy, startx:startx + cropx]
+
+
+def cropmat(img,size):
+    # crop an image to a given size
+    left0=math.floor((np.size(img,0)-size[0])/2)
+    right0=(size[0]+math.floor((np.size(img,0)-size[0])/2))
+    left1=math.floor((np.size(img,1)-size[1])/2)
+    right1=(size[1]+math.floor((np.size(img,1)-size[1])/2))
+    crop_img= img[left0:right0,left1:right1]
+    return crop_img
 
 
 

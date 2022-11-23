@@ -4,7 +4,46 @@ from Operators import Illuminate_frames, Project_data, synchronize_frames_c, mse
 
 
 from Operators import Replicate_frame
-def Alternating_projections(img, illumination, Overlap, Split, frames_data, maxiter = 100, normalization = None, img_truth = None):
+def Alternating_projections(img, illumination, Overlap, Split, frames_data, refine_illumination = False, maxiter = 100, normalization = None, img_truth = None):
+    """
+    Parameters
+    ----------
+    img : 2d matrix
+        reconstructed image.
+    illumination : 2d matrix
+        ukkynubatuib.
+    Overlap : TYPE
+        DESCRIPTION.
+    Split : TYPE
+        DESCRIPTION.
+    frames_data : TYPE
+        Data.
+    refine_illumination : bool, optional
+        DESCRIPTION. The default is False.
+    maxiter : TYPE, optional
+        max iterations. The default is 100.
+    normalization : 2d matrix, optional
+        normalization, computed internally if None. The default is None.
+    img_truth : TYPE, optional
+        truth, used to compare . The default is None.
+
+    Returns
+    -------
+    img : TYPE
+        image.
+    frames : TYPE
+        frames.
+    residuals : matrix shape (3, maxiter)
+        normalized residuals: 
+            0) | img - f truth|; 
+            1) | |F(frames)| - |data||
+            2) | frames_new - frames_old|
+    
+
+    """
+
+
+    
 
     # we need the frames norm to normalize
     frames_norm = np.linalg.norm(np.sqrt(frames_data))
@@ -25,7 +64,10 @@ def Alternating_projections(img, illumination, Overlap, Split, frames_data, maxi
         normalization=Overlap(Replicate_frame(np.abs(illumination)**2,nframes)) #check
 
         
-        
+    refine_illumination = 1
+    eps_illum = None
+    eps0 = 1e-2
+    
     for ii in np.arange(maxiter):
         # data projection
         frames, mse_data = Project_data(frames,frames_data)
@@ -36,6 +78,16 @@ def Alternating_projections(img, illumination, Overlap, Split, frames_data, maxi
         ##################
         # overlap projection
         img= Overlap(Illuminate_frames(frames,np.conj(illumination)))/normalization
+        
+        if ii>5 and refine_illumination:
+            frames_split= Split(img)
+            norm_frames = np.sum(np.abs(frames_split)**2,0)
+            if type(eps_illum) == type(None):
+                eps_illum = np.max(norm_frames)*eps0
+            
+            illumination = np.sum(frames*np.conj(Split(img)) + eps0 * illumination,0)/(norm_frames+eps_illum)
+            normalization=Overlap(Replicate_frame(np.abs(illumination)**2,nframes)) #check
+            
         
         frames = Illuminate_frames(Split(img),illumination)
 
