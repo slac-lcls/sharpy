@@ -47,6 +47,21 @@ img_initial = np.ones((Nx,Ny))
 maxiter=100
 img4,frames, residuals_AP = Alternating_projections(img_initial, illumination, Overlap, Split, data, refine_illumination = False, maxiter = maxiter, img_truth = truth)
 
+#%%
+
+illumination=np.array(fid['probe'], dtype = np.complex64)
+
+lens_true=np.fft.fft2(np.fft.fftshift(illumination))
+lens_init=np.abs(lens_true) # remove true phase
+illum_init=np.fft.fftshift(np.fft.ifft2(lens_init))
+
+
+print('not refining illumination, starting with the wrong one')
+img3,frames, residuals_AP = Alternating_projections(img_initial, illum_init, Overlap, Split, data, refine_illumination = False, maxiter = maxiter, img_truth = truth)
+
+print('refining illumination')
+img2,frames, residuals_AP = Alternating_projections(img_initial, illum_init, Overlap, Split, data, refine_illumination = True, maxiter = maxiter, img_truth = truth)
+
 
 
 
