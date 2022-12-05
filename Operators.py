@@ -4,8 +4,12 @@ Ptycho operators
 """
 import numpy as np
 import scipy as sp
+
 import math
 import numpy_groupies
+import cupy as cp
+xp = cp
+import cupyx.scipy.sparse as sparse
 
 #import multiprocessing as mp
 
@@ -26,22 +30,22 @@ def make_probe(nx,ny, r1= 0.03, r2=0.06, fx = 0., fy = 0.):
     fx,fy:  x-y quadradic fase (focus)
 
     """
-    xi=np.reshape(np.arange(0,nx)-nx/2,(nx,1))
+    xi=xp.reshape(xp.arange(0,nx)-nx/2,(nx,1))
     
-    xi = np.fft.ifftshift(xi)
+    xi = xp.fft.ifftshift(xi)
     
-    rr=np.sqrt(xi**2+(xi.T)**2)
+    rr=xp.sqrt(xi**2+(xi.T)**2)
     r1= r1*nx #define zone plate circles
     r2= r2*nx
 
     Fprobe=((rr>=r1) & (rr<=r2))
     
     
-    phase = np.exp(1j*fx*np.pi*((xi/nx)**2)) * np.exp(1j*fy*np.pi*((xi.T/nx)**2))
+    phase = xp.exp(1j*fx*xp.pi*((xi/nx)**2)) * xp.exp(1j*fy*xp.pi*((xi.T/nx)**2))
     
     Fprobe = Fprobe * phase
     
-    probe=np.fft.fftshift(np.fft.ifft2(Fprobe))
+    probe=xp.fft.fftshift(xp.fft.ifft2(Fprobe))
     probe=probe/max(abs(probe).flatten())
     return probe
     
@@ -54,22 +58,23 @@ def make_translations(Dx,Dy,nnx,nny,Nx,Ny):
      
     """
     
-    ix,iy=np.meshgrid(np.arange(0,Dx*nnx,Dx)+Nx/2-Dx*nnx/2+1,
-                      np.arange(0,Dy*nny,Dy)+Ny/2-Dy*nny/2+1)
-    xshift=math.floor(Dx/2)*np.mod(np.arange(1,np.size(ix,1)+1),2)
+    ix,iy=xp.meshgrid(xp.arange(0,Dx*nnx,Dx)+Nx/2-Dx*nnx/2+1,
+                      xp.arange(0,Dy*nny,Dy)+Ny/2-Dy*nny/2+1)
+    xshift=math.floor(Dx/2)*xp.mod(xp.arange(1,xp.size(ix,1)+1),2)
     # adding shift in the x-direction to make close-packing lattice 
-    ix=np.transpose(np.add(np.transpose(ix),xshift))
+    ix=xp.transpose(xp.add(xp.transpose(ix),xshift))
     
-    ix=ix-np.min(ix)
-    iy=iy-np.min(iy)
+    ix=ix-xp.min(ix)
+    iy=iy-xp.min(iy)
     
     
-    ix=np.reshape(ix,(nnx*nny,1,1))
-    iy=np.reshape(iy,(nnx*nny,1,1))
+    ix=xp.reshape(ix,(nnx*nny,1,1))
+    iy=xp.reshape(iy,(nnx*nny,1,1))
     
     
     return ix,iy
     
+
 
 def map_frames(translations_x,translations_y,nx,ny,Nx,Ny):
     """
@@ -77,37 +82,67 @@ def map_frames(translations_x,translations_y,nx,ny,Nx,Ny):
     """
 
     # map frames to image indices 
-    translations_x=np.reshape(np.transpose(translations_x),(np.size(translations_x),1,1))
-    translations_y=np.reshape(np.transpose(translations_y),(np.size(translations_y),1,1))
+    translations_x=xp.reshape(xp.transpose(translations_x),(xp.size(translations_x),1,1))
+    translations_y=xp.reshape(xp.transpose(translations_y),(xp.size(translations_y),1,1))
 
     
-    xframeidx,yframeidx=np.meshgrid(np.arange(nx),np.arange(ny))
-    # print('translations shapes:',np.shape(translations_x),'frameidx',np.shape(xframeidx))
+    xframeidx,yframeidx=xp.meshgrid(xp.arange(nx),xp.arange(ny))
+    # print('translations shapes:',xp.shape(translations_x),'frameidx',xp.shape(xframeidx))
     
-    spv_x=np.add(xframeidx,translations_x) 
-    spv_y=np.add(yframeidx,translations_y) 
+    spv_x=xp.add(xframeidx,translations_x) 
+    spv_y=xp.add(yframeidx,translations_y) 
     
-    mapidx=np.mod(spv_x,Nx)
-    mapidy=np.mod(spv_y,Ny)
-    mapid=np.add(mapidx,mapidy*Nx) 
-    #mapid=np.add(mapidx*Nx,mapidy) 
-    mapid=mapid.astype(int)
+    # enforce periodic boundaries
+    mapidx=xp.mod(spv_x,Nx)
+    mapidy=xp.mod(spv_y,Ny)
+    
+    mapid=xp.add(mapidx,mapidy*Nx) 
+    #mapid=xp.add(mapidx*Nx,mapidy) 
+    mapid=mapid.astype(np.uint32)
+    
     return mapid
     
 
 def Splitc(img,mapid):
-    time0=timer()
     # Split an image into frames given mapping
+    time0=timer()
     frames_out = (img.ravel())[mapid]
     timers['Split']+=timer()-time0
     return frames_out
 
 def Overlapc(frames,Nx,Ny, mapid): #check
-    # overlap frames onto an image
+    # overlap frames onto an image using aggregate function
     time0=timer()
-    accum = np.reshape(numpy_groupies.aggregate(mapid.ravel(),frames.ravel()),(Nx,Ny))
+    accum = xp.reshape(numpy_groupies.aggregate(mapid.ravel(),frames.ravel()),(Nx,Ny))
+    
     timers['Overlap']+=timer()-time0
     return accum
+
+def Overlapd(frames,SS,shape): #check
+    # overlap frames onto an image using SPmV and reshape
+    
+    time0=timer()
+    output = SS*frames.ravel()
+    output.shape=shape
+    timers['Overlap']+=timer()-time0
+    return output
+#    accum = xp.reshape(numpy_groupies.aggregate(mapid.ravel(),frames.ravel()),(Nx,Ny))
+    
+
+
+
+def Split_Overlap_plan(translations_x,translations_y,nx,ny,Nx,Ny):
+    mapid=map_frames(translations_x,translations_y,nx,ny,Nx,Ny)  
+
+    # for cupy we need a sparse matrix
+    col = xp.arange(mapid.size)
+    val = xp.ones((mapid.size),dtype=np.float32)
+    SS=sparse.coo_matrix((val.ravel(),(mapid.ravel(),col.ravel())))
+    SS=sparse.csr_matrix(SS)
+
+    Split = lambda img: Splitc(img,mapid)
+    Overlap = lambda frames: Overlapd(frames,SS,(Nx,Ny))
+    return Split, Overlap
 
 def Split_plan(translations_x,translations_y,nx,ny,Nx,Ny):
     mapid=map_frames(translations_x,translations_y,nx,ny,Nx,Ny)  
@@ -131,10 +166,10 @@ def crop_center(img, cropx, cropy):
 
 def cropmat(img,size):
     # crop an image to a given size
-    left0=math.floor((np.size(img,0)-size[0])/2)
-    right0=(size[0]+math.floor((np.size(img,0)-size[0])/2))
-    left1=math.floor((np.size(img,1)-size[1])/2)
-    right1=(size[1]+math.floor((np.size(img,1)-size[1])/2))
+    left0=math.floor((xp.size(img,0)-size[0])/2)
+    right0=(size[0]+math.floor((xp.size(img,0)-size[0])/2))
+    left1=math.floor((xp.size(img,1)-size[1])/2)
+    right1=(size[1]+math.floor((xp.size(img,1)-size[1])/2))
     crop_img= img[left0:right0,left1:right1]
     return crop_img
 
@@ -142,29 +177,29 @@ def cropmat(img,size):
 
 def Overlapc0(frames,Nx,Ny,mapid):
     
-    #ret = np.bincount(mapid, weights=frames.real)+1j*np.bincount(mapid, weights=frames.imag)
-    ret = np.bincount(mapid.ravel(), weights=(frames.ravel()).real)+np.bincount(mapid.ravel(), weights=(frames.ravel()).imag)
+    #ret = xp.bincount(mapid, weights=frames.real)+1j*xp.bincount(mapid, weights=frames.imag)
+    ret = xp.bincount(mapid.ravel(), weights=(frames.ravel()).real)+xp.bincount(mapid.ravel(), weights=(frames.ravel()).imag)
     ret.shape=(Nx,Ny)
     return ret
 
 # broadcast
 def Illuminate_frames(frames,Illumination):
-    Illuminated=frames*np.reshape(Illumination,(1,np.shape(Illumination)[0],np.shape(Illumination)[1]))
+    Illuminated=frames*xp.reshape(Illumination,(1,xp.shape(Illumination)[0],xp.shape(Illumination)[1]))
     return Illuminated
   
 def Replicate_frame(frame,nframes):
     # replicate a frame along the first dimension
-    Replicated= np.repeat(frame[np.newaxis,:, :], nframes, axis=0)
+    Replicated= xp.repeat(frame[xp.newaxis,:, :], nframes, axis=0)
     return Replicated
 
 def Sum_frames(frames):
-    Summed=np.add(frames,axis=0)
+    Summed=xp.add(frames,axis=0)
     return Summed
 
 def Stack_frames(frames,omega):
     # multiply frames by a vector in the first dimension
     omega=omega.reshape([len(omega),1,1])
-    #stv=np.multiply(frames,omega)
+    #stv=xp.multiply(frames,omega)
     stv=frames*omega
     return stv
 
@@ -195,9 +230,9 @@ def braket(ystackl,ystackr,dd,bw):
     dxi=dd.real
     dyi=dd.imag
     
-    #bracket=np.sum(np.multiply(bra(ystackl[jj],nx,ny,-dxi,-dyi),ket(ystackr[ii],nx,ny,dxi,dyi)))
-    #bracket=np.vdot(bra(ystackl[jj],nx,ny,-dxi,-dyi),ket(ystackr[ii],nx,ny,dxi,dyi))
-    bket=np.vdot(bra(ystackl,-dxi,-dyi,bw),ket(ystackr,dxi,dyi,bw))
+    #bracket=xp.sum(xp.multiply(bra(ystackl[jj],nx,ny,-dxi,-dyi),ket(ystackr[ii],nx,ny,dxi,dyi)))
+    #bracket=xp.vdot(bra(ystackl[jj],nx,ny,-dxi,-dyi),ket(ystackr[ii],nx,ny,dxi,dyi))
+    bket=xp.vdot(bra(ystackl,-dxi,-dyi,bw),ket(ystackr,dxi,dyi,bw))
     
     
     return bket
@@ -216,8 +251,8 @@ def Gramiam_calc(framesl,framesr,plan):
     
     nframes=framesl.shape[0]
     nnz=len(col)
-    #val=np.empty((nnz,1),dtype=framesl.dtype)
-    #val = shared_array(shape=(nnz),dtype=np.complex128)
+    #val=xp.empty((nnz,1),dtype=framesl.dtype)
+    #val = shared_array(shape=(nnz),dtype=xp.complex128)
  
     def braket_i(ii):
         val[ii] = braket(framesl[col[ii]],framesr[row[ii]],dd[ii],bw)
@@ -244,16 +279,16 @@ def Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny,bw =0):
     #calculates the difference of the coordinates between all frames
     dx=translations_x.ravel(order='F').reshape(nframes,1)
     dy=translations_y.ravel(order='F').reshape(nframes,1)
-    dx=np.subtract(dx,np.transpose(dx))
-    dy=np.subtract(dy,np.transpose(dy))
+    dx=xp.subtract(dx,xp.transpose(dx))
+    dy=xp.subtract(dy,xp.transpose(dy))
     
     #calculates the wrapping effect for a period boundary
     dx=-(dx+Nx*((dx < (-Nx/2)).astype(float)-(dx > (Nx/2)).astype(float)))
     dy=-(dy+Ny*((dy < (-Ny/2)).astype(float)-(dy > (Ny/2)).astype(float)))    
  
     #find the frames idex that overlaps
-    #col,row=np.where(np.tril(np.logical_and(abs(dy)< nx,abs(dx) < ny)).T)
-    col,row=np.where(np.tril((abs(dy)< nx-2*bw)*(abs(dx) < ny-2*bw)).T)
+    #col,row=xp.where(xp.tril(xp.logical_and(abs(dy)< nx,abs(dx) < ny)).T)
+    col,row=xp.where(xp.tril((abs(dy)< nx-2*bw)*(abs(dx) < ny-2*bw)).T)
 
     # complex displacement (x, 1j y)
     # why are col-row swapped?
@@ -262,8 +297,8 @@ def Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny,bw =0):
     #col,row,dd=frames_overlap(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw)
  
     nnz=col.size
-#    val=np.empty((nnz,1),dtype=np.complex128)
-    val = shared_array(shape=(nnz,1),dtype=np.complex128)
+#    val=xp.empty((nnz,1),dtype=xp.complex128)
+    val = shared_array(shape=(nnz,1),dtype=xp.complex128)
     
     plan={'col':col,'row':row,'dd':dd, 'val':val,'bw':bw}
     #Gramiam = lambda framesl,framesr: Gramiam_calc(framesl,framesr,plan)
@@ -278,7 +313,7 @@ def Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny,bw =0):
 def Precondition(H,frames, bw = 0):
     time0=timer()
     fw,fh=frames.shape[1:]
-    frames_norm=np.linalg.norm(frames[:,bw:fw-bw ,bw:fh-bw],axis=(1,2))
+    frames_norm=xp.linalg.norm(frames[:,bw:fw-bw ,bw:fh-bw],axis=(1,2))
     D=sp.sparse.diags(1/frames_norm)
     H1=D @ H @ D
     #H1=(H1+H1.getH())/2
@@ -290,9 +325,9 @@ from scipy.sparse.linalg import eigsh
 def Eigensolver(H):
     time0=timer()
     
-    nframes=np.shape(H)[0]
+    nframes=xp.shape(H)[0]
     #print('nframes',nframes)
-    v0=np.ones((nframes,1))
+    v0=xp.ones((nframes,1))
     eigenvalues, eigenvectors = eigsh(H, k=1,which='LM',v0=v0, tol=1e-9)
     #eigenvalues, eigenvectors = eigsh(H, k=1,which='LM',v0=v0, tol=0)
     #eigenvalues, eigenvectors = eigsh(H, k=2,which='LM',v0=v0)
@@ -300,15 +335,15 @@ def Eigensolver(H):
     omega=eigenvectors[:,0]
     timers['Eigensolver']+=timer()-time0
 
-    omega=omega/np.abs(omega)
+    omega=omega/xp.abs(omega)
     
     # subtract the average phase
-    so=np.conj(np.sum(omega))
+    so=xp.conj(xp.sum(omega))
     so/=abs(so)    
     omega*=so
     ########
     
-    omega=np.reshape(omega,(nframes,1,1))
+    omega=xp.reshape(omega,(nframes,1,1))
     return omega
 
 
@@ -318,7 +353,7 @@ def synchronize_frames_c(frames, illumination, normalization,plan, bw=0):
     # Gramiam = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
 
     time0=timer()   
-    framesl=Illuminate_frames(frames,np.conj(illumination))
+    framesl=Illuminate_frames(frames,xp.conj(illumination))
     framesr=framesl*normalization    
     timers['Sync_setup']+=timer()-time0
 
@@ -345,30 +380,30 @@ def synchronize_frames_c(frames, illumination, normalization,plan, bw=0):
 
 def mse_calc(img0,img1):
     # calculate the MSE between two images after global phase correction
-    nnz=np.size(img0)
+    nnz=xp.size(img0)
     # compute the best phase
-    phase=np.dot(np.reshape(np.conj(img1),(1,nnz)),np.reshape(img0,(nnz,1)))[0,0]
-    phase=phase/np.abs(phase)
+    phase=xp.dot(xp.reshape(xp.conj(img1),(1,nnz)),xp.reshape(img0,(nnz,1)))[0,0]
+    phase=phase/xp.abs(phase)
     # compute norm after correcting the phase
-    mse=np.linalg.norm(img0-img1*phase)
+    mse=xp.linalg.norm(img0-img1*phase)
     return mse
 
 def Propagate(frames):
     # simple propagation
-    return np.fft.fft2(frames)
+    return xp.fft.fft2(frames)
 
 def IPropagate(frames):
     # simple inverse propagation
-    return np.fft.ifft2(frames)
+    return xp.fft.ifft2(frames)
 
 eps = 1e-8
 def Project_data(frames,frames_data):
     time0=timer()
     # apply Fourier magnitude projections
     frames = Propagate(frames)
-    mse = np.linalg.norm(np.abs(frames)-np.sqrt(frames_data))
+    mse = xp.linalg.norm(xp.abs(frames)-xp.sqrt(frames_data))
 
-    frames *= np.sqrt((frames_data+eps)/(np.abs(frames)**2+eps))
+    frames *= xp.sqrt((frames_data+eps)/(xp.abs(frames)**2+eps))
     frames = IPropagate(frames)
     timers['Project_data']+=timer()-time0
     return frames, mse
@@ -388,7 +423,7 @@ def shared_array(shape=(1,), dtype=np.float32):
                         np.complex64: ctypes.c_float}
 
     numel = np.int(np.prod(shape))
-    iscomplex=(dtype == np.complex128 or dtype == np.complex64)
+    iscomplex=(dtype == np.complex128 or dtype == xp.complex64)
     #numel *= 
     arr_ctypes = sharedctypes.RawArray(np_type_to_ctype[dtype], numel*(1+iscomplex))
     np_arr = np.frombuffer(arr_ctypes, dtype=dtype, count=numel)
