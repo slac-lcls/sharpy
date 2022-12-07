@@ -49,8 +49,6 @@ img4,frames, residuals_AP = Alternating_projections(img_initial, illumination, O
 
 #%%
 
-illumination=np.array(fid['probe'], dtype = np.complex64)
-
 lens_true=np.fft.fft2(np.fft.fftshift(illumination))
 lens_init=np.abs(lens_true) # remove true phase
 illum_init=np.fft.fftshift(np.fft.ifft2(lens_init))
