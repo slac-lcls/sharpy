@@ -111,8 +111,8 @@ print(
     "not refining illumination, starting with good one, maxiter:",
     maxiter,
 )
-residuals_interval = 1
-residuals_interval = np.inf
+#residuals_interval = np.inf
+residuals_interval = 10
 
 
 img4, frames, illum, residuals_AP = Alternating_projections(
@@ -132,6 +132,8 @@ print("total time:", timer() - t0)
 
 """
 
+=======
+>>>>>>> e7496afc69877ad027d0898523ae5e0f03a11448
 lens_true=xp.fft.fft2(xp.fft.fftshift(illumination))
 lens_init=xp.abs(lens_true) # remove true phase
 illum_init=xp.fft.fftshift(xp.fft.ifft2(lens_init))
