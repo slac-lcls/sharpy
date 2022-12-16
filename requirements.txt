@@ -1,9 +1,6 @@
 numpy
 scipy
-math
 numpy_groupies
 cupy
-timeit
-copy
 h5py
 matplotlib
