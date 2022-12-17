@@ -41,5 +41,5 @@ jobs:
     #    pytest
     - name: Generate coverage report from pytest
       run: |
-        echo "::set-env name=PYTHONPATH::/home/runner/work/sharpy"
+        echo "::set-env name=PYTHONPATH::/home/runner/work/sharpy/sharpy/sharpy"
         pytest --cov=./ --cov-report=xml
