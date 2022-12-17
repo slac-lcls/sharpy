@@ -1,1 +1,1 @@
-from wallet import *
+from sharpy.wallet import *
