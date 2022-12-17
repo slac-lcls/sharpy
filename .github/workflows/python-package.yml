@@ -3,15 +3,15 @@
 
 name: Python package
 
-steps:
-  - name: Set the value
-    id: step_one
-    run: |
-      echo "PYTHONPATH=/home/runner/work/sharpy/sharpy/sharpy" >> $GITHUB_ENV
-  - name: Use the value
-    id: step_two
-    run: |
-      echo "${{ env.action_state }}" # This will output 'yellow'
+#steps:
+#  - name: Set the value
+#    id: step_one
+#    run: |
+#      echo "PYTHONPATH=/home/runner/work/sharpy/sharpy/sharpy" >> $GITHUB_ENV
+#  - name: Use the value
+#    id: step_two
+#    run: |
+#      echo "${{ env.action_state }}" # This will output 'yellow'
 
 on:
   push:
