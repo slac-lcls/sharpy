@@ -7,7 +7,6 @@ import scipy as sp
 
 import math
 import numpy_groupies
-import cupy as cp
 
 import config
 
@@ -15,10 +14,12 @@ GPU = config.GPU
 
 
 if GPU:
+    import cupy as cp
     xp = cp
     import cupyx.scipy.sparse as sparse
     from fft_plan import fft2, ifft2
     import cupyx as cpx
+    import cupy as cp
 
 else:
     xp = np
@@ -241,7 +242,7 @@ def make_probe(nx, ny, r1=0.03, r2=0.06, fx=0.0, fy=0.0):
     fx,fy:  x-y quadradic fase (focus)
 
     """
-    xi = xp.reshape(xp.arange(0, nx) - nx / 2, (nx, 1))
+    xi = xp.reshape(xp.arange(0, nx) - nx / 2, (nx, 1)) 
 
     xi = xp.fft.ifftshift(xi)
 
@@ -406,10 +407,10 @@ def Overlapc0(frames, Nx, Ny, mapid):
 # broadcast
 def Illuminate_frames(frames, Illumination):
     # frames =frames*xp.reshape(Illumination,(1,xp.shape(Illumination)[0],xp.shape(Illumination)[1]))
-    frames *= xp.reshape(
+    Illuminated = frames * xp.reshape(
         Illumination, (1, xp.shape(Illumination)[0], xp.shape(Illumination)[1])
     )
-    return frames
+    return Illuminated
 
 
 def Replicate_frame(frame, nframes):
@@ -483,6 +484,9 @@ def Gramiam_calc(framesl, framesr, plan):
     nnz = len(col)
     # val=xp.empty((nnz,1),dtype=framesl.dtype)
     # val = shared_array(shape=(nnz),dtype=xp.complex128)
+    
+    #col=np.array([np.argwhere(col[i]==np.unique(col)) for i in range(np.size(col))]).ravel()
+    #row=np.array([np.argwhere(row[i]==np.unique(row)) for i in range(np.size(row))]).ravel()
 
     def braket_i(ii):
         val[ii] = braket(framesl[col[ii]], framesr[row[ii]], dd[ii], bw)
@@ -623,6 +627,9 @@ def mse_calc(img0, img1):
     mse = xp.linalg.norm(img0 - img1 * phase)
     return mse
 
+def common_scale(img0,img1):
+    scale = xp.dot(img0.ravel(),img1.ravel()) / xp.dot(img0.ravel(),img0.ravel())   
+    return scale
 
 import ctypes
 from multiprocessing import sharedctypes

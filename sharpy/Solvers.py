@@ -1,5 +1,4 @@
 import numpy as np
-import cupy as cp
 from timeit import default_timer as timer
 from Operators import (
     Illuminate_frames,
@@ -14,6 +13,7 @@ import config
 GPU = config.GPU
 
 if GPU:
+    import cupy as cp
     xp = cp
     mempool = cp.get_default_memory_pool()
 else:
@@ -33,6 +33,7 @@ timers = {
     "solver_loop": 0,
     "ProxD": 0,
     "Overlap": 0,
+    "Sync": 0,
     "illuminate&split": 0,
     "refine_illumination": 0,
     "mse_step": 0,
@@ -123,22 +124,28 @@ def refine_illumination_function(
 
 
 def Alternating_projections(
+    sync,
     img,
+    Gramiam,
     illumination,
     Overlap,
     Split,
     frames_data,
-    refine_illumination=False,
-    maxiter=100,
-    normalization=None,
-    img_truth=None,
-    residuals_interval=1,
+    refine_illumination,
+    maxiter,
+    normalization,
+    img_truth,
+    residuals_interval,
 ):
     """
     Parameters
     ----------
+    sync : bool 
+        synchronization
     img : 2d matrix
         reconstructed image.
+    Gramiam:
+        
     illumination : 2d matrix
         ukkynubatuib.
     Overlap : TYPE
@@ -239,6 +246,11 @@ def Alternating_projections(
     # refine_illumination = 1
     # eps_illum = None
     # eps0 = 1e-2
+    
+    if sync == True:
+        inormalization_split = Split(1/(normalization))
+        #inormalization_split = Split(1/(normalization+1e-8))
+        
     timers["solver_init"] = timer() - t00
     t00 = timer()
     if GPU:
@@ -255,6 +267,7 @@ def Alternating_projections(
         print("----")
 
     compute_residuals = False
+    
     for ii in xp.arange(maxiter):
         # data projection
         t0 = timer()
@@ -279,14 +292,24 @@ def Alternating_projections(
 
         frames_old = frames + 0.0  # make a copy
         timers["copies"] += timer() - t0
-        t0 = timer()
 
         # if GPU and ii<2:
         #     print('in loop, after copy memory used, and total normalized:', mempool.used_bytes()/frames_data.nbytes,mempool.total_bytes()/frames_data.nbytes )
         #     print('----')
 
+        ####################
+        # here goes the synchronization
+        if sync==True:
+            t0 = timer()
+            omega=synchronize_frames_c(frames, illumination, inormalization_split, Gramiam)
+            frames=frames*omega
+            timers["Sync"] += timer() - t0
+           
+        ##################
+        
         ##################
         # overlap projection
+        t0 = timer()
         img = Overlap(Illuminate_frames(frames, xp.conj(illumination))) / normalization
         timers["Overlap"] += timer() - t0
 

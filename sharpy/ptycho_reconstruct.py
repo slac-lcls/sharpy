@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import numpy as np
-import cupy as cp
 import copy
 import h5py
 import matplotlib.pyplot as plt
@@ -10,12 +9,15 @@ from Operators import Split_Overlap_plan
 import Solvers
 from Operators import get_times, reset_times, normalize_times
 import config
+from Operators import Gramiam_plan, Replicate_frame
 
 Alternating_projections = Solvers.Alternating_projections
 reset_times()
-GPU = False#config.GPU
+GPU = config.GPU #False
+sync = True
 
 if GPU:
+    import cupy as cp
     xp = cp
     print("using GPU")
 else:
@@ -55,7 +57,7 @@ Nx = xp.int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
 Ny = Nx
 
 
-#%%
+#
 if GPU:
     mempool = cp.get_default_memory_pool()
     print(
@@ -89,32 +91,44 @@ if GPU:
     print("data size", data.nbytes)
     print("----")
 
+if sync == True:
+   Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
+
+else: 
+   Gplan = None
+
+
+
 img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
 ############################
 # reconstruct
-
+refine_illumination = False
 maxiter = 100
+# residuals_interval = np.inf
+residuals_interval = 1
+
 t0 = timer()
 print("geometry: img size:", (Nx, Ny), "frames:", (nx, ny, nframes))
 print(
     "not refining illumination, starting with good one, maxiter:",
     maxiter,
 )
-# residuals_interval = np.inf
-residuals_interval = 10
-
 
 img4, frames, illum, residuals_AP = Alternating_projections(
+    sync,
     img_initial,
+    Gplan,
     illumination,
     Overlap,
     Split,
     data,
-    refine_illumination=False,
-    maxiter=maxiter,
-    img_truth=truth,
-    residuals_interval=residuals_interval,
+    refine_illumination,
+    maxiter,
+    normalization=None,
+    img_truth =truth,
+    residuals_interval = residuals_interval
 )
+
 print("total time:", timer() - t0)
 
 ############################

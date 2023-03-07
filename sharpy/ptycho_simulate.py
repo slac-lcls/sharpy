@@ -11,7 +11,7 @@ GPU = config.GPU
 
 
 # define simulation dimensions (frames, step, image)
-nx = 128  # frame size
+nx = 16  # frame size
 Dx = 5  # Step size
 nnx=16 # number of frames in x direction
 # nnx=40 # number of frames in x direction
@@ -35,7 +35,9 @@ Ny = Dy * nny
 # we need: image, illumination, scan pattern
 
 # make the illumination (astigmatic i.e. fx, fy different from 0)
-illumination = make_probe(nx, ny, r1=0.03, r2=0.06, fx=+20, fy=-20)
+#illumination = make_probe(nx, ny, r1=0.03, r2=0.06, fx=+20, fy=-20)
+illumination = make_probe(nx, ny, r1=0.025*3, r2=0.085*3, fx=+20, fy=-20)
+
 #############################
 # create translations (in pixels) using close packing
 translations_x, translations_y = make_translations(Dx, Dy, nnx, nny, Nx, Ny)
@@ -45,11 +47,12 @@ translations_x, translations_y = make_translations(Dx, Dy, nnx, nny, Nx, Ny)
 from PIL import Image
 
 img0 = np.array(Image.open("../data/gold_balls.png"), np.float32) / 63.0
-# img0=img0+1j # simple complex
+#img0=img0+1j # simple complex
 img0 = np.exp(0.69 * (-1 + 0.5 * 1j) * img0)  # more realistic
 
 # set image dimension:
-Nx = np.int(np.ceil(np.max(translations_x) - np.min(translations_x)))
+Nx = int(np.ceil(np.max(translations_x) - np.min(translations_x)))
+#why not Nx +=  Nx + nx
 Ny = Nx
 
 from time import sleep
@@ -73,6 +76,7 @@ thres = np.finfo(truth.dtype).eps * 1e2
 Split = Split_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 # generate frames from truth:
+  
 frames = Illuminate_frames(Split(truth), illumination)  # check
 
 ## keep the data fftshifted
