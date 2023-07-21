@@ -586,11 +586,13 @@ def Gramiam_calc_cuda(frames, plan,illumination,normalization):
 #    #include <thrust/device_vector.h>
 #    #include <thrust/complex.h>
 #    thrust::device_vector<thrust::complex<float>> value(nframes);
+#    #include <iostream>
     t0 = timer()
     value = xp.zeros(nnz,dtype = xp.complex64)
-    cp.RawKernel(zQQz_raw_kernel,"dotp")\
+    cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
         ((int(nblocks),),(int(nthreads),), \
          (value,framesl,framesr,col,row,dx,dy, nnz, frame_height, frame_width))
+    print('Bye')
     # Try cupy sparse
     timers['Gramiam'] = timer() - t0
     
