@@ -6,6 +6,6 @@ Created on Tue Dec  6 20:43:43 2022
 @author: smarchesini
 """
 
-#GPU = True
-
 GPU = True
+
+#GPU = False

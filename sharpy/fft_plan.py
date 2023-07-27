@@ -7,7 +7,7 @@ plan2D = None
 # print("Plan1D",plan1D)
 owrite = True
 Plan = True
-debug = True
+
 
 def fft_reset(x):
     global plan1D

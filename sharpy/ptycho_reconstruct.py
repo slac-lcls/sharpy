@@ -27,7 +27,12 @@ else:
 
 ##################################################
 # input data
-fname_in = "simulation_test.h5"
+fname_in = "simulation_small.h5"
+
+import sys
+# Retrieve the value of 'fname' from the command-line arguments
+#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
+
 fid = h5py.File(fname_in, "r")
 
 data = xp.array(fid["data"], dtype=xp.float32)
@@ -92,6 +97,7 @@ if GPU:
     print("----")
 
 if sync == True:
+   #calculate the preconditioner here
    Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
 
 else: 
@@ -100,11 +106,11 @@ else:
 
 
 #img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
-img_initial = xp.ones((Nx, Ny), dtype=xp.complex128) #Need to match datatype in operators fft Plan2D
+img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) #Need to match datatype in operators fft Plan2D
 ############################
 # reconstruct
 refine_illumination = False
-maxiter = 1
+maxiter = 30
 # residuals_interval = np.inf
 residuals_interval = 1
 
@@ -205,7 +211,7 @@ plt.title("Ground truth", fontsize=10)
 plt.imshow(abs(truth), cmap="gray")
 plt.colorbar()
 plt.subplot(1, 3, 2)
-plt.title("Alternating Projections\n no Sync:%2.2g" % (nmse4), fontsize=10)
+plt.title("Alternating Projections\n Sync:%2.2g" % (nmse4), fontsize=10)
 plt.imshow(abs(img), cmap="gray")
 plt.colorbar()
 plt.subplot(1, 3, 3)

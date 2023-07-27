@@ -16,7 +16,13 @@ GPU = config.GPU
 # define simulation dimensions (frames, step, image)
 nx = 16  # frame size
 Dx = 5  # Step size
-nnx=16 # number of frames in x direction
+nnx=8 # number of frames in x direction
+
+# define larger simulation dimensions (frames, step, image)
+#nx = 64  # frame size
+#Dx = 16  # Step size
+#nnx=32 # number of frames in x direction
+
 # nnx=40 # number of frames in x direction
 #nnx = 80  # number of frames in x direction
 # nnx=40 # number of frames in x direction
@@ -100,7 +106,7 @@ detector_pixel_size = 100.0
 # this defines the detector distance (paraxial approx)
 detector_distance = (nx * detector_pixel_size * resolution) / wavelength
 # save data to file:
-file_out = "simulation_test.h5"
+file_out = "simulation_small.h5"
 fid = h5py.File(file_out, "w")
 
 

@@ -22,6 +22,7 @@ from Operators import Gramiam_plan, Replicate_frame
 Alternating_projections = Solvers.Alternating_projections
 reset_times()
 GPU = config.GPU #False
+
 sync = True
 
 if GPU:
@@ -63,7 +64,8 @@ translations_x = xp.real(translations)
 translations_y = xp.imag(translations)
 
 # get the image extent (with wrap-around)
-Nx = xp.int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
+#Nx = xp.int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
+Nx = int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
 Ny = Nx
 
 

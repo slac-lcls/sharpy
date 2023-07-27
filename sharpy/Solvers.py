@@ -5,6 +5,7 @@ from Operators import (
     Project_data,
     synchronize_frames_c,
     mse_calc,
+    Precondition_calc
 )
 from Operators import Replicate_frame
 
@@ -195,9 +196,9 @@ def Alternating_projections(
     t00 = t000
 
     # we need the frames norm to normalize
-    frames_norm = xp.linalg.norm(xp.sqrt(frames_data))
+    frames_norm_sum = xp.linalg.norm(xp.sqrt(frames_data))
     # renormalize the norm for the ifft2 space
-    frames_norm_r = frames_norm / xp.sqrt(xp.prod(xp.array(frames_data.shape[-2:])))
+    frames_norm_r = frames_norm_sum / xp.sqrt(xp.prod(xp.array(frames_data.shape[-2:])))
 
     # Prox_data = prox_data_plan(frames_data)
 
@@ -250,7 +251,9 @@ def Alternating_projections(
     if sync == True:
         inormalization_split = Split(1/(normalization))
         #inormalization_split = Split(1/(normalization+1e-8))
-        
+        frames_norm = Precondition_calc(frames, bw=0)
+        #print('!!!frames_norm_shape',frames_norm.dtype,frames_norm.shape)
+  
     timers["solver_init"] = timer() - t00
     t00 = timer()
     if GPU:
@@ -302,7 +305,7 @@ def Alternating_projections(
         # here goes the synchronization
         if sync==True:
             t0 = timer()
-            omega=synchronize_frames_c(frames, illumination, inormalization_split, Gramiam)
+            omega=synchronize_frames_c(frames, illumination, frames_norm, inormalization_split, Gramiam)
             frames=frames*omega
             timers["Sync"] += timer() - t0
            
@@ -327,7 +330,9 @@ def Alternating_projections(
         timers["refine_illumination"] += timer() - t0
 
         t0 = timer()
+        #print('3',type(frames.dtype))
         frames = Illuminate_frames(Split(img), illumination)
+        #print('4',type(frames.dtype))
         timers["illuminate&split"] += timer() - t0
 
         # if GPU and ii<2:
@@ -369,7 +374,7 @@ def Alternating_projections(
 
     t0 = timer()
 
-    residuals[:, 1] /= frames_norm
+    residuals[:, 1] /= frames_norm_sum
     residuals[:, 2] /= frames_norm_r
     if type(img_truth) != type(None):
         residuals[:, 0] /= nrm_truth
@@ -382,7 +387,7 @@ def Alternating_projections(
 
 
 def Alternating_projections_c(
-    opt,
+    sync,
     img,
     Gramiam,
     frames_data,
@@ -408,6 +413,10 @@ def Alternating_projections_c(
     if type(img_truth) != type(None):
         nrm_truth = xp.linalg.norm(img_truth)
 
+    if sync == True:
+        frames_norm = Precondition_calc(frames, bw=0)
+        #print('!!!frames_norm_shape',frames_norm.dtype,frames_norm.shape)
+        
     for ii in xp.arange(maxiter):
         # data projection
         frames, mse_data = Project_data(frames, frames_data)
@@ -416,10 +425,10 @@ def Alternating_projections_c(
         frames_old = frames + 0.0  # make a copy
         ####################
         # here goes the synchronization
-        if opt == True:
+        if sync == True:
             time0 = timer()
             omega = synchronize_frames_c(
-                frames, illumination, inormalization_split, Gramiam
+                frames, illumination, frames_norm, frames_norm, inormalization_split, Gramiam
             )
             frames = frames * omega
             time_sync += timer() - time0

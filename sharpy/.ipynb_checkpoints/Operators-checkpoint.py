@@ -16,7 +16,6 @@ import pkg_resources
 
 GPU = config.GPU
 
-
 if GPU:
     import cupy as cp
     xp = cp
@@ -73,8 +72,8 @@ def normalize_times():
 
 def Propagate(frames):
     # simple propagation
-    print('frames shape',frames.shape)
-    print('frames type', type(frames))
+    #print('frames shape',frames.shape)
+    #print('frames type', type(frames))
     return fft2(frames)
 
 
@@ -128,7 +127,7 @@ def Project_data(frames, frames_data, compute_residuals=False):
     #     time0=timer()
     #     frames *= cpx.rsqrt(((frames*frames.conj()).real+eps)*fd)
     # else:
-    #      frames *= xp.sqrt((frames_data+eps)/((frames*frames.conj()).real+eps))
+    #      frames *= xp.sqrt((frames_data+eps)/((frames*franmes.conj()).real+eps))
     #      # frames *= cpx.rsqrt(((frames*frames.conj()).real+eps)/(frames_data+eps))
     # print('using proxD')
     frames = ProxD(frames, frames_data, eps)
@@ -449,14 +448,15 @@ def ket(ystackr, dx, dy, bw=0):
     # dxi=dx[ii,jj].astype(int)
     # dyi=dy[ii,jj].astype(int)
     nx, ny = ystackr.shape
-    #dxi = dx.astype(int)
-    #dyi = dy.astype(int)
-    dxi = dx
-    dyi = dy
+    dxi = dx.astype(int)
+    dyi = dy.astype(int)
+    #dxi = dx
+    #dyi = dy
     ket = ystackr[
         max([0, dyi]) + bw : min([nx, nx + dyi]) - bw,
         max([0, dxi]) + bw : min([nx, nx + dxi]) - bw,
     ]
+    #print('range frames left then right',max([0, dyi]) + bw, min([nx, nx + dyi]) - bw,max([0, dxi]) + bw,min([nx, nx + dxi]) - bw)
     # ket=ystackr[max([0,dxi])+bw:min([nx,nx+dxi])-bw,
     #             max([0,dyi])+bw:min([nx,nx+dyi])-bw]
 
@@ -493,7 +493,7 @@ def braket_i(ii,framesl,framesr,col,row,dx,dy,bw):
 #braket_i = cp.fuse(kernel_name='braket_i')(braket_i)
     
 
-def Gramiam_calc(framesl, framesr, plan):
+def Gramiam_calc(framesl, framesr, plan,frames_norm):
     # computes all the inner products between overlaping frames
     col = plan["col"]
     row = plan["row"]
@@ -520,26 +520,14 @@ def Gramiam_calc(framesl, framesr, plan):
     #@cp.fuse(kernel_name='braket_i')
     
     time0 = timer()
-    print(nnz)
+    #print(nnz)
     for ii in range(nnz):
         #braket_i(ii)
         val[ii] = braket_i(ii,framesl,framesr,col,row,dx,dy,bw)
-    #    if ii == 0:
-    #        t0 = timer()
-    #        braket_i(ii)
-    #        print('each dot takes', timer() - t0)
+        val[ii] /= frames_norm[col[ii]]*frames_norm[row[ii]] #calculate D @ H @ D 
     
-    '''
-    #def parallel_braket_i(nnz,framesl,framesr,col,row,dx,dy,bw):
-        # Create a pool of workers
-    #    pool = mp.Pool()
-        # Parallelize the loop
-    #    results = pool.map(braket_i, range(nnz))
-        # Close the pool
-    #    pool.close()
-    #    pool.join()
-    '''
-    #parallel_braket_i(nnz,framesl,framesr,col,row,dx,dy,bw)
+    #print('true value',val)
+    
     
     timers["Gramiam"] += timer() - time0
     time0 = timer()
@@ -547,9 +535,10 @@ def Gramiam_calc(framesl, framesr, plan):
     
     # H=sp.sparse.csr_matrix((val.ravel(), (col, row)), shape=(nframes,nframes))
     if GPU == False:
+        #put in kernel
         H = sp.sparse.coo_matrix((val.ravel(), (col, row)), shape=(nframes, nframes))
         H = H + (sp.sparse.triu(H, 1)).getH()
-        H = H.tocsr()
+        H = H.tocsr() #solve 
         timers["Gramiam_completion"] += timer() - time0
     else:
         H = sparse.coo_matrix((val.ravel(), (col, row)), shape=(nframes, nframes))
@@ -568,35 +557,47 @@ if zQQz_raw_kernel == None:
     with open(file_name, 'r') as myfile:
         zQQz_raw_kernel = myfile.read()
         
-def Gramiam_calc_cuda(frames, plan,illumination,normalization):
+def Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm):
     col = plan['col']
     row = plan['row']
     dx = plan['dx']
     dy = plan['dy']
-#    ptr = xp.concatenate(([0],xp.nonzero(xp.diff(col))[0]+1,[len(col)]))
+
     nnz = len(col)
     frame_height = frames.shape[1]
+    #print('height',frame_height)
     frame_width = frames.shape[2]
+    #put in kernel
     framesl = Illuminate_frames(frames, xp.conj(illumination))
-    framesr = framesl * normalization
     
+    #framesr = (framesl * normalization).transpose(0,2,1).ravel(order='C').ravel #column-wise indexing
+    #framesl = framesl.transpose(0,2,1).ravel(order='C').ravel()
+    
+    framesr = framesl * normalization
+   
+    #put in kernel
+    
+    #print('framesl_true',framesl[80:82],framesl.shape)
+    #print('framesr_true',framesr[256:258])
     nthreads = 128
     nblocks = nnz
-    
-#    #include <thrust/device_vector.h>
-#    #include <thrust/complex.h>
-#    thrust::device_vector<thrust::complex<float>> value(nframes);
-#    #include <iostream>
+    #print('nnz',nnz)
+
     t0 = timer()
     value = xp.zeros(nnz,dtype = xp.complex64)
+    #print('initialize', value)
+    #print('col',col,type(col),col.dtype, col.shape)
+    #print('row',row,row.dtype,row.shape)
+    #print('dx',type(dx),dx.dtype, dx.shape)
     cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
         ((int(nblocks),),(int(nthreads),), \
-         (value,framesl,framesr,col,row,dx,dy, nnz, frame_height, frame_width))
-    print('Bye')
+         (value,framesl,framesr,frames_norm,col,row,dx,dy, nnz, frame_height, frame_width))
+    #print('out',value)
+    #print('value by Cuda',value)
     # Try cupy sparse
     timers['Gramiam'] = timer() - t0
     
-    nframes = framesl.shape[0]
+    nframes = frames.shape[0]
     H = sparse.coo_matrix((value.ravel(), (col, row)), shape=(nframes, nframes))
     H += sparse.triu(H, k=1).conj().T
     H = H.tocsr()
@@ -606,21 +607,22 @@ def Gramiam_calc_cuda(frames, plan,illumination,normalization):
 def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     # embed all geometric parameters into the gramiam function
     # calculates the difference of the coordinates between all frames
-    print('!!!!!',type(translations_x.dtype))
+    #print('!!!!!',type(translations_x.dtype))
     dx = translations_x.ravel(order="F").reshape(nframes, 1)
     dy = translations_y.ravel(order="F").reshape(nframes, 1)
     dx = xp.subtract(dx, xp.transpose(dx))
     dy = xp.subtract(dy, xp.transpose(dy))
-    print('!!!!!',type(dx.dtype))
+    #print('!!!!!',type(dx.dtype))
     # calculates the wrapping effect for a period boundary
     #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(float) - (dx > (Nx / 2)).astype(float)))
     dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
     #dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(float) - (dy > (Ny / 2)).astype(float)))
-    dy = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
-    
+    dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(int) - (dy > (Ny / 2)).astype(int)))
+
     # find the frames idex that overlaps
     # col,row=xp.where(xp.tril(xp.logical_and(abs(dy)< nx,abs(dx) < ny)).T)
     col, row = xp.where(xp.tril((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)).T)
+   
     #row, col = xp.where(xp.tril((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)))
     
     # complex displacement (x, 1j y)
@@ -633,11 +635,15 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     # col,row,dd=frames_overlap(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw)
 
     nnz = col.size
+    #val=xp.empty((nnz,1),dtype=xp.complex128)
     val=xp.empty((nnz,1),dtype=xp.complex64)
     #val = shared_array(shape=(nnz, 1), dtype=xp.complex128)
 
     #plan = {"col": col, "row": row, "dd": dd, "val": val, "bw": bw}
-    plan = {"col": col, "row": row, "dx": dx, "dy": dy,"val": val, "bw": bw}
+   # plan = {"col": xp.ascontiguousarray(col), "row": xp.ascontiguousarray(row), "dx": dx, "dy": dy,"val": val, "bw": bw}
+    plan = {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy,"val": val, "bw": bw}
+    #plan = {"col": col, "row": row, "dx": dx, "dy": dy,"val": val, "bw": bw}
+
     # Gramiam = lambda framesl,framesr: Gramiam_calc(framesl,framesr,plan)
     return plan
 
@@ -646,17 +652,32 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
 #    H=Gramiam(nframes,framesl,framesr,col,row,nx,ny,dx,dy)
 
 
+def Precondition_calc(frames, bw=0):
+    fw, fh = frames.shape[1:]
+    t0 = timer()
+    frames_norm = xp.linalg.norm(frames[:, bw : fw - bw, bw : fh - bw], axis=(1, 2)).astype(xp.complex64)
+    
+    return frames_norm
+
+
 def Precondition(H, frames, bw=0):
     time0 = timer()
     fw, fh = frames.shape[1:]
-    frames_norm = xp.linalg.norm(frames[:, bw : fw - bw, bw : fh - bw], axis=(1, 2))
-    print(type(frames_norm))
-    print(frames_norm.shape)
+    t0 = timer()
+    frames_norm = xp.linalg.norm(frames[:, bw : fw - bw, bw : fh - bw], axis=(1, 2)).astype(xp.complex64)
+    print('!!!!!',frames_norm.dtype,type(frames_norm))
+    print('1', timer()-t0)
+    #print(type(frames_norm))
+    #print(frames_norm.shape)
     if GPU == False:
         D = sp.sparse.diags(1 / frames_norm)
     else: 
-        D = sparse.diags(1 / frames_norm , format='csr')
-    H1 = D @ H @ D
+        t0 = timer()
+        D = sparse.diags(1 / frames_norm , format='csr') #slow
+        print('2',timer()-t0)
+    t0 = timer()    
+    H1 = D @ H @ D #slow
+    print('3',timer()-t0)
     # H1=(H1+H1.getH())/2
     timers["Precondition"] += timer() - time0 
     return H1, D
@@ -672,10 +693,14 @@ def Eigensolver(H):
 
     nframes = xp.shape(H)[0]
     # print('nframes',nframes)
-    v0 = xp.ones((nframes, 1))
     if GPU: 
-        eigenvalues, eigenvectors = eigsh(H, k=1, which="LM", tol=1e-9)
+        #eigenvalues, eigenvectors = eigsh(H, k=1, which="LM", tol=1e-9)
+        #use sparsity, and hermitian, use only triu
+        #v0 = xp.ones((nframes, 1),xp.complex64)
+        v0 = xp.ones((nframes),xp.complex64)
+        eigenvalues, eigenvectors = eigsh(H, k=1, ncv=3, maxiter=5, which="LM", v0=v0, tol=1e-3)
     else:
+        v0 = xp.ones((nframes, 1),xp.complex64)
         eigenvalues, eigenvectors = eigsh(H, k=1, which="LM", v0=v0, tol=1e-9)
     # eigenvalues, eigenvectors = eigsh(H, k=1,which='LM',v0=v0, tol=0)
     # eigenvalues, eigenvectors = eigsh(H, k=2,which='LM',v0=v0)
@@ -696,19 +721,26 @@ def Eigensolver(H):
 
 
 # def synchronize_frames_c(frames, illumination, normalization,translations_x,translations_y,nframes,nx,ny,Nx,Ny):
-def synchronize_frames_c(frames, illumination, normalization, plan, bw=0):
+def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan, bw=0):
     # col,row,dx,dy=frames_overlap(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
     # Gramiam = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
 
     time0 = timer()
     timers["Sync_setup"] += timer() - time0
     if GPU:
-        H = Gramiam_calc_cuda(frames, plan,illumination,normalization)
+        H = Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm)
+        #framesl = Illuminate_frames(frames, xp.conj(illumination))
+        #framesr = framesl * normalization
+        #print('true value',framesl[0,0:3,5],framesr[1,0:3,0])
+        #print('true value after ravel',framesl.ravel()[80:83],framesr.ravel()[256:258])
+        #H = Gramiam_calc(framesl, framesr, plan)
+        #print('!!!',xp.linalg.norm(H_cuda - H))
     else:
         framesl = Illuminate_frames(frames, xp.conj(illumination))
         framesr = framesl * normalization
-        H = Gramiam_calc(framesl, framesr, plan)
-
+        H = Gramiam_calc(framesl, framesr, plan,frames_norm)
+    
+    '''incorporated in the kernel
     if "Preconditioner" in plan:
         time0 = timer()
         # print('hello')
@@ -717,9 +749,10 @@ def synchronize_frames_c(frames, illumination, normalization, plan, bw=0):
         timers["Precondition"] = timer() - time0
     else:
         H1, D = Precondition(H, frames, bw)
-
+    '''
+    
     # compute the largest eigenvalue of H1
-    omega = Eigensolver(H1)
+    omega = Eigensolver(H)
     return omega
 
 

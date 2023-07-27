@@ -7,7 +7,7 @@ plan2D = None
 # print("Plan1D",plan1D)
 owrite = True
 Plan = True
-debug = True
+
 
 def fft_reset(x):
     global plan1D
@@ -49,14 +49,14 @@ def fft2(x):
     global plan2D
     if plan2D == None and Plan:
         plan2D = fftpack.get_fft_plan(x, axes=(-2, -1))
-        if False:
+        if True:
             print('plan2D is None')
             print(type(x.dtype))
             print(plan2D)
     else:
         #fft_reset(x)
         #plan2D = fftpack.get_fft_plan(x, axes=(-2, -1))
-        if False:
+        if True:
             print('Using existing plan2D')
             print(type(x.dtype))
             print(plan2D)
