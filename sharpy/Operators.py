@@ -562,18 +562,19 @@ def Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm):
     row = plan['row']
     dx = plan['dx']
     dy = plan['dy']
-
+    bw = plan['bw']
+    
     nnz = len(col)
     frame_height = frames.shape[1]
     #print('height',frame_height)
     frame_width = frames.shape[2]
     #put in kernel
-    framesl = Illuminate_frames(frames, xp.conj(illumination))
-    
+    #framesl = Illuminate_frames(frames, xp.conj(illumination))
+        
     #framesr = (framesl * normalization).transpose(0,2,1).ravel(order='C').ravel #column-wise indexing
     #framesl = framesl.transpose(0,2,1).ravel(order='C').ravel()
     
-    framesr = framesl * normalization
+    #framesr = framesl * normalization
    
     #put in kernel
     
@@ -582,16 +583,23 @@ def Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm):
     nthreads = 128
     nblocks = nnz
     #print('nnz',nnz)
-
+  
     t0 = timer()
     value = xp.zeros(nnz,dtype = xp.complex64)
     #print('initialize', value)
     #print('col',col,type(col),col.dtype, col.shape)
     #print('row',row,row.dtype,row.shape)
     #print('dx',type(dx),dx.dtype, dx.shape)
+    '''
     cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
         ((int(nblocks),),(int(nthreads),), \
-         (value,framesl,framesr,frames_norm,col,row,dx,dy, nnz, frame_height, frame_width))
+         (value,framesl,framesr,frames_norm,illumination,col,row,dx,dy, nnz, frame_height, frame_width))
+    '''
+    
+    cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+        ((int(nblocks),),(int(nthreads),), \
+         (value,frames,frames_norm,illumination,normalization.astype(xp.complex64),col,row,dx,dy,bw,nnz, frame_height, frame_width))
+    
     #print('out',value)
     #print('value by Cuda',value)
     # Try cupy sparse
@@ -635,6 +643,7 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     # col,row,dd=frames_overlap(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw)
 
     nnz = col.size
+       
     #val=xp.empty((nnz,1),dtype=xp.complex128)
     val=xp.empty((nnz,1),dtype=xp.complex64)
     #val = shared_array(shape=(nnz, 1), dtype=xp.complex128)
@@ -656,7 +665,7 @@ def Precondition_calc(frames, bw=0):
     fw, fh = frames.shape[1:]
     t0 = timer()
     frames_norm = xp.linalg.norm(frames[:, bw : fw - bw, bw : fh - bw], axis=(1, 2)).astype(xp.complex64)
-    
+
     return frames_norm
 
 
@@ -665,7 +674,7 @@ def Precondition(H, frames, bw=0):
     fw, fh = frames.shape[1:]
     t0 = timer()
     frames_norm = xp.linalg.norm(frames[:, bw : fw - bw, bw : fh - bw], axis=(1, 2)).astype(xp.complex64)
-    print('!!!!!',frames_norm.dtype,type(frames_norm))
+    #print('!!!!!',frames_norm.dtype,type(frames_norm))
     print('1', timer()-t0)
     #print(type(frames_norm))
     #print(frames_norm.shape)
@@ -698,7 +707,8 @@ def Eigensolver(H):
         #use sparsity, and hermitian, use only triu
         #v0 = xp.ones((nframes, 1),xp.complex64)
         v0 = xp.ones((nframes),xp.complex64)
-        eigenvalues, eigenvectors = eigsh(H, k=1, ncv=3, maxiter=5, which="LM", v0=v0, tol=1e-3)
+        eigenvalues, eigenvectors = eigsh(H, k=1, ncv=3, maxiter=5, v0=v0, which="LM", tol=1e-3)
+        #eigenvalues, eigenvectors = eigsh(H, k=1,  which="LM", tol=1e-6)
     else:
         v0 = xp.ones((nframes, 1),xp.complex64)
         eigenvalues, eigenvectors = eigsh(H, k=1, which="LM", v0=v0, tol=1e-9)
@@ -731,10 +741,8 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
         H = Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm)
         #framesl = Illuminate_frames(frames, xp.conj(illumination))
         #framesr = framesl * normalization
-        #print('true value',framesl[0,0:3,5],framesr[1,0:3,0])
-        #print('true value after ravel',framesl.ravel()[80:83],framesr.ravel()[256:258])
-        #H = Gramiam_calc(framesl, framesr, plan)
-        #print('!!!',xp.linalg.norm(H_cuda - H))
+        #H = Gramiam_calc(framesl, framesr, plan,frames_norm)
+        #print('!!!',sp.linalg.norm(H1-H))
     else:
         framesl = Illuminate_frames(frames, xp.conj(illumination))
         framesr = framesl * normalization

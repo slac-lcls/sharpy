@@ -97,10 +97,13 @@ if GPU:
     print("----")
 
 if sync == True:
-   Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
-
+   #calculate the preconditioner here
+    Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+    #print('plan',Gplan['col'],Gplan['row'],Gplan['dx'],Gplan['dy'],Gplan['val'])
+    if Gplan['col'].size == 0:
+        sync = False
 else: 
-   Gplan = None
+    Gplan = None
 
 
 

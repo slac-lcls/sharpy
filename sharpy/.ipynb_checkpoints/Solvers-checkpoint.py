@@ -251,7 +251,8 @@ def Alternating_projections(
     if sync == True:
         inormalization_split = Split(1/(normalization))
         #inormalization_split = Split(1/(normalization+1e-8))
-        frames_norm = Precondition_calc(frames, bw=0)
+        frames_norm = Precondition_calc(frames, bw=Gramiam['bw'])
+        print('!!!frames_norm',frames_norm[0],frames_norm[1])
         #print('!!!frames_norm_shape',frames_norm.dtype,frames_norm.shape)
   
     timers["solver_init"] = timer() - t00
@@ -385,7 +386,7 @@ def Alternating_projections(
     # print('time sync:',time_sync)
     return img, frames, illumination, residuals
 
-
+'''
 def Alternating_projections_c(
     sync,
     img,
@@ -447,3 +448,4 @@ def Alternating_projections_c(
 
     print("time sync:", time_sync)
     return img, frames, residuals
+'''
