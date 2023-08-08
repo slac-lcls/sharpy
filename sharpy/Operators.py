@@ -548,6 +548,7 @@ def Gramiam_calc(framesl, framesr, plan,frames_norm):
         
     return H
 
+
 resource_package = __name__
 
 zQQz_raw_kernel = None
@@ -556,60 +557,53 @@ if zQQz_raw_kernel == None:
     file_name = pkg_resources.resource_filename(resource_package, resource_path)
     with open(file_name, 'r') as myfile:
         zQQz_raw_kernel = myfile.read()
-        
-def Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm):
-    col = plan['col']
-    row = plan['row']
-    dx = plan['dx']
-    dy = plan['dy']
-    bw = plan['bw']
+
+
+def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm):
     
-    nnz = len(col)
-    frame_height = frames.shape[1]
-    #print('height',frame_height)
-    frame_width = frames.shape[2]
-    #put in kernel
-    #framesl = Illuminate_frames(frames, xp.conj(illumination))
-        
-    #framesr = (framesl * normalization).transpose(0,2,1).ravel(order='C').ravel #column-wise indexing
-    #framesl = framesl.transpose(0,2,1).ravel(order='C').ravel()
-    
-    #framesr = framesl * normalization
-   
-    #put in kernel
-    
-    #print('framesl_true',framesl[80:82],framesl.shape)
-    #print('framesr_true',framesr[256:258])
-    nthreads = 128
-    nblocks = nnz
-    #print('nnz',nnz)
-  
     t0 = timer()
-    value = xp.zeros(nnz,dtype = xp.complex64)
+    
+    if GPU:
+        value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
+        timers['Gramiam'] = timer() - t0
+        H = plan["val2H"](value.ravel())
+        timers['Gramiam_completion']=timer() - t0
+        
+    else:
+        col = gram_calc['col']
+        row = gram_calc['row']
+        dx = gram_calc['dx']
+        dy = gram_calc['dy']
+        bw = gram_calc['bw']
+        value = gram_calc['val']
+        frame_height = frames.shape[1]
+        #print('height',frame_height)
+        frame_width = frames.shape[2]   
+        '''
+        nthreads = 128
+        nnz = len(col)
+        nblocks = nnz
+        cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+        ((int(nblocks),),(int(nthreads),), \
+        (value,frames,frames_norm,illumination,normalization,col,row,dx,dy,bw,nnz, frame_height, frame_width))
+        '''
+        
+        timers['Gramiam'] = timer() - t0
+    
+        nframes = frames.shape[0]
+        print(type(col),col.dtype,type(row),row.dtype,type(value),value.dtype)
+        H = sparse.coo_matrix((value.ravel(), (col, row)), shape=(nframes, nframes))
+        H += sparse.triu(H, k=1).conj().T
+        H = H.tocsr()
+        timers['Gramiam_completion']=timer() - t0
+    
     #print('initialize', value)
     #print('col',col,type(col),col.dtype, col.shape)
     #print('row',row,row.dtype,row.shape)
     #print('dx',type(dx),dx.dtype, dx.shape)
-    '''
-    cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
-        ((int(nblocks),),(int(nthreads),), \
-         (value,framesl,framesr,frames_norm,illumination,col,row,dx,dy, nnz, frame_height, frame_width))
-    '''
-    
-    cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
-        ((int(nblocks),),(int(nthreads),), \
-         (value,frames,frames_norm,illumination,normalization.astype(xp.complex64),col,row,dx,dy,bw,nnz, frame_height, frame_width))
-    
     #print('out',value)
     #print('value by Cuda',value)
-    # Try cupy sparse
-    timers['Gramiam'] = timer() - t0
     
-    nframes = frames.shape[0]
-    H = sparse.coo_matrix((value.ravel(), (col, row)), shape=(nframes, nframes))
-    H += sparse.triu(H, k=1).conj().T
-    H = H.tocsr()
-    timers['Gramiam_completion']=timer() - t0
     return H
 
 def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
@@ -646,21 +640,28 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
        
     #val=xp.empty((nnz,1),dtype=xp.complex128)
     val=xp.empty((nnz,1),dtype=xp.complex64)
-    #val = shared_array(shape=(nnz, 1), dtype=xp.complex128)
 
-    #plan = {"col": col, "row": row, "dd": dd, "val": val, "bw": bw}
-   # plan = {"col": xp.ascontiguousarray(col), "row": xp.ascontiguousarray(row), "dx": dx, "dy": dy,"val": val, "bw": bw}
-    plan = {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy,"val": val, "bw": bw}
-    #plan = {"col": col, "row": row, "dx": dx, "dy": dy,"val": val, "bw": bw}
-
-    # Gramiam = lambda framesl,framesr: Gramiam_calc(framesl,framesr,plan)
+    #
+    val2H = mapu2all(row, col , nframes) 
+    
+    # plan = {"col": xp.ascontiguousarray(col), "row": xp.ascontiguousarray(row), "dx": dx, "dy": dy,"val": val, "bw": bw}
+    plan = {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy,"val": val, "bw": bw,"val2H":val2H,"gram_calc":None}
+   
+    # we can pass the function instead of the plan
+    if GPU: 
+        nthreads = 128
+        nnz = len(col)
+        nblocks = nnz 
+        def gram_calc(frames,frames_norm, illumination, normalization, value=val):
+            cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+            ((int(nblocks),),(int(nthreads),), \
+            (value,frames,frames_norm, illumination, normalization,col,row,dx,dy,bw,nnz, nx, ny))
+            return value
+        
+        plan["gram_calc"] = gram_calc
+        
     return plan
-
-
-#    lambda Gramiam1
-#    H=Gramiam(nframes,framesl,framesr,col,row,nx,ny,dx,dy)
-
-
+    
 def Precondition_calc(frames, bw=0):
     fw, fh = frames.shape[1:]
     t0 = timer()
@@ -729,6 +730,37 @@ def Eigensolver(H):
     omega = xp.reshape(omega, (nframes, 1, 1))
     return omega
 
+def mapu2all(row, col , nframes):
+   
+    # initialize sparse array
+    val0=xp.empty(col.size, dtype = xp.complex64)
+    #Soo=sparse.coo_array((val0,(row,col)))
+    Soo=sparse.coo_matrix((val0,(row,col)))
+    H=Soo.tocsr()
+
+    # split up upper and lower matrix indices
+    iiu = xp.where(row <= col)[0]
+    iil1 = xp.where(row > col)[0] # excluding diag
+
+    # mapping index from upper to lower triangle
+    idx = xp.arange(iiu.size)
+    # exclude the diagonal  
+    nd = xp.where(row[iiu] != col[iiu])
+   
+    # transpose the ordering
+    ii=col[iiu[nd]]+row[iiu[nd]]*nframes
+    u2l=idx[nd][xp.argsort(ii)]
+
+    # combined index for assignment
+    ii_fill=xp.concatenate((iiu,iil1))
+
+
+    def val2H(valu):
+        # H.data[ii_fill] = np.concatenate((valu, np.conj(valu[u2l])))
+        H.data[ii_fill] = xp.concatenate((xp.conj(valu), (valu[u2l])))
+        return H
+
+    return   val2H
 
 # def synchronize_frames_c(frames, illumination, normalization,translations_x,translations_y,nframes,nx,ny,Nx,Ny):
 def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan, bw=0):
@@ -738,7 +770,7 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
     time0 = timer()
     timers["Sync_setup"] += timer() - time0
     if GPU:
-        H = Gramiam_calc_cuda(frames, plan,illumination,normalization,frames_norm)
+        H = Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm)
         #framesl = Illuminate_frames(frames, xp.conj(illumination))
         #framesr = framesl * normalization
         #H = Gramiam_calc(framesl, framesr, plan,frames_norm)

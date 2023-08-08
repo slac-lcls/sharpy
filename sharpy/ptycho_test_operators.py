@@ -11,7 +11,7 @@ import h5py
 
 from Operators import Split_plan, Overlap_plan  # , Project_data
 from Operators import Illuminate_frames
-
+from wrap_ops import Split, Overlap
 # from Operators import cropmat, make_probe, make_translations #, map_frames
 
 
@@ -49,8 +49,8 @@ Ny = Nx
 
 #%%
 
-Split = Split_plan(translations_x, translations_y, nx, ny, Nx, Ny)
-Overlap = Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
+Split0 = Split_plan(translations_x, translations_y, nx, ny, Nx, Ny) 
+Overlap0 = Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 frames = Illuminate_frames(Split(truth), illumination)  # check
 
@@ -68,6 +68,7 @@ if test_flag:
 
     # used to check if things are self consistent
     Overlap = Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
+    
     normalization = Overlap(
         Replicate_frame(np.abs(illumination) ** 2, nframes)
     )  # check

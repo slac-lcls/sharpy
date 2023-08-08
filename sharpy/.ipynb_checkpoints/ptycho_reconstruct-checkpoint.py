@@ -10,8 +10,8 @@ import Solvers
 from Operators import get_times, reset_times, normalize_times
 import config
 from Operators import Gramiam_plan, Replicate_frame
+from wrap_ops import overlap_cuda,split_cuda
 
-Alternating_projections = Solvers.Alternating_projections
 reset_times()
 GPU = config.GPU #False
 sync = True
@@ -24,7 +24,10 @@ else:
     xp = np
     print("using CPU")
 
-
+if GPU:
+    Alternating_projections = Solvers.Alternating_projections_c
+else:
+    Alternating_projections = Solvers.Alternating_projections
 ##################################################
 # input data
 fname_in = "simulation_small.h5"
@@ -41,6 +44,7 @@ illumination = xp.array(fid["probe"], dtype=xp.complex64)
 translations = xp.array(fid["translations"])
 #print('translations1', type(translations),translations.dtype) #float128 dtype
 nframes, nx, ny = data.shape
+
 resolution = (
     xp.float32(fid["wavelength"])
     * xp.float32(fid["detector_distance"])
@@ -79,7 +83,7 @@ if GPU:
     print("----")
 
 
-Split, Overlap = Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
+#Split, Overlap = Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 if GPU:
     mempool = cp.get_default_memory_pool()
@@ -97,9 +101,13 @@ if GPU:
     print("----")
 
 if sync == True:
-   #calculate the preconditioner here
-    Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
-    #print('plan',Gplan['col'],Gplan['row'],Gplan['dx'],Gplan['dy'],Gplan['val'])
+    if GPU:
+       #calculate the preconditioner here
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        #print('plan',Gplan['col'],Gplan['row'],Gplan['dx'],Gplan['dy'],Gplan['val'])
+    else:
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        
     if Gplan['col'].size == 0:
         sync = False
 else: 
@@ -109,6 +117,8 @@ else:
 
 #img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
 img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) #Need to match datatype in operators fft Plan2D
+
+
 ############################
 # reconstruct
 refine_illumination = False
@@ -123,6 +133,7 @@ print(
     maxiter,
 )
 
+'''
 img4, frames, illum, residuals_AP = Alternating_projections(
     sync,
     img_initial,
@@ -130,6 +141,23 @@ img4, frames, illum, residuals_AP = Alternating_projections(
     illumination,
     Overlap,
     Split,
+    data,
+    refine_illumination,
+    maxiter,
+    normalization=None,
+    img_truth =truth,
+    residuals_interval = residuals_interval
+)
+'''
+img4, frames, illum, residuals_AP = Alternating_projections(
+    sync,
+    img_initial,
+    Gplan,
+    illumination,
+    translations_x,
+    translations_y,
+    overlap_cuda,
+    split_cuda,
     data,
     refine_illumination,
     maxiter,

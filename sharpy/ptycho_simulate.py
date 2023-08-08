@@ -6,6 +6,7 @@ import cupy as cp
 import h5py
 
 from Operators import Split_plan
+from wrap_ops import split_cuda
 from Operators import Illuminate_frames
 from Operators import cropmat, make_probe, make_translations  # , map_frames
 import config
@@ -14,9 +15,9 @@ GPU = config.GPU
 
 
 # define simulation dimensions (frames, step, image)
-#nx = 16  # frame size
-#Dx = 5  # Step size
-#nnx=8 # number of frames in x direction
+nx = 16  # frame size
+Dx = 5  # Step size
+nnx= 8 # number of frames in x direction
 
 # define larger simulation dimensions (frames, step, image)
 #nx = 64  # frame size
@@ -30,7 +31,6 @@ GPU = config.GPU
 # nnx=64 # number of frames in x direction
 #nnx = 100  # number of
 
-Nx = Dx * nnx
 
 # same thing for y
 ny = nx
@@ -39,8 +39,8 @@ Dy = Dx
 nframes = nnx * nny
 # total number of frames
 
-Ny = Dy * nny
-
+Nx = nnx * Dx
+Ny = nny * Dy
 
 # we need: image, illumination, scan pattern
 
@@ -75,9 +75,8 @@ if GPU:
     img0 = xp.array(img0, dtype=xp.complex64)
     illumination = xp.array(illumination, dtype=xp.complex64)
 
-
-truth = cropmat(img0, [Nx, Ny])
-
+truth = cp.ascontiguousarray(cropmat(img0, [Nx, Ny]))
+print(type(truth))
 
 # threshold to check if things match within numerical accuracy
 thres = np.finfo(truth.dtype).eps * 1e2
@@ -88,8 +87,15 @@ Split = Split_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 # generate frames from truth:
   
-frames = Illuminate_frames(Split(truth), illumination)  # check
+frames0 = Illuminate_frames(Split(truth), illumination)  # check
+frames = xp.zeros((nframes,nx,ny),dtype = xp.complex64)
 
+translations = (translations_x + 1j * translations_y).astype(xp.complex64)
+print(truth.shape)
+frames_out = split_cuda(truth, frames, translations, illumination)  # check
+print('!!!',frames_out.shape)
+frames = xp.reshape(frames_out,(frames.shape))
+print(xp.linalg.norm(frames-frames0))
 ## keep the data fftshifted
 frames_data = np.abs(np.fft.fft2(frames)) ** 2  # squared magnitude from the truth
 
@@ -137,3 +143,17 @@ fid.create_dataset("detector_distance", data=detector_distance)
 
 
 fid.close()
+
+print(nx,ny,Nx,Ny)
+import matplotlib.pyplot as plt
+fig = plt.figure(figsize=(10, 10))
+plt.subplot(1, 3, 1)
+plt.imshow(abs(frames[0].get()))
+plt.subplot(1, 3, 2)
+plt.imshow(abs(frames0[0].get()))
+plt.subplot(1,3,3)
+plt.imshow(abs(truth[0:nx,2:ny+2]))
+plt.show()
+
+print(truth[0:5,2:7])
+print(frames[0,0:5,0:5].get())
