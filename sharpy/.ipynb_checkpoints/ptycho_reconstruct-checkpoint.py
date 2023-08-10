@@ -122,7 +122,7 @@ img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) #Need to match datatype in o
 ############################
 # reconstruct
 refine_illumination = False
-maxiter = 30
+maxiter = 300
 # residuals_interval = np.inf
 residuals_interval = 1
 

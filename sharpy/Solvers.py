@@ -10,7 +10,7 @@ from Operators import (
 from Operators import Replicate_frame
 from wrap_ops import overlap_cuda,split_cuda
 import matplotlib.pyplot as plt
-
+from tqdm import tqdm
 import config
 
 GPU = config.GPU
@@ -517,16 +517,14 @@ def Alternating_projections_c(
         #print( translations.dtype,type( translations))
         normalization = xp.zeros(img_truth.shape,dtype = xp.complex64)
         overlap_cuda(normalization, 0, translations, illumination) 
-        #print(normalization)
-          # check type
-
+ 
     # refine_illumination = 1
     # eps_illum = None
     # eps0 = 1e-2
     
     if sync == True:
         reg = 1e-8
-        #print(xp.minimum(normalization))
+
         if GPU:
             inormalization_split = xp.zeros(frames_data.shape,dtype = xp.complex64)
             split_cuda(1/(normalization+reg),inormalization_split,translations, 0)
@@ -535,8 +533,7 @@ def Alternating_projections_c(
             #inormalization_split = Split(1/(normalization+1e-8))
             inormalization_split = Split(1/(normalization))
         frames_norm = Precondition_calc(frames, bw=Gramiam['bw'])
-        print('!!!frames_norm',frames_norm[0],frames_norm[1])
-        #print('!!!frames_norm_shape',frames_norm.dtype,frames_norm.shape)
+        
   
     timers["solver_init"] = timer() - t00
     t00 = timer()
@@ -555,8 +552,8 @@ def Alternating_projections_c(
 
     compute_residuals = False
 
-    for ii in xp.arange(maxiter):
-        print(ii)
+    for ii in tqdm(range(maxiter)):
+
         # data projection
         t0 = timer()
         t0_loop = timer()
@@ -604,7 +601,7 @@ def Alternating_projections_c(
             img *= 0 
             overlap_cuda(img, frames,translations, illumination) 
             img = img/normalization
-            print('Here', type(translations),(translations).dtype)
+            
         timers["Overlap"] += timer() - t0
 
         t0 = timer()
@@ -620,11 +617,11 @@ def Alternating_projections_c(
         timers["refine_illumination"] += timer() - t0
 
         t0 = timer()
-        #print('3',type(frames.dtype))
+        
         frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
         split_cuda(img,frames, translations,illumination)
    
-        #print('4',type(frames.dtype))
+        
         timers["illuminate&split"] += timer() - t0
 
         # if GPU and ii<2:
