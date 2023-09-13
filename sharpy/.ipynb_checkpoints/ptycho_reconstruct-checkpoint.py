@@ -30,7 +30,7 @@ else:
     Alternating_projections = Solvers.Alternating_projections
 ##################################################
 # input data
-fname_in = "simulation_small.h5"
+#fname_in = "simulation_small.h5"
 
 import sys
 # Retrieve the value of 'fname' from the command-line arguments
@@ -117,12 +117,12 @@ else:
 
 #img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
 img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) #Need to match datatype in operators fft Plan2D
-
-
+#img_initial = truth + 0
 ############################
 # reconstruct
-refine_illumination = False
-maxiter = 300
+#refine_illumination = False
+refine_illumination = True
+maxiter = 100
 # residuals_interval = np.inf
 residuals_interval = 1
 
@@ -149,9 +149,10 @@ img4, frames, illum, residuals_AP = Alternating_projections(
     residuals_interval = residuals_interval
 )
 '''
+
 img4, frames, illum, residuals_AP = Alternating_projections(
     sync,
-    img_initial,
+    img_initial+0,
     Gplan,
     illumination,
     translations_x,
@@ -163,7 +164,9 @@ img4, frames, illum, residuals_AP = Alternating_projections(
     maxiter,
     normalization=None,
     img_truth =truth,
-    residuals_interval = residuals_interval
+    residuals_interval = residuals_interval,
+    sync_interval = 1,
+    num_iter = 10,
 )
 
 print("total time:", timer() - t0)
@@ -186,7 +189,24 @@ print("total time operators benchmarked:", tots)
 
 print("after normalization")
 timersn = get_times()
-print(timersn)
+
+labels = [key for key,value in timersn.items() if value!=0]
+sizes = [100 * value for value in timersn.values() if value!=0]
+
+
+patches, texts = plt.pie(sizes,startangle=90, radius=1.2)
+labels = ['{0} - {1:1.2f} %'.format(i,j) for i,j in zip(labels, sizes)]
+
+sort_legend = True
+if sort_legend:
+    patches, labels, dummy =  zip(*sorted(zip(patches, labels, sizes),
+                                          key=lambda labels: labels[2],
+                                          reverse=True))
+
+plt.legend(patches, labels, loc='center left', bbox_to_anchor=(-0.1, 1.),
+           fontsize=8)
+
+plt.show()
 
 tt = Solvers.get_times()
 print("solver timers:\n", tt)
@@ -239,15 +259,15 @@ fig = plt.figure(figsize=(10, 10))
 plt.subplot(1, 3, 1)
 plt.title("Ground truth", fontsize=10)
 plt.imshow(abs(truth), cmap="gray")
-plt.colorbar()
+plt.colorbar(fraction=0.046, pad=0.04)
 plt.subplot(1, 3, 2)
 plt.title("Alternating Projections\n Sync:%2.2g" % (nmse4), fontsize=10)
 plt.imshow(abs(img), cmap="gray")
-plt.colorbar()
+plt.colorbar(fraction=0.046, pad=0.04)
 plt.subplot(1, 3, 3)
 plt.title("Difference")
 plt.imshow(abs(truth) - abs(img), cmap="jet")
-plt.colorbar()
+plt.colorbar(fraction=0.046, pad=0.04)
 plt.show()
 
 ##

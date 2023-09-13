@@ -15,9 +15,9 @@ GPU = config.GPU
 
 
 # define simulation dimensions (frames, step, image)
-nx = 16  # frame size
+nx = 8  # frame size
 Dx = 5  # Step size
-nnx= 8 # number of frames in x direction
+nnx= 2 # number of frames in x direction
 
 # define larger simulation dimensions (frames, step, image)
 #nx = 64  # frame size
@@ -76,7 +76,7 @@ if GPU:
     illumination = xp.array(illumination, dtype=xp.complex64)
 
 truth = cp.ascontiguousarray(cropmat(img0, [Nx, Ny]))
-print(type(truth))
+#print(type(truth))
 
 # threshold to check if things match within numerical accuracy
 thres = np.finfo(truth.dtype).eps * 1e2
@@ -91,11 +91,12 @@ frames0 = Illuminate_frames(Split(truth), illumination)  # check
 frames = xp.zeros((nframes,nx,ny),dtype = xp.complex64)
 
 translations = (translations_x + 1j * translations_y).astype(xp.complex64)
-print(truth.shape)
+
 frames_out = split_cuda(truth, frames, translations, illumination)  # check
-print('!!!',frames_out.shape)
+
+#print('!!!',frames_out.shape)
 frames = xp.reshape(frames_out,(frames.shape))
-print(xp.linalg.norm(frames-frames0))
+#print(xp.linalg.norm(frames-frames0))
 ## keep the data fftshifted
 frames_data = np.abs(np.fft.fft2(frames)) ** 2  # squared magnitude from the truth
 
@@ -112,7 +113,7 @@ detector_pixel_size = 100.0
 # this defines the detector distance (paraxial approx)
 detector_distance = (nx * detector_pixel_size * resolution) / wavelength
 # save data to file:
-file_out = "simulation_small.h5"
+file_out = "test_small.h5"
 fid = h5py.File(file_out, "w")
 
 
@@ -143,17 +144,3 @@ fid.create_dataset("detector_distance", data=detector_distance)
 
 
 fid.close()
-
-print(nx,ny,Nx,Ny)
-import matplotlib.pyplot as plt
-fig = plt.figure(figsize=(10, 10))
-plt.subplot(1, 3, 1)
-plt.imshow(abs(frames[0].get()))
-plt.subplot(1, 3, 2)
-plt.imshow(abs(frames0[0].get()))
-plt.subplot(1,3,3)
-plt.imshow(abs(truth[0:nx,2:ny+2]))
-plt.show()
-
-print(truth[0:5,2:7])
-print(frames[0,0:5,0:5].get())

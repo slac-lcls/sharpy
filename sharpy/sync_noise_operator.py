@@ -13,16 +13,16 @@ import h5py
 import matplotlib.pyplot as plt
 from timeit import default_timer as timer
 
-from Operators import Split_Overlap_plan
+#from Operators import Split_Overlap_plan
+from wrap_ops import overlap_cuda,split_cuda
 import Solvers
 from Operators import get_times, reset_times, normalize_times
 import config
 from Operators import Gramiam_plan, Replicate_frame, circular_aperture, mse_calc
+   
 
-Alternating_projections = Solvers.Alternating_projections
 reset_times()
 GPU = config.GPU #False
-sync = True
 
 if GPU:
     import cupy as cp
@@ -32,126 +32,135 @@ else:
     xp = np
     print("using CPU")
 
+if GPU:
+    Alternating_projections = Solvers.Alternating_projections_c
+else:
+    Alternating_projections = Solvers.Alternating_projections
 
 ##################################################
-# input data
-class DataProcessor:
-    def __init__(self,fname_in):
-        self.fname_in = fname_in
-        
-    def load_data(self):
-        fid = h5py.File(self.fname_in, "r")
-        #data = xp.array(fid["data"], dtype=xp.float32) 
-        self.data = xp.array(fid["data"], dtype=xp.float64) 
-        self.data0 = copy.deepcopy(self.data) #make a copy of the noiseless data
-        self.illumination = xp.array(fid["probe"], dtype=xp.complex64)
+import sys
+# Retrieve the value of 'fname' from the command-line arguments
+#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
 
-        self.translations = xp.array(fid["translations"])
+fid = h5py.File(fname_in, "r")
 
-        self.nframes, self.nx, self.ny = self.data.shape
-        self.resolution = (xp.float32(fid["wavelength"])
-                      * xp.float32(fid["detector_distance"])
-                      / (self.nx * xp.float32(fid["detector_pixel_size"]))
-                     )
+data = xp.array(fid["data"], dtype=xp.float32)
+illumination = xp.array(fid["probe"], dtype=xp.complex64)
 
-        self.translations = self.translations / self.resolution
+translations = xp.array(fid["translations"])
+#print('translations1', type(translations),translations.dtype) #float128 dtype
+nframes, nx, ny = data.shape
 
-        self.truth = xp.array(fid["truth"], dtype=xp.complex64)
-        
-        self.translations_x = xp.real(self.translations)
-        self.translations_y = xp.imag(self.translations)
+resolution = (
+    xp.float32(fid["wavelength"])
+    * xp.float32(fid["detector_distance"])
+    / (nx * xp.float32(fid["detector_pixel_size"]))
+)
+translations = translations / resolution
+truth = xp.array(fid["truth"], dtype=xp.complex64)
 
-        # get the image extent (with wrap-around)
-        self.Nx = xp.int(xp.ceil(xp.max(self.translations_x) - xp.min(self.translations_x)))
-        self.Ny = self.Nx
-        fid.close()
+translations_x = xp.array(fid["translations_x"]) #load the real and imag of dtype int64
+translations_y = xp.array(fid["translations_y"])
+fid.close()
+
 #################################################
 
-def Get_Mappings(processor):
-    Split, Overlap = Split_Overlap_plan(processor.translations_x, processor.translations_y, processor.nx,
-                                        processor.ny, processor.Nx,processor.Ny)
+#translations_x = xp.real(translations)
+#translations_y = xp.imag(translations)
 
-    if sync == True:
-       Gplan = Gramiam_plan(processor.translations_x,processor.translations_y,processor.nframes,processor.nx,processor.ny,processor.Nx,processor.Ny)
+# get the image extent (with wrap-around)
+Nx = int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
+Ny = Nx
 
-    else: 
-       Gplan = None
-    return Split,Overlap, Gplan
+#################################################
 
+if sync == True:
+    if GPU:
+       #calculate the preconditioner here
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        #print('plan',Gplan['col'],Gplan['row'],Gplan['dx'],Gplan['dy'],Gplan['val'])
+    else:
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        
+    if Gplan['col'].size == 0:
+        sync = False
+else: 
+    Gplan = None
 
 ############################
 # reconstruct
 
-def Simulate_Noise(opts,sync,processor):
-    t0 = timer()
+def Simulate_Noise(opts,sync,data,truth, translations_x, translations_y, Nx, Ny,nx,ny,nframes):
+    
     
     ###
     refine_illumination, maxiter, residuals_interval = opts['refine_illumination'], opts['maxiter'], opts['residuals_interval']
     data,data0,illumination,translations, nframes, nx, ny, resolution, truth, translations_x, translations_y, Nx, Ny= processor.data, processor.data0, processor.illumination, processor.translations, processor.nframes, processor.nx, processor.ny, processor.resolution, processor.truth, processor.translations_x, processor.translations_y, processor.Nx, processor.Ny
+    
     ###
     
     print("geometry: img size:", (Nx, Ny), "frames:", (nx, ny, nframes))
     print( "not refining illumination, starting with good one, maxiter:", maxiter,)
 
     ###
-    img_initial = xp.ones((Nx, Ny))
+    img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
     nrm0 = xp.linalg.norm(truth)
     test_result = {'SNR':[],'img':[],'frames':[],'illum':[],'residuals_AP':[],'nmse':[]}
-    Split,Overlap, Gplan = Get_Mappings(processor)
+    Gplan = Get_Mappings(processor,sync)
     ###
-    
-    noise_list = noise_generator(opts['noise_low'], opts['noise_high'], xp.shape(data0),opts['noise_type'])
-    for nl in xp.arange(len(noise_list)):
-        noise = noise_list[nl]
-        data_in = data0 + noise
+    print('HERE',xp.shape(data0))
+    noise_list = noise_generator(opts['noise_low'], opts['noise_high'], xp.shape(data),opts['noise_type'])
+
+    for nl in range(len(noise_list)):
+        
+        noise = noise_list[nl].astype(data.dtype)
+        data_in = data + noise
+        Gplan = Get_Mappings(processor,sync)
         #data_in = (xp.sqrt(data0) + noise)**2 #gaussian noise
         img4, frames, illum, residuals_AP = Alternating_projections(
-        sync,
-        img_initial,
-        Gplan,
-        illumination,
-        Overlap,
-        Split,
-        data_in,
-        refine_illumination,
-        maxiter,
-        normalization=None,
-        img_truth =truth,
-        residuals_interval = residuals_interval
+            sync,
+            img_initial +0,
+            Gplan,
+            illumination +0,
+            translations_x +0,
+            translations_y +0,
+            overlap_cuda,
+            split_cuda,
+            data_in,
+            refine_illumination,
+            maxiter,
+            normalization=None,
+            img_truth =truth,
+            residuals_interval = residuals_interval
         )
-        print("total time:", timer() - t0)
-    
+        
         # calculate mse
         if residuals_AP.size > 0:
             nmse4 = residuals_AP[-1, 0]
         else:
             nmse4 = np.NaN
 
-        if GPU:
-            truth = truth.get()
-            img = img4.get()
-            residuals_AP = residuals_AP.get()
-        else:
-            img = img4
 
         test_result['SNR'].append(xp.linalg.norm(truth.ravel()) / xp.linalg.norm(noise.ravel()))
-        test_result['img'].append(img)
+        test_result['img'].append(img4)
         test_result['frames'].append(frames)
         test_result['illum'].append(illum)
         test_result['residuals_AP'].append(residuals_AP)
         test_result['nmse'].append(nmse4)
-    return test_result, img
+    return test_result, img4
    
 ############################
 def noise_generator(noise_low,noise_high,length,noise_type):
     noise = []
-    level = xp.arange(noise_low,noise_high,0.2)
+    level = xp.arange(noise_low,noise_high,0.8)
     for nl in level:
         if noise_type == 'poisson':
             noise.append(10**nl * xp.random.poisson(1, length))   
         elif noise_type == 'gaussian':
             noise.append(10**nl * xp.random.randn(length))
     return noise
+
+def 
 ############################
 
 def plotter(test_result0, test_result1, img0, image1,processor):
@@ -161,20 +170,23 @@ def plotter(test_result0, test_result1, img0, image1,processor):
     nn = len(test_result0['SNR'])
     for i in range(nn):
         plt.subplot(4, nn, i+1)
+        plt.axis('off')
         plt.title("AP Sync \n SNR MSE : (% 2.2g ,% 2.2g)" % (test_result1['SNR'][i],test_result1['nmse'][i]), fontsize=20)
-        plt.imshow(abs(test_result1['img'][i]), cmap="gray")
+        plt.imshow(abs((test_result1['img'][i]).get()), cmap="gray")
         plt.subplot(4, nn, nn + i +1)
+        plt.axis('off')
         plt.title("Difference", fontsize=20)
-        plt.imshow(abs(processor.truth) - abs(test_result1['img'][i]), cmap="jet")
-        plt.colorbar(location="bottom")
+        plt.imshow((abs(processor.truth) - abs(test_result1['img'][i])).get(), cmap="jet")
         
         plt.subplot(4, nn, 2*nn + i+1)
+        plt.axis('off')
         plt.title("AP NoSync \n SNR MSE : (% 2.2g ,% 2.2g)" % (test_result0['SNR'][i],test_result0['nmse'][i]), fontsize=20)
-        plt.imshow(abs(test_result0['img'][i]), cmap="gray")
+        plt.imshow(abs((test_result0['img'][i]).get()), cmap="gray")
         plt.subplot(4, nn, 3* nn + i +1)
+        plt.axis('off')
         plt.title("Difference", fontsize=20)
-        plt.imshow(abs(processor.truth) - abs(test_result0['img'][i]), cmap="jet")
-        plt.colorbar(location="bottom")
+        plt.imshow((abs(processor.truth) - abs(test_result0['img'][i])).get(), cmap="jet")
+        plt.colorbar(fraction=0.046, pad=0.04,location="bottom")
     
     plt.show()
 
@@ -182,20 +194,22 @@ def plotter(test_result0, test_result1, img0, image1,processor):
 
     # make a new figure with residuals
     #fig, axs = plt.subplots(nrows=3, ncols=1, sharex=True, figsize=(10, 10),dpi=1200)
+    cycler = ['red', 'green', 'blue','purple','yellow','grey']
+    
     fig, axs = plt.subplots(nrows=4, ncols=1, sharex=True, figsize=(10, 20))
     for i in range(nn) :
-        axs[0].semilogy(xp.asarray(test_result0['residuals_AP'][i][:, 0]),label = {'SNR',round(test_result0['SNR'][i],2)})
-        axs[0].semilogy(xp.asarray(test_result1['residuals_AP'][i][:, 0]),'--',label = {'SNR',round(test_result1['SNR'][i],2)})
+        axs[0].semilogy((test_result0['residuals_AP'][i][:, 0]).get(),'--',\
+                    (test_result1['residuals_AP'][i][:, 0]).get(),label = f'SNR: {(test_result0["SNR"][i]).round()}', color = cycler[i])
         axs[0].set_title("|img-f truth| (f=phase scalar)")
         axs[0].legend(loc = 'upper right')
-        axs[1].semilogy(xp.asarray(test_result0['residuals_AP'][i][:, 3]))
-        axs[1].semilogy(xp.asarray(test_result1['residuals_AP'][i][:, 3]),'--')
+    
+        axs[1].semilogy((test_result0['residuals_AP'][i][:, 3]).get(),'--',(test_result1['residuals_AP'][i][:, 3]).get(),color = cycler[i]) 
         axs[1].set_title("|truth|/|img-f truth| (f=phase scalar)")
-        axs[2].semilogy(test_result0['residuals_AP'][i][:, 1])
-        axs[2].semilogy(test_result1['residuals_AP'][i][:, 1],'--')
+    
+        axs[2].semilogy((test_result0['residuals_AP'][i][:, 1]).get(),'--',(test_result1['residuals_AP'][i][:, 1]).get(),color = cycler[i])
         axs[2].set_title("||frames|-data|")
-        axs[3].semilogy(test_result0['residuals_AP'][i][:, 2])
-        axs[3].semilogy(test_result1['residuals_AP'][i][:, 2],'--')
+   
+        axs[3].semilogy((test_result0['residuals_AP'][i][:, 2]).get(),'--',(test_result1['residuals_AP'][i][:, 2]).get(),color = cycler[i])
         axs[3].set_title("frames overlapped")
     plt.show()
 

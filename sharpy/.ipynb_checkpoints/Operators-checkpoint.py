@@ -83,7 +83,7 @@ def IPropagate(frames):
     return ifft2(frames)
 
 
-eps = xp.float32(1e-2)
+eps = xp.float32(1e-16)
 
 
 if GPU:
@@ -92,7 +92,9 @@ if GPU:
     def ProxD(x, y, eps):
         # return   x* cpx.rsqrt(((x*x.conj()).real+eps)/(y+eps))
         # return   x* cpx.rsqrt(((xp.real(x)*xp.real(x.real)+xp.imag(x)**2)+eps)/(y+eps))
-        return x * cpx.rsqrt(((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps) / (y + eps))
+        #return x * cpx.rsqrt(((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps) / (y + eps))
+        return x * xp.sqrt((y + eps) )/ xp.sqrt(((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
+
 
 else:
 
@@ -562,8 +564,9 @@ if zQQz_raw_kernel == None:
 def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm):
     
     t0 = timer()
-    
+   
     value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
+   
     timers['Gramiam'] = timer()-t0
     
     t0 = timer()
@@ -625,10 +628,16 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     
     # calculates the wrapping effect for a period boundary
     #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(float) - (dx > (Nx / 2)).astype(float)))
-    dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
+    @xp.fuse(kernel_name="wrap_boundary")
+    def wrap_boundary(dx,Nx):
+        return -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
+       
+    #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
+    dx = wrap_boundary(dx,Nx)
     #dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(float) - (dy > (Ny / 2)).astype(float)))
-    dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(int) - (dy > (Ny / 2)).astype(int)))
-
+    #@xp.fuse(kernel_name="wrap_boundary2")
+    #dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(int) - (dy > (Ny / 2)).astype(int)))
+    dy =  wrap_boundary(dy,Ny)
     # find the all the frames idex that overlaps
     row, col = xp.where((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)) 
     
@@ -644,24 +653,28 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     
     
     nnz = col.size
-    val=xp.empty((nnz,1),dtype=xp.complex64)
+    #val=xp.empty((nnz,1),dtype=xp.complex64) 
+    val=xp.zeros((nnz,1),dtype=xp.complex64) 
     
     # plan = {"col": xp.ascontiguousarray(col), "row": xp.ascontiguousarray(row), "dx": dx, "dy": dy,"val": val, "bw": bw}
     plan = {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy,"val": val, "bw": bw,"val2H":val2H,"gram_calc":None}
-        
+    
     # we can pass the function instead of the plan
     if GPU: 
         nthreads = 128
         nnz = len(col)
         nblocks = nnz 
-        def gram_calc(frames,frames_norm, illumination, normalization, value=val):
+        def gram_calc(frames,frames_norm, illumination, normalization, value=val+0):
+        #def gram_calc(frames,frames_norm, illumination, normalization, value=val):
+       
             cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
             ((int(nblocks),),(int(nthreads),), \
             (value,frames,frames_norm, illumination, normalization,col.astype(int),row.astype(int),dx,dy,bw,nnz, nx, ny))
             return value
         
         plan["gram_calc"] = gram_calc
-        
+      
+ 
     return plan
     
 def Precondition_calc(frames, bw=0):
@@ -696,41 +709,193 @@ else:
     from scipy.sparse.linalg import eigsh
 
 
-def Eigensolver(H):
+def Eigensolver(H,num_iter):
     time0 = timer()
 
     nframes = xp.shape(H)[0]
     # print('nframes',nframes)
     if GPU: 
-        '''
+        
+        #print('IS H herm', H - H.transpose().conj())
         #use sparsity, and hermitian, use only triu
-        v0 = xp.ones((nframes),xp.complex64)
-        eigenvalues, eigenvectors = eigsh(H, k=1, ncv=3, maxiter=5, v0=v0, which="LM", tol=1e-3)
-        #eigenvalues, eigenvectors = eigsh(H, k=1,v0=v0,  which="LM", tol=1e-6)
+        #v0 = xp.ones((nframes),xp.complex64)
+        #eigenvalues, eigenvectors = eigsh(H, k=1, ncv=3, maxiter=5, v0=v0, which="LM", tol=1e-3)
+        #eigenvalues, eigenvectors = eigsh(H, k=1, ncv = 1, v0=v0,  which="LM", tol=0)
+        #eigenvalues,eigenvectors = xp.linalg.eigh(H.todense())
+        #print(xp.argmax(eigenvalues))
+        #v0 = np.ones((nframes,1),np.complex64)
+        #eigenvalues, eigenvectors = sp.sparse.linalg.eigsh(H.get(), k=10, which="LM", v0=v0, tol=0)
+        #eigenvalues, eigenvectors = sp.sparse.linalg.eigs(H.get(), k=64, which="LM", v0=v0, tol=0)
+    
+        '''
+        eigenvectors = xp.ones((nframes,1),xp.complex64)
+        for _ in range(num_iter):
+            eigenvectors = H * eigenvectors
         '''
         
-        v0 = np.ones((nframes),xp.complex64)
-        eigenvalues, eigenvectors = sp.sparse.linalg.eigsh(H.get(), k=1, which="LM", v0=v0, tol=1e-3)
-
+        ###complex 128
+        #v0 = xp.ones((nframes,),xp.complex128)
+        #v0 /= xp.linalg.norm(v0)
+        #H1 = H.astype(xp.complex128)
+        #eigenvalues, eigenvectors = eigsh(H1, k =2, which="LM", v0= v0, ncv = 6, tol=1e-6,return_eigenvectors = True) #
+        #eigenvectors = eigenvectors.astype(xp.complex64)
+      
+        if H.size>20:
+            #v0 = xp.ones((nframes,),xp.complex64)
+            #eigenvalues, eigenvectors = eigsh(H, k =3, ncv = 9, v0 = v0, which="LM", return_eigenvectors = True) #
+            eigenvectors = xp.ones((nframes,1),xp.complex64)
+            for _ in range(num_iter):
+                eigenvectors = H * eigenvectors
+        else:
+            eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense())
+            eigenvectors = xp.array(eigenvectors)
+        #eigenvalues, eigenvectors = eigsh(H1 , k=2,ncv = 6, v0 = v0, maxiter = 10,which="LM", tol=1e-6,return_eigenvectors = True) # if dont specify starting point v0, converges to another eigenvector
+        #eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense()) #working
+        #eigenvalues,eigenvectors = xp.linalg.eigh(H.todense()) #not working
         
-        #eigenvalues, eigenvectors = eigsh(H, k=1,v0=v0,  which="LM", tol=1e-6)
+         
+    '''    
     else:
+        print(type(H))
         v0 = xp.ones((nframes, 1),xp.complex64)
-        eigenvalues, eigenvectors = eigsh(H, k=1, which="LM", v0=v0, tol=1e-9)
-   
-    # if dont specify starting point v0, converges to another eigenvector
-    omega = xp.array(eigenvectors[:, 0])
+        eigenvalues, eigenvectors = eigsh(H, k=3, which="LM", tol=1e-9)
+    
+    #result by the eigsh
+    #omega0 = xp.array(eigenvectors[:,-1])
+    #so = xp.sign(omega1)[0] #substract the common phase for eigsh. The angle tends to jump between theta and -theta. so force the angle between [0,\pi]
+    #so = xp.sign(xp.sum(omega1)) #common phase
+    #omega1 /= so
+
+    #result by power it
+    #omega0 = eigenvectors[:, 0]
+    #omega0 /= xp.linalg.norm(omega0) #normalize
+    
+    #correct for the blow up the difference for small magnitude
+    #mask = xp.abs(omega1)< (1e-3 /nframes) #amp
+    #omega1[mask] = 1
+    #omega11 = omega1 / xp.abs(omega1) #blow up the difference for small magnitude
+    #mask2 = (xp.abs(xp.angle(omega11)) < xp.pi/8)*1 #angle
+    #omega11 *= -mask  + 1
+    #omega11[mask] = 1
+    
+    
+    #gradient decent for 10 steps
+    w1 = eigenvectors[:,-1]
+    so = xp.sign(xp.sum(w1)) #common phase
+    w1 /= so
+    w2 = eigenvectors[:,-2]
+    so = xp.sign(xp.sum(w2)) #common phase
+    w2 /= so
+    w3 = eigenvectors[:,-3]
+    so = xp.sign(xp.sum(w3))
+    w3 /= so
+    a1 = xp.sqrt(w1.size)/2 
+    a2 = 0.01*a1* 1j
+    ss = 0.01
+    
+    
+    import matplotlib.pyplot as plt
+    plt.imshow((xp.reshape(xp.abs(w1),(64,64))).get())
+    plt.colorbar()
+    plt.show()
+    plt.imshow((xp.reshape(xp.abs(w2),(64,64))).get()) #in the hope that when abs(w1(i))~= 0, abs(w2(i))~= 1
+    plt.colorbar()
+    plt.show()
+    plt.imshow((xp.reshape(xp.abs(w3),(64,64))).get()) #in the hope that when abs(w1(i))~= 0, abs(w2(i))~= 1
+    plt.colorbar()
+    plt.show()
+    
+    print(xp.linalg.norm(w1),xp.linalg.norm(w2))
+    omega0 = a1 * w1 + a2 * w2
+    print(xp.linalg.norm(omega0))
+    print('decent?', evalf(a1,a2,w1,w2),a1,a2)
+    
+    for _ in range(5000):
+        grad1,grad2 = gradientf(a1,a2,w1,w2)
+        a1 = a1 - ss *grad1
+        a2 = a2 - ss * grad2
+    
+    print('decent?', evalf(a1,a2,w1,w2),a1,a2)
+    
+    print(xp.linalg.norm(w1),xp.linalg.norm(w2))
+    omega0 = a1 * w1 + a2 * w2
+    print(xp.linalg.norm(omega0))
+    
+    plt.imshow((xp.reshape(xp.abs(omega0),(64,64))).get()) #in the hope that when abs(w1(i))~= 0, abs(w2(i))~= 1
+    plt.colorbar()
+    plt.show()
+    
+    plt.imshow((xp.reshape(xp.angle(omega0),(64,64))).get()) #in the hope that when abs(w1(i))~= 0, abs(w2(i))~= 1
+    plt.clim(-0.02,0.06)
+    plt.show()
+    '''
+    omega0 = eigenvectors[:,-1]
+    #random sign problem by eigsh
+    '''
+    so = xp.sign(xp.sum(omega0)) 
+    omega0 /= so
+    print(omega0)
+    '''
+
+    omega0 /= xp.abs(omega0)
+
+    #common phase
+    so = xp.conj(xp.sum(omega0)) 
+    so /= xp.abs(so)
+    omega0 *= so
+
+
+    
     timers["Eigensolver"] += timer() - time0
-
-    omega = omega / xp.abs(omega)
-
+    
+    '''
+    plt.imshow(abs(np.reshape(omega11.get()-omega0.get(),(64,64))))
+    plt.colorbar()
+    plt.show()
+    plt.imshow(np.reshape(np.angle(omega11.get()),(64,64)))
+    plt.colorbar()
+    plt.show()
+    plt.imshow(np.reshape(np.angle(omega0.get()),(64,64)))
+    plt.colorbar()
+    plt.show()
+    '''
     # subtract the average phase
-    so = xp.conj(xp.sum(omega))
-    so /= abs(so)
-    omega *= so
+    #so = xp.conj(xp.sum(omega))
+    #so /= abs(so)
+    #omega *= so
     ########
 
-    omega = xp.reshape(omega, (nframes, 1, 1))
+    #omega = xp.reshape(omega11, (nframes, 1, 1))
+    omega = xp.reshape(omega0, (nframes, 1, 1))
+    return omega
+
+#def Eigensolver(H,eigsh_tol, eigsh_maxiter,power_it,power_iterations):
+def Eigensolver_c(H,num_iter=5):
+    time0 = timer()
+
+    nframes = H.shape[1]
+    
+    eigenvectors = xp.random.rand(nframes,1,dtype = xp.float32) + 1j * xp.random.rand(nframes,1,dtype = xp.float32)
+    for _ in range(num_iter):
+        eigenvectors = H @ eigenvectors
+        eigenvectors /= xp.linalg.norm(eigenvectors)
+    ########
+    omega = xp.array(eigenvectors[:, 0])
+    
+    omega /= xp.linalg.norm(omega)
+   
+    timers["Eigensolver"] += timer() - time0
+
+    # subtract the average phase
+    omega0 = omega + 0 
+    omega0 /= xp.abs(omega0)
+    so = xp.conj(xp.sum(omega0))
+    so /= abs(so)
+    
+    omega *= so
+  
+    ########
+   
     return omega
 
 def mapu2all(row, col , nframes):
@@ -764,16 +929,19 @@ def mapu2all(row, col , nframes):
     
     return   val2H
 
-# def synchronize_frames_c(frames, illumination, normalization,translations_x,translations_y,nframes,nx,ny,Nx,Ny):
-def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan, bw=0):
+
+def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan, bw=0,num_iter=5):
     # col,row,dx,dy=frames_overlap(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
     # Gramiam = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
-
+    
     time0 = timer()
     timers["Sync_setup"] += timer() - time0
-    if GPU:
+    if GPU:     
         H = Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm)
-
+        
+        #H = (H + H.transpose().conj())
+        #print('Here is H', H.todense()) 
+      
     else:
         framesl = Illuminate_frames(frames, xp.conj(illumination))
         framesr = framesl * normalization
@@ -791,10 +959,45 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
     '''
     
     # compute the largest eigenvalue of H1
-    omega = Eigensolver(H)
     
+    #omega = Eigensolver(H)
+    #if type(eig_plan) == type(None):
+        #omega = Eigensolver(H,eigsh_tol = 1e-6, eigsh_maxiter = None,power_it = False,power_iterations = 5)
+    omega = Eigensolver(H,num_iter)
+    '''
+    eig = sp.sparse.linalg.eigs(H.get())
+    eigs = eig[0][0]
+    eigv = eig[1][:,0]
+    print(eigv.shape)
+    print('HELLOOOOO', xp.linalg.norm( H.get() * eigv - eigs * eigv))
+    print('11',xp.linalg.norm(eigv))
+    '''
+    '''
+    else:
+        tol = eig_plan['tol'] #tol for eig solver
+        maxiter = eig_plan['maxiter'] #maxiter for eig solver
+        power_it = eig_plan['power_it'] #boolean power iteration
+        num_iterations = eig_plan['num_iterations'] #number of power iteration step
+        print(tol,maxiter,power_it,num_iterations)
+        #omega = Eigensolver(H,tol, maxiter,power_it,num_iterations)
+        omega = Eigensolver(H)
+    '''
     return omega
 
+from wrap_ops import refine_illumination_cuda
+def synchronize_illum_c(nrm_illumination, frames,normalization, plan, num_iter=5):
+    
+    if GPU:     
+        A = refine_illumination_cuda(frames,normalization, plan)
+
+    omega = Eigensolver_c(A,num_iter)
+    omega = xp.reshape(omega,(frames.shape[1],frames.shape[2]))
+    omega *= nrm_illumination
+    
+    import matplotlib.pyplot as plt
+    plt.imshow(abs(omega.get()))
+    plt.show()
+    return omega
 
 # def synchronize_frames_plan(inormalization_split,Gramiam):
 #    omega=lambda frames synchronize_frames_c(frames, illumination, inormalization_split, Gramiam)
@@ -804,6 +1007,7 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
 
 def mse_calc(img0, img1):
     # calculate the MSE between two images after global phase correction
+    
     nnz = xp.size(img0)
     # compute the best phase
     phase = xp.dot(xp.reshape(xp.conj(img1), (1, nnz)), xp.reshape(img0, (nnz, 1)))[
@@ -855,3 +1059,23 @@ def circular_aperture(radius,img):
                 aperture[i,j] = 1              
     return aperture
 
+def gradientf(a1,a2,w1,w2):
+    #this function calculate the gradient of f(a1,a2,w1,w2)=\| abs(a1w1+a2w2) - ones \|^2
+    #a1,a2 are two complex scalrs, w1 w2 are top two orthonormal complex vectors
+    
+    denom = xp.abs(a1*w1 +a2*w2)
+    alpha11 = xp.sum(xp.abs(w1)**2/denom)
+    alpha12 = xp.sum(xp.conj(w1) * w2/denom)
+    
+    alpha21 = xp.sum(xp.abs(w2)**2/denom)
+    alpha22 = xp.sum(xp.conj(w2) * w1/denom)
+    
+    #gradient w.r.t a1
+    grad1 = a1 - a1*alpha11  - a2 * alpha12
+    grad2 = a2 - a2*alpha21  - a1 * alpha22
+    
+    return grad1, grad2
+
+def evalf(a1,a2,w1,w2):
+    #evaluate f(a1,a2,w1,w2)=\| abs(a1w1+a2w2) - ones \|^2
+    return xp.linalg.norm(xp.abs(a1*w1+a2*w2) - xp.ones(w1.shape))**2

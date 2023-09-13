@@ -7,7 +7,7 @@ from Operators import (
     mse_calc,
     Precondition_calc
 )
-from Operators import Replicate_frame
+from Operators import Replicate_frame, synchronize_illum_c
 from wrap_ops import overlap_cuda,split_cuda
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -27,7 +27,7 @@ eps0 = xp.float32(1e-2)
 
 eps_illum = None
 
-
+reg = 1e-8 #for sync normalizations
 ############################################
 # timings
 #
@@ -393,7 +393,7 @@ def Alternating_projections_c(
     sync,
     img,
     Gramiam,
-    illumination,
+    illumination_truth,
     translations_x,
     translations_y,
     overlap_cuda,
@@ -404,6 +404,8 @@ def Alternating_projections_c(
     normalization,
     img_truth,
     residuals_interval,
+    sync_interval=1,
+    num_iter = 5
 ):
     """
     Parameters
@@ -430,7 +432,8 @@ def Alternating_projections_c(
         normalization, computed internally if None. The default is None.
     img_truth : TYPE, optional
         truth, used to compare . The default is None.
-
+    eig_plan: dictionary for eigensolver, optional
+    
     Returns
     -------
     img : TYPE
@@ -464,10 +467,12 @@ def Alternating_projections_c(
 
     # we need the frames norm to normalize
     frames_norm_sum = xp.linalg.norm(xp.sqrt(frames_data))
+
     # renormalize the norm for the ifft2 space
     frames_norm_r = frames_norm_sum / xp.sqrt(xp.prod(xp.array(frames_data.shape[-2:])))
-    translations = (translations_x + 1j * translations_y).astype(np.complex64)
-    
+ 
+    translations = (translations_x + 1j * translations_y).astype(xp.complex64)
+ 
     # Prox_data = prox_data_plan(frames_data)
 
     if GPU:
@@ -486,9 +491,11 @@ def Alternating_projections_c(
     # get the frames from the inital image
     if GPU:
         frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
-        split_cuda(img, frames, translations, illumination)
+      
+        split_cuda(img, frames, translations, illumination_truth)
+
     else:
-        frames = Illuminate_frames(Split(img), illumination)
+        frames = Illuminate_frames(Split(img), illumination_truth)
 
     if GPU:
         print(
@@ -504,34 +511,38 @@ def Alternating_projections_c(
         print("----")
 
     nresiduals = int(np.ceil(maxiter / residuals_interval))
-
+    
     # residuals = xp.zeros((maxiter,3),dtype=xp.float32)
     residuals = xp.zeros((nresiduals, 4), dtype=xp.float32)
 
+    if refine_illumination == True:
+        nrm_illumination = xp.linalg.norm(illumination_truth)     
+        #eps_illum = 1e-8
+    else:
+        illumination = illumination_truth + 0
+        
     if type(img_truth) != type(None):
         nrm_truth = xp.linalg.norm(img_truth)
-    if type(normalization) == type(None):
+
+    if refine_illumination == False and type(normalization) == type(None) and sync == True:
         nframes = xp.shape(frames_data)[0]
-        #normalization = Overlap(Replicate_frame(xp.abs(illumination) ** 2, nframes)
-        #print(illumination.shape,img_truth.shape)
-        #print( translations.dtype,type( translations))
         normalization = xp.zeros(img_truth.shape,dtype = xp.complex64)
         overlap_cuda(normalization, 0, translations, illumination) 
- 
-    # refine_illumination = 1
-    # eps_illum = None
-    # eps0 = 1e-2
-    
-    if sync == True:
-        reg = 1e-8
+        
+
+    if  refine_illumination == False and sync == True:
+        
 
         if GPU:
             inormalization_split = xp.zeros(frames_data.shape,dtype = xp.complex64)
             split_cuda(1/(normalization+reg),inormalization_split,translations, 0)
+            
             #print(inormalization_split)
         else:
             #inormalization_split = Split(1/(normalization+1e-8))
             inormalization_split = Split(1/(normalization))
+        
+    if sync == True:
         frames_norm = Precondition_calc(frames, bw=Gramiam['bw'])
         
   
@@ -551,7 +562,7 @@ def Alternating_projections_c(
         print("----")
 
     compute_residuals = False
-
+    iii = True #if print
     for ii in tqdm(range(maxiter)):
 
         # data projection
@@ -565,12 +576,14 @@ def Alternating_projections_c(
         frames, mse_data = Project_data(
             frames, frames_data, compute_residuals=compute_residuals
         )
+        
         # if GPU and ii<2:
         #     print('in loop, after Prox data memory used, and total normalized:', mempool.used_bytes()/frames_data.nbytes,mempool.total_bytes()/frames_data.nbytes )
         #     print('----')
 
         if compute_residuals:
             residuals[ii // residuals_interval, 1] = mse_data
+           
         timers["ProxD"] += timer() - t0
 
         t0 = timer()
@@ -582,15 +595,45 @@ def Alternating_projections_c(
         #     print('in loop, after copy memory used, and total normalized:', mempool.used_bytes()/frames_data.nbytes,mempool.total_bytes()/frames_data.nbytes )
         #     print('----')
 
+        ##################
+        #here goes refine_illumination
+        t0 = timer()
+
+        if refine_illumination:
+            if False :
+                print("refining illum")
+                illumination, normalization = refine_illumination_function(
+                img, illumination, frames, Split, Overlap, lens_mask=None
+            )
+            else:
+                print(frames.dtype)
+                normalization_illum = xp.linalg.norm(frames, axis = 0).astype(xp.complex64)
+               
+                illumination = synchronize_illum_c(nrm_illumination, frames,normalization_illum, Gramiam, num_iter=1)
+                print(illumination)
+                plt.imshow(abs(illumination.get()))
+                plt.show()
+        timers["refine_illumination"] += timer() - t0
+
+
         ####################
         # here goes the synchronization
         if sync==True:
+
             t0 = timer()
-            omega=synchronize_frames_c(frames, illumination, frames_norm, inormalization_split, Gramiam, Gramiam['bw'])
-            frames=frames*omega
+            if ii%sync_interval == 0:
+  
+                if refine_illumination:
+                    #update the normalization after illum refinement 
+                    normalization = xp.zeros(img_truth.shape,dtype = xp.complex64)
+                    overlap_cuda(normalization, 0, translations, illumination) 
+                    inormalization_split = xp.zeros(frames_data.shape,dtype = xp.complex64)
+                    split_cuda(1/(normalization+reg),inormalization_split,translations, 0)         
+                 
+                #omega=synchronize_frames_c(frames, illumination, frames_norm, inormalization_split, Gramiam, Gramiam['bw'],num_iter)
+                #frames = frames * omega
+                
             timers["Sync"] += timer() - t0
-           
-        ##################
         
         ##################
         # overlap projection
@@ -600,21 +643,11 @@ def Alternating_projections_c(
         else:
             img *= 0 
             overlap_cuda(img, frames,translations, illumination) 
-            img = img/normalization
+            img = img/(normalization+reg)
+            plt.imshow(abs(img.get()))
+            plt.show()
             
         timers["Overlap"] += timer() - t0
-
-        t0 = timer()
-
-        if refine_illumination and ii > 5:
-            print("refining illum")
-            illumination, normalization = refine_illumination_function(
-                img, illumination, frames, Split, Overlap, lens_mask=None
-            )
-        # else:
-        #    print('not refining')
-
-        timers["refine_illumination"] += timer() - t0
 
         t0 = timer()
         
@@ -640,6 +673,10 @@ def Alternating_projections_c(
             if compute_residuals:
                 nmse0 = mse_calc(img_truth, img)
                 residuals[ii // residuals_interval, 0] = nmse0
+                if (nmse0/nrm_truth < 1e-4) and (iii == True):
+                    iii = False
+                    print(f'nmse0 reach 1e-4 accuracy in {ii} iterations and {timer() - t000} time')
+                    #break
             timers["mse_truth"] += timer() - t0
         timers["loop_intrnl"] += timer() - t0_loop
 

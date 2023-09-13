@@ -47,10 +47,11 @@ dotp(
         if (blockIdx.x == 1 && threadIdx.x == 0) {
             printf("col: %d, row: %d\n", col00, row00);
            }
-       */    
+       */
+       
         long long int Dx = frame_width - abs(dx[ii]) - 2*bw; /*integration width */
         long long int Dy = frame_height - abs(dy[ii]) - 2*bw; /*integration height */
-       
+      
        
         /*row-wise*/
         /* offset, including row */
@@ -93,10 +94,13 @@ dotp(
                     }
                 
                 */
-                 Sum0 += thrust::conj(frames[ii1]) * illumination[ii3] * frames[ii2] * thrust::conj(illumination[ii4]) * normalization[ii2]; /* conj/not */
+                if(illumination){
+                    Sum0 += thrust::conj(frames[ii1]) * illumination[ii3] * frames[ii2] * thrust::conj(illumination[ii4]) * normalization[ii2]; }
+                else{   
+                    Sum0 += thrust::conj(frames[ii1])  * frames[ii2] * normalization[ii2]; 
                 }
 
-                
+                }
       
         // Compute the block-wide sum for thread0
         thrust::complex< float >  Sum1 = BlockReduce(temp_storage).Sum(Sum0);

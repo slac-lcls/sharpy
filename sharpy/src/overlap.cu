@@ -25,8 +25,8 @@ Overlap(thrust::complex< float >  * image,
                 f_x = i%frame_width;
                 f_y = i/frame_width;
                 
-		int g_x = ((int)(translations[fid].x) + f_x)%img_width;
-		int g_y = ((int)(translations[fid].y) + f_y)%img_height;
+		int g_x = ((int)(translations[fid].x) + f_x)%img_width; //periodic boundary
+		int g_y = ((int)(translations[fid].y) + f_y)%img_height; //periodic boundary
         
         /*
 		if(g_x >= img_width || g_y >= img_height){
@@ -51,7 +51,7 @@ Overlap(thrust::complex< float >  * image,
 			else{
 				//...or we have the "illumination * Conj(illumination)" which is the "abs(illumination)^2"
 				overlap_output = overlap_output * thrust::conj(overlap_output);
-
+                
 			}
 		}
 		else{

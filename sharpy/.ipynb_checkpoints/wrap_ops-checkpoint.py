@@ -1,5 +1,6 @@
 import pkg_resources
 import cupy as cp
+import cupyx.scipy.sparse as sparse
 
 # hardcodeds
 nthreads = 256
@@ -10,6 +11,7 @@ nthreads = 256
 split_raw_kernel = None
 overlap_raw_kernel = None
 gram_raw_kernel = None
+refine_illum_raw_kernel = None
 
 resource_package = __name__
 
@@ -32,9 +34,14 @@ with open(file_name, 'r') as myfile:
 resource_path = '/'.join(('src','zQQz.cu'))
 file_name = pkg_resources.resource_filename(resource_package, resource_path)
 with open(file_name, 'r') as myfile:
-        gram_raw_kernel = myfile.read()
+    gram_raw_kernel = myfile.read()
         
 
+resource_path = '/'.join(('src','refine_illumination.cu'))
+file_name = pkg_resources.resource_filename(resource_package, resource_path)
+with open(file_name, 'r') as myfile:
+    refine_illum_raw_kernel = myfile.read()
+        
 # ==================
 # wrap cuda kernels
 # ==================
@@ -59,12 +66,20 @@ def overlap_cuda(image, frames, translations, illumination):
        frames_x = frames.shape[2] 
     '''
     nthreads = 256 
+    
     if type(image)== type(None):
         image = xp.zeros((1)) #--?
     # we could verify that frames illumination and translations shapes are consistent
-    cp.RawKernel(overlap_raw_kernel, "Overlap") \
+    
+    if type(frames) == int:
+        cp.RawKernel(overlap_raw_kernel, "Overlap") \
         ((int(translations.size),), (int(nthreads),), \
-        (image, frames, translations, illumination, image.shape[0], image.shape[1], translations.size, illumination.shape[0], illumination.shape[1]))
+        (image, frames, cp.ascontiguousarray(translations), cp.ascontiguousarray(illumination), image.shape[0], image.shape[1], translations.size, illumination.shape[0], illumination.shape[1]))
+    else:
+        cp.RawKernel(overlap_raw_kernel, "Overlap") \
+        ((int(translations.size),), (int(nthreads),), \
+        (image, cp.ascontiguousarray(frames), cp.ascontiguousarray(translations), cp.ascontiguousarray(illumination), image.shape[0], image.shape[1], translations.size, illumination.shape[0], illumination.shape[1]))
+        
 
     return image
 
@@ -83,10 +98,22 @@ def split_cuda(image, frames, translations, illumination):
     #nblocks = (frames.shape[0]+ frames_per_block-1)/frames_per_block
     nblocks = frames.shape[0]
 
-    cp.RawKernel(split_raw_kernel, "Split") \
+    if type(image) == int and type(illumination) == int:
+        cp.RawKernel(split_raw_kernel, "Split") \
         ((int(nblocks),), (int(nthreads),), \
-        (image, frames, translations, illumination, int(image.shape[0]), int(image.shape[1]), int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]), int(nthreads), int(tsize)))
-
+        (image, frames, cp.ascontiguousarray(translations), illumination, int(image.shape[0]), int(image.shape[1]), int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]), int(nthreads), int(tsize)))
+    elif type(image) == int and type(illumination) != int:
+        cp.RawKernel(split_raw_kernel, "Split") \
+        ((int(nblocks),), (int(nthreads),), \
+        (image, frames, cp.ascontiguousarray(translations), cp.ascontiguousarray(illumination), int(image.shape[0]), int(image.shape[1]), int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]), int(nthreads), int(tsize)))
+    elif type(image) != int and type(illumination) == int:
+        cp.RawKernel(split_raw_kernel, "Split") \
+        ((int(nblocks),), (int(nthreads),), \
+        (cp.ascontiguousarray(image), frames, cp.ascontiguousarray(translations), illumination, int(image.shape[0]), int(image.shape[1]), int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]), int(nthreads), int(tsize)))
+    else:
+        cp.RawKernel(split_raw_kernel, "Split") \
+        ((int(nblocks),), (int(nthreads),), \
+        (cp.ascontiguousarray(image), frames, cp.ascontiguousarray(translations), cp.ascontiguousarray(illumination), int(image.shape[0]), int(image.shape[1]), int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]), int(nthreads), int(tsize)))
     return frames
 
 def Gramiam_calc_cuda(frames, illumination,normalization,frames_norm, gram_calc):
@@ -173,5 +200,31 @@ def Gramian_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
 
 #    lambda Gramiam1
 #    H=Gramiam(nframes,framesl,framesr,col,row,nx,ny,dx,dy)
+
+
+def refine_illumination_cuda(frames,normalization, plan):
+    col = plan['col']
+    row = plan['row']
+    dx = plan['dx']
+    dy = plan['dy']
+    bw = plan['bw']
+    
+    nnz = len(col)
+    nblocks = nnz
+    
+    #initilize matrix
+    A = cp.empty((frames.shape[1]*frames.shape[2],frames.shape[1]*frames.shape[2]), dtype = cp.complex64) 
+    print(A.shape)
+    
+    cp.RawKernel(refine_illum_raw_kernel,"Refine_illum")\
+        ((int(nblocks),),(int(nthreads),), \
+        (A,cp.ascontiguousarray(frames), cp.ascontiguousarray(normalization),col,row,dx,dy,bw,nnz, int(frames.shape[1]), int(frames.shape[2])))
+   
+    print('is there nan value in A',cp.any(cp.isnan(A)))
+    A = sparse.coo_matrix(A)
+    A += sparse.triu(A, k=1).conj().T
+    A = A.tocsr()
+ 
+    return A
 
 

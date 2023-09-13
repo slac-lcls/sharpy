@@ -36,7 +36,7 @@ else:
 
 ##################################################
 # input data
-fname_in = "simulation.h5"
+#fname_in = "simulation.h5"
 fid = h5py.File(fname_in, "r")
 
 #data = xp.array(fid["data"], dtype=xp.float32) 
@@ -56,12 +56,15 @@ resolution = (
 translations = translations / resolution
 
 truth = xp.array(fid["truth"], dtype=xp.complex64)
+
+translations_x = xp.array(fid["translations_x"]) #load the real and imag of dtype int64
+translations_y = xp.array(fid["translations_y"])
 fid.close()
 
 #################################################
 
-translations_x = xp.real(translations)
-translations_y = xp.imag(translations)
+#translations_x = xp.real(translations)
+#translations_y = xp.imag(translations)
 
 # get the image extent (with wrap-around)
 #Nx = xp.int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
@@ -86,7 +89,7 @@ if GPU:
     print("----")
 
 
-Split, Overlap = Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
+#Split, Overlap = Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 if GPU:
     mempool = cp.get_default_memory_pool()
@@ -104,10 +107,17 @@ if GPU:
     print("----")
 
 if sync == True:
-   Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny)
-
+    if GPU:
+       #calculate the preconditioner here
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        #print('plan',Gplan['col'],Gplan['row'],Gplan['dx'],Gplan['dy'],Gplan['val'])
+    else:
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        
+    if Gplan['col'].size == 0:
+        sync = False
 else: 
-   Gplan = None
+    Gplan = None
 
 
 
@@ -115,7 +125,7 @@ img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
 ############################
 # reconstruct
 refine_illumination = False
-maxiter = 100
+maxiter = 1
 # residuals_interval = np.inf
 residuals_interval = 1
 
@@ -131,20 +141,24 @@ test_result = {'SNR':[],'img':[],'frames':[],'illum':[],'residuals_AP':[],'nmse'
 for nl in range(-3,2):
     noise = 10**nl * xp.random.poisson(1, xp.shape(data0))
     data_in = data0 + noise
+    
+    t0 = timer()
     img4, frames, illum, residuals_AP = Alternating_projections(
     sync,
     img_initial,
     Gplan,
     illumination,
-    Overlap,
-    Split,
-    data_in,
+    translations_x,
+    translations_y,
+    overlap_cuda,
+    split_cuda,
+    data,
     refine_illumination,
     maxiter,
     normalization=None,
     img_truth =truth,
     residuals_interval = residuals_interval
-    )
+)
     print("total time:", timer() - t0)
     
     # calculate mse

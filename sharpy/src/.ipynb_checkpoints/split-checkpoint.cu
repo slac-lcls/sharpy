@@ -40,11 +40,10 @@ Split(thrust::complex< float > * image,
         */
         
 		thrust::complex< float > image_pixel = image[g_y*img_width + g_x];
-                thrust::complex< float > output;
+        thrust::complex< float > output;
 
-                if(illumination){
-
-                	output = image_pixel * illumination[i];
+        if(illumination){
+            output = image_pixel * illumination[i];
 		}
 		else{
 			output = image_pixel;
