@@ -213,7 +213,7 @@ def refine_illumination_cuda(frames,normalization, plan):
     nblocks = nnz
     
     #initilize matrix
-    A = cp.empty((frames.shape[1]*frames.shape[2],frames.shape[1]*frames.shape[2]), dtype = cp.complex64) 
+    A = cp.zeros((frames.shape[1]*frames.shape[2],frames.shape[1]*frames.shape[2]), dtype = cp.complex64) 
     print(A.shape)
     
     cp.RawKernel(refine_illum_raw_kernel,"Refine_illum")\

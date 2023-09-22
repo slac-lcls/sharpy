@@ -1004,6 +1004,137 @@ def synchronize_illum_c(nrm_illumination, frames,normalization, plan, num_iter=5
 #    Gramiam = lambda framesl,framesr: Gramiam_calc(framesl,framesr,nframes,col,row,nx,ny,dx,dy)
 #    return Gramiam
 
+#old version of refine_illumination
+def refine_illumination_function(
+    img, illumination, frames, Split, Overlap, lens_mask=None
+):
+    """
+    refine_illumination based on
+
+    Parameters
+    ----------
+    img : TYPE
+        input image.
+    illumination : TYPE
+        initial illumination.
+    frames : TYPE
+        frames estimate.
+    Split : TYPE
+        Split operator.
+    Overlap : TYPE
+        overlap operator.
+    lens_mask : TYPE, optional
+        lens mask in F-space to remove grid pathology. The default is None.
+
+    Returns
+    -------
+    illumination : TYPE
+        refined illumination.
+    normalization : TYPE
+        refined normalization.
+
+    """
+
+    # eps_illum = None
+    global eps_illum
+    frames_split = Split(img)
+    norm_frames = xp.mean(xp.abs(frames_split) ** 2, 0)
+    if type(eps_illum) == type(None):
+        eps_illum = xp.max(norm_frames) * eps0
+
+    illumination = xp.sum(
+        frames * xp.conj(Split(img)) + eps_illum * illumination, 0
+    ) / (norm_frames + eps_illum)
+
+    # apply mask to illumination
+    if type(lens_mask) != type(None):
+        illumination = xp.fft.fft2(illumination)
+        illumination *= lens_mask
+        illumination = xp.fft.ifft2(illumination)
+
+    normalization = Overlap(
+        Replicate_frame(xp.abs(illumination) ** 2, frames_split.shape[0])
+    )  # check
+    return illumination, normalization
+
+from wrap_ops import overlap_cuda,split_cuda
+#refine illumination based on pairwise relationship between frames
+def refine_illumination_pairwise(
+    img, illumination_start, illumination_truth, frames, translations, split_cuda, overlap_cuda, lens_mask=None
+):
+    """
+    refine_illumination based on
+
+    Parameters
+    ----------
+    img : TYPE
+        input image.
+    illumination : TYPE
+        initial illumination.
+    frames : TYPE
+        frames estimate.
+    Split : TYPE
+        Split operator.
+    Overlap : TYPE
+        overlap operator.
+    lens_mask : TYPE, optional
+        lens mask in F-space to remove grid pathology. The default is None.
+
+    Returns
+    -------
+    illumination : TYPE
+        refined illumination.
+    normalization : TYPE
+        refined normalization.
+
+    """
+
+    # eps_illum = None
+    global eps_illum
+    img0 = img * 0 
+    frames0 = frames * 0 
+    nframes = frames.shape[0]
+    
+    #matrix D^(-1/2)
+    frames_norm = (xp.abs(frames) ** 2).astype(xp.complex64)
+    nl = xp.sum(split_cuda(overlap_cuda(img0, frames_norm, translations, illumination_truth * 0 + 1), frames0, translations,0),axis = 0)
+    D_inv = 1 / xp.sqrt(nl)
+    
+    
+    #Define D^(-1/2)HD^(-1/2) as an operator
+    #@cp.fuse(kernel_name="DHD")
+    def DHD(a):
+        img0 = img * 0
+        frames0 = frames * 0
+        overlap_cuda(img0, frames.conj()* Replicate_frame(D_inv * a, nframes),translations,illumination_truth *0 + 1)
+        b = D_inv * xp.sum(frames * split_cuda(img0, frames0,translations,0),axis = 0)
+        return b
+     
+    #solve illumination by power iteration    
+    if illumination_start is None:
+        w = xp.random.rand(16,16,dtype = xp.float32) + 1j*xp.random.rand(16,16,dtype = xp.float32) 
+    else:
+        w = illumination_start
+    for _ in range(100):    
+        w = DHD(w)
+    
+    #transform back
+    illumination = D_inv * w
+    illumination *= xp.linalg.norm(illumination_truth)/xp.linalg.norm(illumination) #have same norm
+    
+    #common phase
+    phase=xp.dot(illumination.conj().ravel(),illumination_truth.ravel())
+    phase /= xp.abs(phase)
+    illumination *= phase
+    
+    # apply mask to illumination
+    if type(lens_mask) != type(None):
+        illumination = xp.fft.fft2(illumination)
+        illumination *= lens_mask
+        illumination = xp.fft.ifft2(illumination)
+
+    return illumination
+
 
 def mse_calc(img0, img1):
     # calculate the MSE between two images after global phase correction

@@ -7,7 +7,7 @@ from Operators import (
     mse_calc,
     Precondition_calc
 )
-from Operators import Replicate_frame, synchronize_illum_c
+from Operators import Replicate_frame, synchronize_illum_c,refine_illumination_pairwise
 from wrap_ops import overlap_cuda,split_cuda
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -71,59 +71,6 @@ def normalize_times(tot=None):
 
 
 ############################################
-
-
-def refine_illumination_function(
-    img, illumination, frames, Split, Overlap, lens_mask=None
-):
-    """
-    refine_illumination based on
-
-    Parameters
-    ----------
-    img : TYPE
-        input image.
-    illumination : TYPE
-        initial illumination.
-    frames : TYPE
-        frames estimate.
-    Split : TYPE
-        Split operator.
-    Overlap : TYPE
-        overlap operator.
-    lens_mask : TYPE, optional
-        lens mask in F-space to remove grid pathology. The default is None.
-
-    Returns
-    -------
-    illumination : TYPE
-        refined illumination.
-    normalization : TYPE
-        refined normalization.
-
-    """
-
-    # eps_illum = None
-    global eps_illum
-    frames_split = Split(img)
-    norm_frames = xp.mean(xp.abs(frames_split) ** 2, 0)
-    if type(eps_illum) == type(None):
-        eps_illum = xp.max(norm_frames) * eps0
-
-    illumination = xp.sum(
-        frames * xp.conj(Split(img)) + eps_illum * illumination, 0
-    ) / (norm_frames + eps_illum)
-
-    # apply mask to illumination
-    if type(lens_mask) != type(None):
-        illumination = xp.fft.fft2(illumination)
-        illumination *= lens_mask
-        illumination = xp.fft.ifft2(illumination)
-
-    normalization = Overlap(
-        Replicate_frame(xp.abs(illumination) ** 2, frames_split.shape[0])
-    )  # check
-    return illumination, normalization
 
 '''
 def Alternating_projections(
@@ -490,9 +437,11 @@ def Alternating_projections_c(
 
     # get the frames from the inital image
     if GPU:
+    
         frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
-      
-        split_cuda(img, frames, translations, illumination_truth)
+        
+        gs_noise = xp.random.random(illumination_truth.shape,dtype = xp.float32)+ 1j * xp.random.random(illumination_truth.shape,dtype = xp.float32)
+        split_cuda(img, frames, translations, illumination_truth + 1 * gs_noise)
 
     else:
         frames = Illuminate_frames(Split(img), illumination_truth)
@@ -516,7 +465,8 @@ def Alternating_projections_c(
     residuals = xp.zeros((nresiduals, 4), dtype=xp.float32)
 
     if refine_illumination == True:
-        nrm_illumination = xp.linalg.norm(illumination_truth)     
+        nrm_illumination = xp.linalg.norm(illumination_truth)
+        illumination_start = None
         #eps_illum = 1e-8
     else:
         illumination = illumination_truth + 0
@@ -606,11 +556,22 @@ def Alternating_projections_c(
                 img, illumination, frames, Split, Overlap, lens_mask=None
             )
             else:
+                illumination = refine_illumination_pairwise(
+    img_truth * 0 , illumination_start, illumination_truth, frames, translations, split_cuda, overlap_cuda, lens_mask=None
+)
+                illumination_start = illumination + 0.0 #make a copy
+                
+                '''
                 print(frames.dtype)
-                normalization_illum = xp.linalg.norm(frames, axis = 0).astype(xp.complex64)
-               
-                illumination = synchronize_illum_c(nrm_illumination, frames,normalization_illum, Gramiam, num_iter=1)
+                img00 = img_truth * 0
+                frames0 = frames + 0
+                overlap_cuda(img00, frames0, translations, illumination_truth *0 +1) 
+                split_cuda(img00,frames0,translations,0)
+                normalization_illum = xp.linalg.norm(frames0, axis = 0).astype(xp.complex64)
+                
+                illumination = synchronize_illum_c(nrm_illumination, frames,normalization_illum, Gramiam, num_iter=50)
                 print(illumination)
+                '''
                 plt.imshow(abs(illumination.get()))
                 plt.show()
         timers["refine_illumination"] += timer() - t0
@@ -626,12 +587,13 @@ def Alternating_projections_c(
                 if refine_illumination:
                     #update the normalization after illum refinement 
                     normalization = xp.zeros(img_truth.shape,dtype = xp.complex64)
-                    overlap_cuda(normalization, 0, translations, illumination) 
+                    
+                    overlap_cuda(normalization, 0, translations, illumination + 0) 
                     inormalization_split = xp.zeros(frames_data.shape,dtype = xp.complex64)
                     split_cuda(1/(normalization+reg),inormalization_split,translations, 0)         
-                 
-                #omega=synchronize_frames_c(frames, illumination, frames_norm, inormalization_split, Gramiam, Gramiam['bw'],num_iter)
-                #frames = frames * omega
+                    
+                omega=synchronize_frames_c(frames, illumination, frames_norm, inormalization_split, Gramiam, Gramiam['bw'],num_iter)
+                frames = frames * omega
                 
             timers["Sync"] += timer() - t0
         
@@ -644,6 +606,7 @@ def Alternating_projections_c(
             img *= 0 
             overlap_cuda(img, frames,translations, illumination) 
             img = img/(normalization+reg)
+            print(xp.any(xp.isnan(normalization)))
             plt.imshow(abs(img.get()))
             plt.show()
             
