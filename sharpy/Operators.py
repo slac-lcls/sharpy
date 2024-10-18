@@ -7,6 +7,7 @@ Ptycho operators
 import numpy as np
 import scipy as sp
 import multiprocessing as mp
+import matplotlib.pyplot as plt
 
 import math
 import numpy_groupies
@@ -249,6 +250,7 @@ def make_probe(nx, ny, r1=0.03, r2=0.06, fx=0.0, fy=0.0):
     fx,fy:  x-y quadradic fase (focus)
 
     """
+
     xi = xp.reshape(xp.arange(0, nx) - nx / 2, (nx, 1)) 
 
     xi = xp.fft.ifftshift(xi)
@@ -257,17 +259,17 @@ def make_probe(nx, ny, r1=0.03, r2=0.06, fx=0.0, fy=0.0):
     r1 = r1 * nx  # define zone plate circles
     r2 = r2 * nx
 
-    Fprobe = (rr >= r1) & (rr <= r2)
+    lens_mask = (rr >= r1) & (rr <= r2)
 
     phase = xp.exp(1j * fx * xp.pi * ((xi / nx) ** 2)) * xp.exp(
         1j * fy * xp.pi * ((xi.T / nx) ** 2)
     )
 
-    Fprobe = Fprobe * phase
+    Fprobe = lens_mask * phase
 
     probe = xp.fft.fftshift(xp.fft.ifft2(Fprobe))
     probe = probe / max(abs(probe).flatten())
-    return probe
+    return probe,lens_mask
 
 
 # close packing translations
@@ -708,7 +710,9 @@ if GPU:
 else:
     from scipy.sparse.linalg import eigsh
 
-
+#######
+####Eigensolver is causing problems, need implementation
+#######
 def Eigensolver(H,num_iter):
     time0 = timer()
 
@@ -727,6 +731,7 @@ def Eigensolver(H,num_iter):
         #eigenvalues, eigenvectors = sp.sparse.linalg.eigsh(H.get(), k=10, which="LM", v0=v0, tol=0)
         #eigenvalues, eigenvectors = sp.sparse.linalg.eigs(H.get(), k=64, which="LM", v0=v0, tol=0)
     
+        
         '''
         eigenvectors = xp.ones((nframes,1),xp.complex64)
         for _ in range(num_iter):
@@ -739,16 +744,29 @@ def Eigensolver(H,num_iter):
         #H1 = H.astype(xp.complex128)
         #eigenvalues, eigenvectors = eigsh(H1, k =2, which="LM", v0= v0, ncv = 6, tol=1e-6,return_eigenvectors = True) #
         #eigenvectors = eigenvectors.astype(xp.complex64)
-      
+        
+        
         if H.size>20:
-            #v0 = xp.ones((nframes,),xp.complex64)
-            #eigenvalues, eigenvectors = eigsh(H, k =3, ncv = 9, v0 = v0, which="LM", return_eigenvectors = True) #
+            '''
+            v0 = xp.ones((nframes,),xp.complex64)
+            eigenvalues, eigenvectors = eigsh(H, k =3, ncv = 9, v0 = v0, which="LM", return_eigenvectors = True) #
+            '''
+            #####
+            ## When refining illuminations, fist few H are very small (maybe due to initialization 
+            ## of illumination =0). Either change initialization or only sync after a stable 
+            ## estimation of illumination found.
+            ####
             eigenvectors = xp.ones((nframes,1),xp.complex64)
+            H.todense()
             for _ in range(num_iter):
-                eigenvectors = H * eigenvectors
+                #print(np.linalg.norm(eigenvectors))
+                eigenvectors = H @ eigenvectors
+                eigenvectors /= xp.linalg.norm(eigenvectors)
+            
         else:
             eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense())
             eigenvectors = xp.array(eigenvectors)
+        
         #eigenvalues, eigenvectors = eigsh(H1 , k=2,ncv = 6, v0 = v0, maxiter = 10,which="LM", tol=1e-6,return_eigenvectors = True) # if dont specify starting point v0, converges to another eigenvector
         #eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense()) #working
         #eigenvalues,eigenvectors = xp.linalg.eigh(H.todense()) #not working
@@ -829,7 +847,11 @@ def Eigensolver(H,num_iter):
     plt.clim(-0.02,0.06)
     plt.show()
     '''
+    
     omega0 = eigenvectors[:,-1]
+    #omega0 = eigenvectors[:,0]
+    omega0 /= xp.linalg.norm(omega0) #normalize
+  
     #random sign problem by eigsh
     '''
     so = xp.sign(xp.sum(omega0)) 
@@ -878,9 +900,10 @@ def Eigensolver_c(H,num_iter=5):
     eigenvectors = xp.random.rand(nframes,1,dtype = xp.float32) + 1j * xp.random.rand(nframes,1,dtype = xp.float32)
     for _ in range(num_iter):
         eigenvectors = H @ eigenvectors
-        eigenvectors /= xp.linalg.norm(eigenvectors)
+        eigenvectors /= xp.linalg.norm(eigenvectors) #this is somehow required for numerical stability
     ########
     omega = xp.array(eigenvectors[:, 0])
+
     
     omega /= xp.linalg.norm(omega)
    
@@ -895,7 +918,7 @@ def Eigensolver_c(H,num_iter=5):
     omega *= so
   
     ########
-   
+    omega = xp.reshape(omega0, (nframes, 1, 1))
     return omega
 
 def mapu2all(row, col , nframes):
@@ -938,7 +961,7 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
     timers["Sync_setup"] += timer() - time0
     if GPU:     
         H = Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm)
-        
+
         #H = (H + H.transpose().conj())
         #print('Here is H', H.todense()) 
       
@@ -963,7 +986,10 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
     #omega = Eigensolver(H)
     #if type(eig_plan) == type(None):
         #omega = Eigensolver(H,eigsh_tol = 1e-6, eigsh_maxiter = None,power_it = False,power_iterations = 5)
+ 
     omega = Eigensolver(H,num_iter)
+    #omega = Eigensolver_c(H,num_iter)
+    
     '''
     eig = sp.sparse.linalg.eigs(H.get())
     eigs = eig[0][0]
@@ -1006,7 +1032,7 @@ def synchronize_illum_c(nrm_illumination, frames,normalization, plan, num_iter=5
 
 #old version of refine_illumination
 def refine_illumination_function(
-    img, illumination, frames, Split, Overlap, lens_mask=None
+    img, illumination,illumination_truth, frames,translations,Split, Overlap, GPU,lens_mask,i
 ):
     """
     refine_illumination based on
@@ -1034,28 +1060,58 @@ def refine_illumination_function(
         refined normalization.
 
     """
+    eps_illum = None #need implementation
+    eps0 = xp.float32(1e-2)
+    
+    illumination0 = illumination + 0
+    #global eps_illum
+    if GPU:
+        frames_split = xp.zeros(frames.shape,dtype = xp.complex64)
+        Split(img + 0.0,frames_split,translations,0)
+    else:    
+        frames_split = Split(img)
+    #norm_frames = xp.mean(xp.abs(frames_split) ** 2, 0) 
+    if GPU:
+        norm_frames = xp.zeros(frames.shape,dtype = xp.complex64) #dtype?
+        Split(img * xp.conj(img),norm_frames,translations,0)
+        norm_frames = xp.sum(norm_frames, 0) 
 
-    # eps_illum = None
-    global eps_illum
-    frames_split = Split(img)
-    norm_frames = xp.mean(xp.abs(frames_split) ** 2, 0)
     if type(eps_illum) == type(None):
-        eps_illum = xp.max(norm_frames) * eps0
-
+            eps_illum = xp.max(xp.abs(norm_frames)) * eps0 * 2**(-i)
+            
+    '''
     illumination = xp.sum(
         frames * xp.conj(Split(img)) + eps_illum * illumination, 0
     ) / (norm_frames + eps_illum)
+    '''
 
+    #illumination =  (xp.sum(frames * xp.conj(frames_split), 0) +  eps_illum * illumination0) / (norm_frames + eps_illum * xp.eye(frames.shape[1],frames.shape[2],dtype = frames.dtype))
+
+    illumination =  (xp.sum(frames * xp.conj(frames_split), 0) +  eps_illum * illumination0) / (norm_frames + eps_illum * xp.eye(norm_frames.shape[0],norm_frames.shape[1], dtype = norm_frames.dtype))
+ 
     # apply mask to illumination
     if type(lens_mask) != type(None):
         illumination = xp.fft.fft2(illumination)
         illumination *= lens_mask
         illumination = xp.fft.ifft2(illumination)
 
+    '''
     normalization = Overlap(
         Replicate_frame(xp.abs(illumination) ** 2, frames_split.shape[0])
     )  # check
-    return illumination, normalization
+    '''
+    
+    #normalize. Orthwise goes to inf
+    #illumination /= xp.linalg.norm(illumination) #have same norm
+    #illumination *= xp.linalg.norm(illumination_truth)
+
+    #common phase
+    #phase=xp.dot(illumination.conj().ravel(),illumination_truth.ravel())
+    #phase /= xp.abs(phase)
+    #illumination *= phase
+    
+    #return illumination, normalization
+    return illumination
 
 from wrap_ops import overlap_cuda,split_cuda
 #refine illumination based on pairwise relationship between frames
@@ -1098,34 +1154,47 @@ def refine_illumination_pairwise(
     #matrix D^(-1/2)
     frames_norm = (xp.abs(frames) ** 2).astype(xp.complex64)
     nl = xp.sum(split_cuda(overlap_cuda(img0, frames_norm, translations, illumination_truth * 0 + 1), frames0, translations,0),axis = 0)
-    D_inv = 1 / xp.sqrt(nl)
+    D_inv = 1 / (xp.sqrt(nl) + 1e-8)
     
     
     #Define D^(-1/2)HD^(-1/2) as an operator
-    #@cp.fuse(kernel_name="DHD")
-    def DHD(a):
+    #@xp.fuse(kernel_name="DHD")
+    def DHD(a,img,frames):
         img0 = img * 0
         frames0 = frames * 0
         overlap_cuda(img0, frames.conj()* Replicate_frame(D_inv * a, nframes),translations,illumination_truth *0 + 1)
-        b = D_inv * xp.sum(frames * split_cuda(img0, frames0,translations,0),axis = 0)
+        split_cuda(img0, frames0,translations,0)
+        b = D_inv * xp.sum(frames * frames0,axis = 0)
         return b
-     
-    #solve illumination by power iteration    
-    if illumination_start is None:
-        w = xp.random.rand(16,16,dtype = xp.float32) + 1j*xp.random.rand(16,16,dtype = xp.float32) 
-    else:
-        w = illumination_start
-    for _ in range(100):    
-        w = DHD(w)
     
+    tolerance = 1e-6
+    #solve illumination by power iteration    
+    w = illumination_start + 0
+    for _ in range(1000):
+        w_new = DHD(w,img,frames)
+    
+        # Check for convergence
+        if xp.linalg.norm(w_new - w) < tolerance:
+            print("Convergence reached.")
+            break
+    
+        w = w_new
+        
+        
     #transform back
     illumination = D_inv * w
-    illumination *= xp.linalg.norm(illumination_truth)/xp.linalg.norm(illumination) #have same norm
+    #normalize. Orthwise goes to inf
+
+    
+    #illumination /= xp.linalg.norm(illumination) #have same norm
+    #illumination *= xp.linalg.norm(illumination_truth)
+
     
     #common phase
-    phase=xp.dot(illumination.conj().ravel(),illumination_truth.ravel())
-    phase /= xp.abs(phase)
-    illumination *= phase
+    #phase=xp.dot(illumination.conj().ravel(),illumination_truth.ravel())
+    #phase /= xp.abs(phase)
+    #illumination *= phase
+    #not necessary
     
     # apply mask to illumination
     if type(lens_mask) != type(None):

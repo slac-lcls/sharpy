@@ -14,7 +14,7 @@ from wrap_ops import overlap_cuda,split_cuda
 
 reset_times()
 GPU = config.GPU #False
-sync = True
+sync = True 
 debug = True
 if GPU:
     import cupy as cp
@@ -41,6 +41,7 @@ fid = h5py.File(fname_in, "r")
 data = xp.array(fid["data"], dtype=xp.float32)
 illumination = xp.array(fid["probe"], dtype=xp.complex64)
 
+    
 translations = xp.array(fid["translations"])
 #print('translations1', type(translations),translations.dtype) #float128 dtype
 nframes, nx, ny = data.shape
@@ -115,14 +116,14 @@ else:
 
 
 
-#img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
-img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) #Need to match datatype in operators fft Plan2D
+img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) 
+#img_initial = xp.random.rand(Nx, Ny , dtype=xp.float32) + 0* 1j * xp.random.rand(Nx, Ny, dtype=xp.float32)#Need to match datatype in operators fft Plan2D
 #img_initial = truth + 0
 ############################
 # reconstruct
 #refine_illumination = False
 refine_illumination = True
-maxiter = 100
+maxiter = 3000
 # residuals_interval = np.inf
 residuals_interval = 1
 
@@ -154,7 +155,7 @@ img4, frames, illum, residuals_AP = Alternating_projections(
     sync,
     img_initial+0,
     Gplan,
-    illumination,
+    illumination+0,
     translations_x,
     translations_y,
     overlap_cuda,
@@ -166,7 +167,7 @@ img4, frames, illum, residuals_AP = Alternating_projections(
     img_truth =truth,
     residuals_interval = residuals_interval,
     sync_interval = 1,
-    num_iter = 10,
+    num_iter = 100,
 )
 
 print("total time:", timer() - t0)
@@ -255,17 +256,18 @@ if GPU:
 else:
     img = img4
 
-fig = plt.figure(figsize=(10, 10))
+fig = plt.figure(figsize=(30, 30))
 plt.subplot(1, 3, 1)
-plt.title("Ground truth", fontsize=10)
+plt.title("Ground truth", fontsize=20)
 plt.imshow(abs(truth), cmap="gray")
 plt.colorbar(fraction=0.046, pad=0.04)
 plt.subplot(1, 3, 2)
-plt.title("Alternating Projections\n Sync:%2.2g" % (nmse4), fontsize=10)
-plt.imshow(abs(img), cmap="gray")
+sync_status = "with synchronization" if sync else "without synchronization"
+plt.title(f"Alternating Projections\n Sync: {sync_status}, NMSE: {nmse4:.2g}", fontsize=20)
+plt.imshow(abs(img),cmap="gray")
 plt.colorbar(fraction=0.046, pad=0.04)
 plt.subplot(1, 3, 3)
-plt.title("Difference")
+plt.title("Difference",fontsize=20)
 plt.imshow(abs(truth) - abs(img), cmap="jet")
 plt.colorbar(fraction=0.046, pad=0.04)
 plt.show()

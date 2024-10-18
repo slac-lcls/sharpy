@@ -5,7 +5,7 @@ import numpy as np
 import cupy as cp
 import h5py
 
-from Operators import Split_plan
+from Operators import Split_plan 
 from wrap_ops import split_cuda
 from Operators import Illuminate_frames
 from Operators import cropmat, make_probe, make_translations  # , map_frames
@@ -15,9 +15,9 @@ GPU = config.GPU
 
 
 # define simulation dimensions (frames, step, image)
-nx = 8  # frame size
-Dx = 5  # Step size
-nnx= 2 # number of frames in x direction
+#nx = 8  # frame size
+#Dx = 5  # Step size
+#nnx= 2 # number of frames in x direction
 
 # define larger simulation dimensions (frames, step, image)
 #nx = 64  # frame size
@@ -31,6 +31,13 @@ nnx= 2 # number of frames in x direction
 # nnx=64 # number of frames in x direction
 #nnx = 100  # number of
 
+# whynotworking
+#nx = 128  # frame size
+#Dx = 20  # Step size
+#nnx=32 # number of frames in x direction
+nx = 16
+nnx = 16
+Dx = 5
 
 # same thing for y
 ny = nx
@@ -46,7 +53,22 @@ Ny = nny * Dy
 
 # make the illumination (astigmatic i.e. fx, fy different from 0)
 #illumination = make_probe(nx, ny, r1=0.03, r2=0.06, fx=+20, fy=-20)
-illumination = make_probe(nx, ny, r1=0.025*3, r2=0.085*3, fx=+20, fy=-20)
+illumination,lens_mask = make_probe(nx, ny, r1=0.025*3, r2=0.085*3, fx=+20, fy=-20) #old
+#illumination,lens_mask = make_probe(nx, ny, r1=0.02*3, r2=0.06*3, fx=+20, fy=-20) #refine_illum #complex128
+#illumination += illumination
+
+# Set a random seed for reproducibility
+np.random.seed(42)
+
+# Generate Gaussian random noise
+mean = 0  # Center the noise around 0.5
+std_dev = 0.01  # Standard deviation
+size = (nx, ny)  # Size of the noise array
+
+# Generate noise and clip it to the range [0, 1]
+noise = cp.asarray(np.clip(np.random.normal(mean, std_dev, size), 0, 1))
+
+illumination += noise
 
 #############################
 # create translations (in pixels) using close packing
@@ -59,7 +81,7 @@ from PIL import Image
 img0 = np.array(Image.open("../data/gold_balls.png"), np.float32) / 63.0
 #img0=img0+1j # simple complex
 #img0 = np.exp(0.69 * (-1 + 0.5 * 1j) * img0)  # more realistic
-img0 = np.exp(0.95 * (-1 + 0.5 * 1j) * img0)  # increase for more contrast
+img0 = np.exp(0.69 * (-1 + 0.5 * 1j) * img0)  # increase for more contrast
 
 # set image dimension:
 Nx = int(np.ceil(np.max(translations_x) - np.min(translations_x)))
@@ -83,7 +105,7 @@ thres = np.finfo(truth.dtype).eps * 1e2
 
 
 ##################
-#Split = Split_plan(translations_x, translations_y, nx, ny, Nx, Ny)
+Split = Split_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 # generate frames from truth:
   
@@ -114,24 +136,25 @@ detector_pixel_size = 100.0
 # this defines the detector distance (paraxial approx)
 detector_distance = (nx * detector_pixel_size * resolution) / wavelength
 # save data to file:
-file_out = "test_small.h5"
+file_out = "refine_illum.h5"
 fid = h5py.File(file_out, "w")
 
 
 if GPU:
     truth = truth.get()
     frames_data = frames_data.get()
-    illumination = illumination.get()
+    illumination = illumination.get() #complex64
+    lens_mask = lens_mask.get()
     lens_aperture = lens_aperture.get()
     translations_x = translations_x.get()
     translations_y = translations_y.get()
-
+    
 
 fid.create_dataset("truth", data=truth)
 fid.create_dataset("data", data=frames_data)
 fid.create_dataset("probe", data=illumination)
 fid.create_dataset("lens_aperture", data=lens_aperture)
-
+fid.create_dataset("lens_mask",data = lens_mask )
 
 # use complex for 2D translations
 translations = (translations_x + 1j * translations_y) * resolution
