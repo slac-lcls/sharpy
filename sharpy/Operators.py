@@ -344,8 +344,12 @@ def Splitc(img, mapid):
 def Overlapc(frames, Nx, Ny, mapid):  # check
     # overlap frames onto an image using aggregate function
     time0 = timer()
+    # size=Nx*Ny zero-fills image pixels that no frame covers; without it
+    # aggregate returns only up to max(mapid)+1 entries and the reshape
+    # fails on partial-coverage (padded) geometries.
     accum = xp.reshape(
-        numpy_groupies.aggregate(mapid.ravel(), frames.ravel()), (Nx, Ny)
+        numpy_groupies.aggregate(mapid.ravel(), frames.ravel(), size=Nx * Ny),
+        (Nx, Ny),
     )
 
     timers["Overlap"] += timer() - time0
@@ -411,9 +415,12 @@ def cropmat(img, size):
 
 def Overlapc0(frames, Nx, Ny, mapid):
 
-    # ret = xp.bincount(mapid, weights=frames.real)+1j*xp.bincount(mapid, weights=frames.imag)
-    ret = xp.bincount(mapid.ravel(), weights=(frames.ravel()).real) + xp.bincount(
-        mapid.ravel(), weights=(frames.ravel()).imag
+    # minlength=Nx*Ny zero-fills uncovered pixels (see Overlapc); the imag
+    # part must be scaled by 1j to reconstruct the complex sum.
+    ret = xp.bincount(
+        mapid.ravel(), weights=(frames.ravel()).real, minlength=Nx * Ny
+    ) + 1j * xp.bincount(
+        mapid.ravel(), weights=(frames.ravel()).imag, minlength=Nx * Ny
     )
     ret.shape = (Nx, Ny)
     return ret
