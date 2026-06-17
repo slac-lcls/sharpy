@@ -1010,7 +1010,8 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
     '''
     return omega
 
-from wrap_ops import refine_illumination_cuda
+if GPU:
+    from wrap_ops import refine_illumination_cuda
 def synchronize_illum_c(nrm_illumination, frames,normalization, plan, num_iter=5):
     
     if GPU:     
@@ -1113,7 +1114,8 @@ def refine_illumination_function(
     #return illumination, normalization
     return illumination
 
-from wrap_ops import overlap_cuda,split_cuda
+if GPU:
+    from wrap_ops import overlap_cuda,split_cuda
 #refine illumination based on pairwise relationship between frames
 def refine_illumination_pairwise(
     img, illumination_start, illumination_truth, frames, translations, split_cuda, overlap_cuda, lens_mask=None

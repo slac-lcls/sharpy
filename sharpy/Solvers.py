@@ -9,10 +9,11 @@ from Operators import (
     Precondition_calc
 )
 from Operators import Replicate_frame, synchronize_illum_c,refine_illumination_pairwise,refine_illumination_function
-from wrap_ops import overlap_cuda,split_cuda
+import config
+if config.GPU:
+    from wrap_ops import overlap_cuda,split_cuda
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import config
 
 GPU = config.GPU
 
