@@ -37,10 +37,14 @@ if config.GPU:
     import cupy as cp
 
     xp = cp
+    import cupyx.scipy.sparse as _sparse
+    import cupyx.scipy.sparse.linalg as _splinalg
 else:
     xp = np
+    import scipy.sparse as _sparse
+    import scipy.sparse.linalg as _splinalg
 
-from Operators import Splitc, Overlapc, map_frames
+from Operators import Splitc, Overlapc, map_frames, bra, ket
 
 
 def probe_derivatives(probe):
@@ -197,3 +201,179 @@ def position_solve_diag(
     dxi_y = dxi_y * scale
 
     return xi_x + dxi_x, xi_y + dxi_y
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3: fully coupled solver (off-diagonal overlap terms, Eq. 27)
+# ---------------------------------------------------------------------------
+def position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
+    """Neighbor-overlap plan for the coupled position solve.
+
+    Same geometry as Operators.Gramiam_plan -- the off-diagonal coupling
+    terms O11/O22/Ox of Eq. (27) live on the same overlapping-frame-pair
+    sparsity pattern as the Gramian -- but computed without the CuPy-only
+    `xp.fuse` kernel, so it runs on CPU too.  Returns the plan dict with
+    keys col, row, dx, dy, bw.
+    """
+    dx = translations_x.ravel(order="F").reshape(nframes, 1)
+    dy = translations_y.ravel(order="F").reshape(nframes, 1)
+    dx = xp.subtract(dx, xp.transpose(dx))
+    dy = xp.subtract(dy, xp.transpose(dy))
+
+    # periodic-boundary wrap
+    dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
+    dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(int) - (dy > (Ny / 2)).astype(int)))
+
+    # overlapping pairs, upper triangle (i <= j)
+    col, row = xp.where(
+        xp.triu((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw))
+    )
+
+    dx = dx[row, col]
+    dy = dy[row, col]
+
+    return {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy, "bw": bw}
+
+
+def _pair_overlaps(L, R, col, row, dx, dy, bw):
+    """Overlap inner products for both orientations of each neighbor pair.
+
+    For pair ii = (a=col, b=row) with displacement (dx, dy):
+        ab[ii] = <L[a], R[b]> over the overlap   (matrix entry [a, b])
+        ba[ii] = <L[b], R[a]> over the overlap   (matrix entry [b, a])
+    Mirrors Operators.braket_i / the framesmul4 convention.
+    """
+    nnz = len(col)
+    ab = xp.empty(nnz, dtype=xp.complex128)
+    ba = xp.empty(nnz, dtype=xp.complex128)
+    for ii in range(nnz):
+        a = int(col[ii])
+        b = int(row[ii])
+        dxi = dx[ii]
+        dyi = dy[ii]
+        ab[ii] = xp.vdot(bra(L[a], -dxi, -dyi, bw), ket(R[b], dxi, dyi, bw))
+        ba[ii] = xp.vdot(bra(L[b], dxi, dyi, bw), ket(R[a], -dxi, -dyi, bw))
+    return ab, ba
+
+
+def _block_from_pairs(ab, ba, col, row, diag, nframes):
+    """Assemble a (nframes, nframes) sparse block from neighbor-pair values.
+
+    Off-diagonal pairs (a != b) contribute ab at [a, b] and ba at [b, a];
+    diagonal pairs (a == b) contribute ab once at [a, a].  `diag` is added
+    to the main diagonal.  Returns a real (2*Re) sparse matrix, matching the
+    +c.c. in Eq. (27).
+    """
+    col = xp.asarray(col)
+    row = xp.asarray(row)
+    offd = col != row
+
+    rows = xp.concatenate([col[offd], row[offd], xp.arange(nframes)])
+    cols = xp.concatenate([row[offd], col[offd], xp.arange(nframes)])
+    # diagonal pair value (a==b) sits in ab where col==row
+    diag_pair = xp.zeros(nframes, dtype=ab.dtype)
+    isdiag = ~offd
+    diag_pair[col[isdiag].astype(int)] = ab[isdiag]
+    vals = xp.concatenate([ab[offd], ba[offd], diag_pair + diag])
+
+    M = _sparse.coo_matrix((vals, (rows, cols)), shape=(nframes, nframes))
+    M = M.tocsr()
+    return (M + M.conj().T) * 0.5 * 2.0  # = M.real symmetrized (2*Re via +c.c.)
+
+
+def position_solve_coupled(
+    frames,
+    dp,
+    xrec0,
+    mapid,
+    Nx,
+    Ny,
+    xi_x,
+    xi_y,
+    plan,
+    reg=1e-10,
+    max_step=0.5,
+):
+    """One *coupled* position-retrieval update (Eq. 27, off-diagonal terms).
+
+    Same inputs as `position_solve_diag` plus a neighbor-overlap `plan`
+    (from `position_plan`).  Builds the full 2k x 2k system
+
+        [H1  Hx] [xi_x]   [rhs1]
+        [Hx' H2] [xi_y] = [rhs2]
+
+    where H1/H2/Hx include the off-diagonal overlap-coupling terms
+    O11/O22/Ox, Jacobi-preconditions it, and solves it with a sparse solver.
+    The second-order S terms are neglected (paper: negligible in practice).
+    """
+    st = taylor_shift_probe(dp, xi_x, xi_y)
+    probe_O = st["O"]
+    probe_x = st["x"]
+    probe_y = st["y"]
+
+    QQinv = 1.0 / (Overlapc(xp.abs(probe_O) ** 2, Nx, Ny, mapid) + reg)
+    psi_img = QQinv * (Overlapc(frames * xp.conj(probe_O), Nx, Ny, mapid) + reg * xrec0)
+    psi = Splitc(psi_img, mapid)
+    QQinv_split = Splitc(QQinv, mapid)
+
+    zR1 = probe_x * psi
+    zR2 = probe_y * psi
+    zu = frames - probe_O * psi
+
+    def fsum(a):
+        return xp.sum(a, axis=(1, 2))
+
+    # diagonal corrections (same as the diagonal solver)
+    ccx = fsum(xp.abs(zR1) ** 2).real
+    ccy = fsum(xp.abs(zR2) ** 2).real
+    cxy = fsum(xp.real(xp.conj(zR1) * zR2))
+
+    rhs1 = fsum(xp.real(xp.conj(zu) * zR1))
+    rhs2 = fsum(xp.real(xp.conj(zu) * zR2))
+
+    col, row = plan["col"], plan["row"]
+    dx, dy, bw = plan["dx"], plan["dy"], plan["bw"]
+    nframes = frames.shape[0]
+
+    # left/right derivative-weighted stacks (z * conj(p), z * conj(p) * QQinv)
+    Lx = frames * xp.conj(probe_x)
+    Ly = frames * xp.conj(probe_y)
+    Rx = Lx * QQinv_split
+    Ry = Ly * QQinv_split
+
+    # off-diagonal overlap terms O11, O22, Ox (note the leading minus sign)
+    ab11, ba11 = _pair_overlaps(Lx, Rx, col, row, dx, dy, bw)
+    ab22, ba22 = _pair_overlaps(Ly, Ry, col, row, dx, dy, bw)
+    abx, bax = _pair_overlaps(Lx, Ry, col, row, dx, dy, bw)
+
+    H1 = _block_from_pairs(-ab11, -ba11, col, row, ccx, nframes)
+    H2 = _block_from_pairs(-ab22, -ba22, col, row, ccy, nframes)
+    Hx = _block_from_pairs(-abx, -bax, col, row, cxy, nframes)
+
+    H1 = H1.real
+    H2 = H2.real
+    Hx = Hx.real
+
+    # assemble [[H1, Hx], [Hx', H2]]
+    H = _sparse.bmat([[H1, Hx], [Hx.T, H2]], format="csr")
+    rhs = xp.concatenate([2.0 * rhs1, 2.0 * rhs2])
+
+    # Jacobi precondition: D = diag(1/sqrt([ccx; ccy]))
+    d = 1.0 / xp.sqrt(xp.concatenate([ccx, ccy]) + 1e-30)
+    D = _sparse.diags(d)
+    HH = (D @ H @ D).tocsr()
+    HH = (HH + HH.T) * 0.5
+
+    try:
+        y = _splinalg.spsolve(HH, D @ rhs)
+    except Exception:
+        y, _ = _splinalg.cg(HH, D @ rhs, maxiter=200)
+    sol = d * y
+
+    dxi_x = sol[:nframes]
+    dxi_y = sol[nframes:]
+
+    # trust region
+    r = xp.sqrt(dxi_x ** 2 + dxi_y ** 2)
+    scale = xp.where(r > 0, xp.minimum(r, max_step) / xp.where(r > 0, r, 1.0), 0.0)
+    return xi_x + dxi_x * scale, xi_y + dxi_y * scale

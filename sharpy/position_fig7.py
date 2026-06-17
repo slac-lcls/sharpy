@@ -132,7 +132,7 @@ def build_problem(seed=0):
     )
 
 
-def run(seed=0, maxiter=1000, position_start=100):
+def run(seed=0, maxiter=1000, position_start=100, method="diag"):
     p = build_problem(seed=seed)
     rng = np.random.default_rng(seed + 999)
     img0 = xp.asarray(
@@ -145,6 +145,7 @@ def run(seed=0, maxiter=1000, position_start=100):
         p["translations_x"], p["translations_y"],
         p["nx"], p["ny"], p["Nx"], p["Ny"],
         maxiter=maxiter, position_start=position_start, position_every=1,
+        method=method,
         img_truth=p["truth"],
         xi_x_truth=p["xi_x_truth"], xi_y_truth=p["xi_y_truth"],
         residuals_interval=1,

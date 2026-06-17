@@ -778,12 +778,13 @@ def Alternating_projections_position(
     position_every=1,
     max_step=0.5,
     reg=1e-10,
+    method="diag",
     img_truth=None,
     xi_x_truth=None,
     xi_y_truth=None,
     residuals_interval=1,
 ):
-    """Alternating projections with diagonal position (scan-error) retrieval.
+    """Alternating projections with position (scan-error) retrieval.
 
     Mirrors `Alternating_projections` but, on a cadence, refines a per-frame
     sub-pixel probe shift xi = (xi_x, xi_y) using `position_solve_diag`
@@ -811,6 +812,10 @@ def Alternating_projections_position(
         Cadence of position updates (MATLAB Fig 7: every iteration).
     max_step : float
         Trust-region cap on the per-frame step, in pixels.
+    method : {"diag", "coupled"}
+        Position solver: "diag" = independent per-frame 2x2 solve;
+        "coupled" = full Eq. (27) sparse solve with off-diagonal overlap
+        coupling (more accurate, converges faster).
     reg : float
         Tikhonov weight in the image least squares.
     img_truth : (Nx, Ny) complex, optional
@@ -831,11 +836,21 @@ def Alternating_projections_position(
         3) position error eps_xi = sum|xi-xi_truth|^2 / sum|xi_truth|^2
     """
     from Operators import Splitc, Overlapc, map_frames
-    from position_retrieval import probe_derivatives, taylor_shift_probe, position_solve_diag
+    from position_retrieval import (
+        probe_derivatives,
+        taylor_shift_probe,
+        position_solve_diag,
+        position_solve_coupled,
+        position_plan,
+    )
 
     nframes = frames_data.shape[0]
     mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
     dp = probe_derivatives(illumination)
+
+    plan = None
+    if method == "coupled":
+        plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
 
     # Accumulated sub-pixel shift estimate (starts at zero -> probe broadcast).
     xi_x = xp.zeros(nframes)
@@ -878,10 +893,16 @@ def Alternating_projections_position(
             and position_every
             and np.mod(ii, position_every) == 0
         ):
-            xi_x, xi_y = position_solve_diag(
-                frames, dp, img, mapid, Nx, Ny, xi_x, xi_y,
-                reg=reg, max_step=max_step,
-            )
+            if method == "coupled":
+                xi_x, xi_y = position_solve_coupled(
+                    frames, dp, img, mapid, Nx, Ny, xi_x, xi_y, plan,
+                    reg=reg, max_step=max_step,
+                )
+            else:
+                xi_x, xi_y = position_solve_diag(
+                    frames, dp, img, mapid, Nx, Ny, xi_x, xi_y,
+                    reg=reg, max_step=max_step,
+                )
             probe_stack, normalization = probe_and_norm(xi_x, xi_y)
 
         # Overlap (image) projection with the current per-frame probe.
