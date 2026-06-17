@@ -44,7 +44,7 @@ else:
     import scipy.sparse as _sparse
     import scipy.sparse.linalg as _splinalg
 
-from Operators import Splitc, Overlapc, map_frames, bra, ket
+from Operators import Splitc, Overlapc, map_frames, ket
 
 
 def probe_derivatives(probe):
@@ -235,13 +235,20 @@ def position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0)
     return {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy, "bw": bw}
 
 
-def _pair_overlaps(L, R, col, row, dx, dy, bw):
-    """Overlap inner products for both orientations of each neighbor pair.
+def _pair_overlaps_fused(frames, pL, pR, qq, col, row, dx, dy, bw):
+    """Coupled overlap inner products with the probes applied *inline*.
 
-    For pair ii = (a=col, b=row) with displacement (dx, dy):
-        ab[ii] = <L[a], R[b]> over the overlap   (matrix entry [a, b])
-        ba[ii] = <L[b], R[a]> over the overlap   (matrix entry [b, a])
-    Mirrors Operators.braket_i / the framesmul4 convention.
+    CPU mirror of the generalized zQQz kernel (left/right illumination): for
+    each neighbor pair, compute the overlap inner product of
+    ``frames * conj(pL)`` (left) with ``frames * conj(pR) * qq`` (right)
+    without ever materializing those full frame-sized products -- only the
+    small overlap slices are formed.  This is the memory-saving form:
+    inputs are frames, the two derivative-probe stacks pL/pR, and the split
+    normalization qq, all of which we already have.
+
+    For pair ii = (a=col, b=row):
+        ab[ii] = sum_overlap conj(frames_a conj(pL_a)) * (frames_b conj(pR_b) qq_b)
+        ba[ii] = sum_overlap conj(frames_b conj(pL_b)) * (frames_a conj(pR_a) qq_a)
     """
     nnz = len(col)
     ab = xp.empty(nnz, dtype=xp.complex128)
@@ -251,8 +258,22 @@ def _pair_overlaps(L, R, col, row, dx, dy, bw):
         b = int(row[ii])
         dxi = dx[ii]
         dyi = dy[ii]
-        ab[ii] = xp.vdot(bra(L[a], -dxi, -dyi, bw), ket(R[b], dxi, dyi, bw))
-        ba[ii] = xp.vdot(bra(L[b], dxi, dyi, bw), ket(R[a], -dxi, -dyi, bw))
+
+        # left frame a, right frame b
+        fa = ket(frames[a], -dxi, -dyi, bw)
+        pLa = ket(pL[a], -dxi, -dyi, bw)
+        fb = ket(frames[b], dxi, dyi, bw)
+        pRb = ket(pR[b], dxi, dyi, bw)
+        qb = ket(qq[b], dxi, dyi, bw)
+        ab[ii] = xp.sum(xp.conj(fa * xp.conj(pLa)) * (fb * xp.conj(pRb) * qb))
+
+        # left frame b, right frame a (reversed displacement)
+        fb2 = ket(frames[b], dxi, dyi, bw)
+        pLb = ket(pL[b], dxi, dyi, bw)
+        fa2 = ket(frames[a], -dxi, -dyi, bw)
+        pRa = ket(pR[a], -dxi, -dyi, bw)
+        qa = ket(qq[a], -dxi, -dyi, bw)
+        ba[ii] = xp.sum(xp.conj(fb2 * xp.conj(pLb)) * (fa2 * xp.conj(pRa) * qa))
     return ab, ba
 
 
@@ -335,16 +356,12 @@ def position_solve_coupled(
     dx, dy, bw = plan["dx"], plan["dy"], plan["bw"]
     nframes = frames.shape[0]
 
-    # left/right derivative-weighted stacks (z * conj(p), z * conj(p) * QQinv)
-    Lx = frames * xp.conj(probe_x)
-    Ly = frames * xp.conj(probe_y)
-    Rx = Lx * QQinv_split
-    Ry = Ly * QQinv_split
-
-    # off-diagonal overlap terms O11, O22, Ox (note the leading minus sign)
-    ab11, ba11 = _pair_overlaps(Lx, Rx, col, row, dx, dy, bw)
-    ab22, ba22 = _pair_overlaps(Ly, Ry, col, row, dx, dy, bw)
-    abx, bax = _pair_overlaps(Lx, Ry, col, row, dx, dy, bw)
+    # off-diagonal overlap terms O11, O22, Ox (note the leading minus sign),
+    # computed with the probes applied inline -- no Lx/Ly/Rx/Ry intermediates
+    # (CPU mirror of the generalized left/right-illumination zQQz kernel).
+    ab11, ba11 = _pair_overlaps_fused(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw)
+    ab22, ba22 = _pair_overlaps_fused(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw)
+    abx, bax = _pair_overlaps_fused(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw)
 
     H1 = _block_from_pairs(-ab11, -ba11, col, row, ccx, nframes)
     H2 = _block_from_pairs(-ab22, -ba22, col, row, ccy, nframes)
