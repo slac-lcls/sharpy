@@ -28,6 +28,41 @@ inner product generalized to derivative probes (the O11/O22/Ox terms).
 So: Gramian = the matrix; braket / zQQz / pair-overlap = the element
 computation (CPU reference / GPU / generalized). One assembly path
 (plan["val2H"]) turns the per-pair entries into H for both CPU and GPU.
+
+Key operators
+-------------
+Geometry / setup:
+  make_probe(nx, ny, ...)        synthesize the (zone-plate) illumination
+  make_translations(...)         close-packed scan positions
+  map_frames(tx, ty, ...)        frame<->image index map `mapid` (integer)
+
+Forward & adjoint  (image <-> frames):
+  Splitc(img, mapid)             image -> frames   (gather overlapping windows)
+  Overlapc(frames, Nx, Ny, mapid)  frames -> image (overlap-add; adjoint of Split)
+  Illuminate_frames(frames, w)   multiply frames by the probe w
+
+Propagation  (real space <-> detector / far field):
+  Propagate / IPropagate         FFT2 / IFFT2
+
+Data constraint:
+  Project_data(frames, data)     Fourier-magnitude projection: replace the
+        modeled magnitude with sqrt(data), keep the phase (ProxD inside)
+
+Gramian & phase synchronization:
+  Gramiam_plan(...)              precompute overlap geometry + plan["val2H"]
+  Gramiam_calc / _cuda           build the Gramian H (CPU Numba / GPU kernel)
+  bra / ket / braket_i           one overlap inner product (readable reference)
+  Precondition(_calc)            Jacobi (D H D) preconditioning of H
+  Eigensolver                    dominant eigenvector (power iteration; eigsh
+        is unreliable in single precision -- see synchronize path)
+  synchronize_frames_c(...)      global per-frame phase fix from H's top eigvec
+
+Metric:
+  mse_calc(a, b)                 phase-corrected normalized MSE
+
+The alternating-projections loop is, in these terms:
+  Split -> Illuminate -> Propagate -> Project_data -> IPropagate
+        -> [synchronize_frames_c] -> Overlap  (-> next iterate)
 """
 #!/cds/home/y/yn754/anaconda3/envs/sharpy-env/bin/python
 
