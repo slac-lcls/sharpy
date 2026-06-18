@@ -700,10 +700,12 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     
     # calculates the wrapping effect for a period boundary
     #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(float) - (dx > (Nx / 2)).astype(float)))
-    @xp.fuse(kernel_name="wrap_boundary")
     def wrap_boundary(dx,Nx):
         return -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
-       
+    # cp.fuse is CuPy-only; on the CPU (NumPy) path use the plain function.
+    if GPU:
+        wrap_boundary = cp.fuse(kernel_name="wrap_boundary")(wrap_boundary)
+
     #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
     dx = wrap_boundary(dx,Nx)
     #dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(float) - (dy > (Ny / 2)).astype(float)))

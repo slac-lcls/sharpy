@@ -18,8 +18,7 @@ if config.GPU:
     pytest.skip("CPU-only test", allow_module_level=True)
 
 import Operators
-from Operators import Gramiam_calc, braket_i
-from position_retrieval import position_plan
+from Operators import Gramiam_calc, Gramiam_plan, braket_i
 
 
 def _ref_H(framesl, framesr, plan, frames_norm):
@@ -54,9 +53,9 @@ def test_gramiam_numba_matches_braket():
     frames_norm = (rng.random(nframes) + 0.5).astype(np.float64)
 
     tx, ty = np.meshgrid(np.arange(nnx) * step, np.arange(nny) * step, indexing="ij")
-    plan = position_plan(tx.ravel().astype(float), ty.ravel().astype(float),
-                         nframes, nx, ny, Nx, Ny, bw=0)
-    plan["val"] = np.empty((len(plan["col"]), 1), dtype=np.complex128)
+    # Gramiam_plan now works on CPU (xp.fuse guarded); exercises plan + calc.
+    plan = Gramiam_plan(tx.ravel().astype(float), ty.ravel().astype(float),
+                        nframes, nx, ny, Nx, Ny, bw=0)
 
     H_ref = _ref_H(framesl, framesr, plan, frames_norm)
     H_fast = Gramiam_calc(framesl, framesr, plan, frames_norm)  # numba path
