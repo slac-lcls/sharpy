@@ -204,6 +204,91 @@ def position_solve_diag(
 
 
 # ---------------------------------------------------------------------------
+# Comparison baseline: gradient descent on the data discrepancy
+# (Guizar-Sicairos & Fienup, Opt. Express 2008, Eq. 21)
+# ---------------------------------------------------------------------------
+def position_solve_gradient(
+    frames_data,
+    image,
+    dp,
+    mapid,
+    xi_x,
+    xi_y,
+    max_step=0.5,
+    n_linesearch=12,
+):
+    """One position update by gradient descent on the *data* discrepancy.
+
+    The Fienup-group alternative to our Section IV solver: instead of a
+    Gauss-Newton step on the projection residual, minimize the detector-space
+    squared error directly,
+
+        eps = sum_n || |FFT(O_n * P(xi_n))|^2  -  I_n ||^2          (gamma=1)
+
+    (Guizar-Sicairos & Fienup 2008, Eq. 17/21), and take a steepest-descent
+    step with a backtracking line search.  Parameterized by the same per-frame
+    sub-pixel probe shift `xi` as `position_solve_diag`/`_coupled`, so the
+    three are directly comparable.
+
+    O_n = Split(image) are the (fixed-image) object frames; the gradient uses
+    the same probe derivatives, via
+        d eps / d xi_x_n = 4 sum_{u,v} (|F_n|^2 - I_n) Re[ conj(F_n) F(O_n P_x) ].
+
+    Parameters mirror the other solvers; `image` is the current image estimate,
+    `frames_data` the measured intensities.
+    """
+    O = Splitc(image, mapid)  # object frames (fixed for this update)
+
+    def model(xix, xiy):
+        st = taylor_shift_probe(dp, xix, xiy)
+        f = O * st["O"]
+        F = xp.fft.fft2(f)
+        I = xp.abs(F) ** 2
+        r = I - frames_data
+        eps = float(xp.sum(r ** 2).real) if xp is np else float((xp.sum(r ** 2)).get().real)
+        return st, F, r, eps
+
+    st, F, r, eps0 = model(xi_x, xi_y)
+
+    # gradient w.r.t. per-frame shift (Eq. 21, probe-shift parameterization)
+    Fx = xp.fft.fft2(O * st["x"])
+    Fy = xp.fft.fft2(O * st["y"])
+    gx = 4.0 * xp.sum(r * xp.real(xp.conj(F) * Fx), axis=(1, 2))
+    gy = 4.0 * xp.sum(r * xp.real(xp.conj(F) * Fy), axis=(1, 2))
+
+    # steepest-descent direction = -g; initial step caps the largest per-frame
+    # move at max_step, then backtrack until the data error decreases.
+    gnorm = xp.sqrt(gx ** 2 + gy ** 2)
+    gmax = float(xp.max(gnorm)) if xp is np else float(xp.max(gnorm).get())
+    if gmax == 0.0:
+        return xi_x, xi_y
+    alpha = max_step / gmax
+
+    for _ in range(n_linesearch):
+        nx_x = xi_x - alpha * gx
+        nx_y = xi_y - alpha * gy
+        _, _, _, eps1 = model(nx_x, nx_y)
+        if eps1 < eps0:
+            return nx_x, nx_y
+        alpha *= 0.5
+
+    return xi_x, xi_y  # line search failed to improve; leave unchanged
+
+
+def shift_rmse(xi_x_true, xi_y_true, xi_x_hat, xi_y_hat):
+    """Global-shift-invariant RMSE of the recovered shifts (Fienup Eq. 15).
+
+    (Delta r)^2 = var(x - x_hat) + var(y - y_hat), removing the global
+    translation ambiguity (the reconstruction is invariant to a constant
+    shift of all positions). Returns Delta r in pixels.
+    """
+    dxv = xi_x_true - xi_x_hat
+    dyv = xi_y_true - xi_y_hat
+    dr2 = (xp.var(dxv) + xp.var(dyv))
+    return float(dr2 ** 0.5) if xp is np else float((dr2 ** 0.5).get())
+
+
+# ---------------------------------------------------------------------------
 # Milestone 3: fully coupled solver (off-diagonal overlap terms, Eq. 27)
 # ---------------------------------------------------------------------------
 def position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
