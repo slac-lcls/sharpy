@@ -221,40 +221,50 @@ def position_solve_gradient(
 
     The Fienup-group alternative to our Section IV solver: instead of a
     Gauss-Newton step on the projection residual, minimize the detector-space
-    squared error directly,
+    squared error directly.  We use the **amplitude** metric (gamma = 1/2 in
+    Guizar-Sicairos & Fienup 2008, Eq. 17):
 
-        eps = sum_n || |FFT(O_n * P(xi_n))|^2  -  I_n ||^2          (gamma=1)
+        eps = sum_n || |FFT(O_n * P(xi_n))|  -  sqrt(I_n) ||^2
 
-    (Guizar-Sicairos & Fienup 2008, Eq. 17/21), and take a steepest-descent
-    step with a backtracking line search.  Parameterized by the same per-frame
-    sub-pixel probe shift `xi` as `position_solve_diag`/`_coupled`, so the
-    three are directly comparable.
+    The square root is the variance-stabilizing transform for Poisson
+    (photon-counting) noise, so amplitude least-squares -- not intensity
+    least-squares -- is the statistically appropriate objective; it is also
+    better-conditioned and matches sharpy's magnitude projection.
+
+    Take a steepest-descent step with a backtracking line search.
+    Parameterized by the same per-frame sub-pixel probe shift `xi` as
+    `position_solve_diag`/`_coupled`, so the three are directly comparable.
 
     O_n = Split(image) are the (fixed-image) object frames; the gradient uses
     the same probe derivatives, via
-        d eps / d xi_x_n = 4 sum_{u,v} (|F_n|^2 - I_n) Re[ conj(F_n) F(O_n P_x) ].
+        d eps / d xi_x_n = 2 sum_{u,v} (1 - sqrt(I_n)/|F_n|) Re[ conj(F_n) F(O_n P_x) ].
 
     Parameters mirror the other solvers; `image` is the current image estimate,
-    `frames_data` the measured intensities.
+    `frames_data` the measured intensities I_n.
     """
     O = Splitc(image, mapid)  # object frames (fixed for this update)
+    sqrtI = xp.sqrt(frames_data)
+    tiny = xp.asarray(1e-12, dtype=sqrtI.dtype)
 
     def model(xix, xiy):
         st = taylor_shift_probe(dp, xix, xiy)
         f = O * st["O"]
         F = xp.fft.fft2(f)
-        I = xp.abs(F) ** 2
-        r = I - frames_data
-        eps = float(xp.sum(r ** 2).real) if xp is np else float((xp.sum(r ** 2)).get().real)
-        return st, F, r, eps
+        A = xp.abs(F)                      # |F_n|
+        r = A - sqrtI                      # amplitude residual (gamma = 1/2)
+        s = xp.sum(r ** 2)
+        eps = float(s) if xp is np else float(s.get())
+        return st, F, A, r, eps
 
-    st, F, r, eps0 = model(xi_x, xi_y)
+    st, F, A, r, eps0 = model(xi_x, xi_y)
 
-    # gradient w.r.t. per-frame shift (Eq. 21, probe-shift parameterization)
+    # gradient w.r.t. per-frame shift (Eq. 21, amplitude metric, probe-shift
+    # parameterization):  d eps/d xi = 2 sum (r/|F|) Re[conj(F) F(O P_xi)]
     Fx = xp.fft.fft2(O * st["x"])
     Fy = xp.fft.fft2(O * st["y"])
-    gx = 4.0 * xp.sum(r * xp.real(xp.conj(F) * Fx), axis=(1, 2))
-    gy = 4.0 * xp.sum(r * xp.real(xp.conj(F) * Fy), axis=(1, 2))
+    w = r / xp.maximum(A, tiny)            # = 1 - sqrt(I)/|F|
+    gx = 2.0 * xp.sum(w * xp.real(xp.conj(F) * Fx), axis=(1, 2))
+    gy = 2.0 * xp.sum(w * xp.real(xp.conj(F) * Fy), axis=(1, 2))
 
     # steepest-descent direction = -g; initial step caps the largest per-frame
     # move at max_step, then backtrack until the data error decreases.
@@ -267,7 +277,7 @@ def position_solve_gradient(
     for _ in range(n_linesearch):
         nx_x = xi_x - alpha * gx
         nx_y = xi_y - alpha * gy
-        _, _, _, eps1 = model(nx_x, nx_y)
+        _, _, _, _, eps1 = model(nx_x, nx_y)
         if eps1 < eps0:
             return nx_x, nx_y
         alpha *= 0.5
