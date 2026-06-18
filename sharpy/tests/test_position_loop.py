@@ -92,12 +92,9 @@ def _make_data(seed=0, sigma_pix=1.0):
 def test_position_loop_recovers_shifts():
     p = _make_data(seed=3, sigma_pix=0.7)
 
-    # Nonzero random start (a zero image is a fixed point of the magnitude projection).
-    rng = np.random.default_rng(123)
-    img0 = xp.asarray(
-        (rng.standard_normal((p["Nx"], p["Ny"]))
-         + 1j * rng.standard_normal((p["Nx"], p["Ny"]))).astype(np.complex64)
-    )
+    # Start at ones: X-ray contrast is small, the image is transmission (~1
+    # everywhere). Physically motivated, and avoids the zero fixed point.
+    img0 = xp.ones((p["Nx"], p["Ny"]), dtype=xp.complex64)
 
     img, frames, xhat_x, xhat_y, res = Solvers.Alternating_projections_position(
         img0,

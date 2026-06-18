@@ -134,11 +134,9 @@ def build_problem(seed=0):
 
 def run(seed=0, maxiter=1000, position_start=100, method="diag"):
     p = build_problem(seed=seed)
-    rng = np.random.default_rng(seed + 999)
-    img0 = xp.asarray(
-        (rng.standard_normal((p["Nx"], p["Ny"]))
-         + 1j * rng.standard_normal((p["Nx"], p["Ny"]))).astype(np.complex64)
-    )
+    # X-ray contrast is small: the image is transmission, ~1 everywhere.
+    # Start at ones (physically motivated; also avoids the zero fixed point).
+    img0 = xp.ones((p["Nx"], p["Ny"]), dtype=xp.complex64)
 
     img, frames, xhat_x, xhat_y, res = Solvers.Alternating_projections_position(
         img0, p["probe"], p["frames_data"],
