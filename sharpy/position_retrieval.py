@@ -29,6 +29,9 @@ Conventions match the MATLAB:
   * a trust region caps the per-frame step at `max_step` pixels.
 """
 
+import os
+import warnings
+
 import numpy as np
 
 import config
@@ -51,6 +54,35 @@ try:
     _HAVE_NUMBA = True
 except Exception:
     _HAVE_NUMBA = False
+
+
+# Overlap-kernel backend selection. This is a runtime *performance* choice
+# (which implementation computes the overlap inner products), kept separate
+# from config.GPU (the fundamental NumPy/CuPy array-library switch).
+#   "auto"   -> numba if available else python  (omp is opt-in; needs a C compiler)
+#   "python" -> the pure-Python reference (_braket_coupled_ref)
+#   "numba"  -> the parallel Numba kernel (_braket_coupled_numba)
+#   "omp"    -> the OpenMP C kernel (zqqz_cpu.braket_coupled_omp), for Perlmutter
+# Resolution order, most specific first:
+#   per-call `backend=` arg  >  set_kernel_backend()/SHARPY_KERNEL env  >  "auto".
+_KERNEL_BACKEND = os.environ.get("SHARPY_KERNEL", "auto")
+
+
+def set_kernel_backend(name):
+    """Set the default overlap-kernel backend: 'auto'|'python'|'numba'|'omp'."""
+    global _KERNEL_BACKEND
+    _KERNEL_BACKEND = name
+
+
+def get_kernel_backend():
+    return _KERNEL_BACKEND
+
+
+def _resolve_backend(backend=None):
+    name = backend or _KERNEL_BACKEND
+    if name == "auto":
+        return "numba" if (_HAVE_NUMBA and not config.GPU) else "python"
+    return name
 
 
 def probe_derivatives(probe):
@@ -378,28 +410,43 @@ if _HAVE_NUMBA:
             ba[ii] = sba
 
 
-def _braket_coupled(frames, pL, pR, qq, col, row, dx, dy, bw):
+def _braket_coupled(frames, pL, pR, qq, col, row, dx, dy, bw, backend=None):
     """Coupled overlap inner products for both pair orientations.
 
-    Numba-parallel kernel on CPU; falls back to the pure-Python reference
-    `_braket_coupled_ref` if numba is unavailable or on GPU.
+    Dispatches on the selected backend (see set_kernel_backend / _resolve_backend):
+    "numba" (parallel), "omp" (OpenMP C), or "python" reference. On GPU the
+    array (CuPy) reference is always used (numba/omp are CPU-only).
     """
-    if _HAVE_NUMBA and not config.GPU:
+    if config.GPU:
+        return _braket_coupled_ref(frames, pL, pR, qq, col, row, dx, dy, bw)
+
+    name = _resolve_backend(backend)
+
+    if name == "omp":
+        try:
+            from zqqz_cpu import braket_coupled_omp
+            return braket_coupled_omp(frames, pL, pR, qq, col, row, dx, dy, bw)
+        except Exception as e:
+            warnings.warn(f"omp kernel unavailable ({e}); falling back")
+            name = "numba" if _HAVE_NUMBA else "python"
+
+    if name == "numba" and _HAVE_NUMBA:
         nnz = len(col)
-        ab = xp.empty(nnz, dtype=xp.complex128)
-        ba = xp.empty(nnz, dtype=xp.complex128)
+        ab = np.empty(nnz, dtype=np.complex128)
+        ba = np.empty(nnz, dtype=np.complex128)
         _braket_coupled_numba(
-            xp.ascontiguousarray(frames),
-            xp.ascontiguousarray(pL),
-            xp.ascontiguousarray(pR),
-            xp.ascontiguousarray(qq),
-            xp.ascontiguousarray(col).astype(np.int64),
-            xp.ascontiguousarray(row).astype(np.int64),
-            xp.ascontiguousarray(dx).astype(np.int64),
-            xp.ascontiguousarray(dy).astype(np.int64),
+            np.ascontiguousarray(frames),
+            np.ascontiguousarray(pL),
+            np.ascontiguousarray(pR),
+            np.ascontiguousarray(qq),
+            np.ascontiguousarray(col).astype(np.int64),
+            np.ascontiguousarray(row).astype(np.int64),
+            np.ascontiguousarray(dx).astype(np.int64),
+            np.ascontiguousarray(dy).astype(np.int64),
             int(bw), ab, ba,
         )
         return ab, ba
+
     return _braket_coupled_ref(frames, pL, pR, qq, col, row, dx, dy, bw)
 
 
@@ -482,6 +529,7 @@ def position_solve_coupled(
     plan,
     reg=1e-10,
     max_step=0.5,
+    backend=None,
 ):
     """One *coupled* position-retrieval update (Eq. 27, off-diagonal terms).
 
@@ -527,9 +575,9 @@ def position_solve_coupled(
     # off-diagonal overlap terms O11, O22, Ox (note the leading minus sign),
     # computed with the probes applied inline -- no Lx/Ly/Rx/Ry intermediates
     # (CPU mirror of the generalized left/right-illumination zQQz kernel).
-    ab11, ba11 = _braket_coupled(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw)
-    ab22, ba22 = _braket_coupled(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw)
-    abx, bax = _braket_coupled(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw)
+    ab11, ba11 = _braket_coupled(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw, backend)
+    ab22, ba22 = _braket_coupled(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw, backend)
+    abx, bax = _braket_coupled(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw, backend)
 
     H1 = _block_from_pairs(-ab11, -ba11, col, row, ccx, nframes)
     H2 = _block_from_pairs(-ab22, -ba22, col, row, ccy, nframes)

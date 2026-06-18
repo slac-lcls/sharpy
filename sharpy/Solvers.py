@@ -803,6 +803,7 @@ def Alternating_projections_position(
     max_step=0.5,
     reg=1e-10,
     method="diag",
+    backend=None,
     img_truth=None,
     xi_x_truth=None,
     xi_y_truth=None,
@@ -840,6 +841,9 @@ def Alternating_projections_position(
         Position solver: "diag" = independent per-frame 2x2 solve;
         "coupled" = full Eq. (27) sparse solve with off-diagonal overlap
         coupling (more accurate, converges faster).
+    backend : {None, "auto", "python", "numba", "omp"}
+        Overlap-kernel backend for the coupled solver (None -> module
+        default; see position_retrieval.set_kernel_backend). Ignored by diag.
     reg : float
         Tikhonov weight in the image least squares.
     img_truth : (Nx, Ny) complex, optional
@@ -920,7 +924,7 @@ def Alternating_projections_position(
             if method == "coupled":
                 xi_x, xi_y = position_solve_coupled(
                     frames, dp, img, mapid, Nx, Ny, xi_x, xi_y, plan,
-                    reg=reg, max_step=max_step,
+                    reg=reg, max_step=max_step, backend=backend,
                 )
             else:
                 xi_x, xi_y = position_solve_diag(
