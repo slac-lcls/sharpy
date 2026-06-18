@@ -1,6 +1,33 @@
 """
 Ptycho operators
 
+Naming / vocabulary
+-------------------
+Three names in this codebase refer to the SAME underlying operation -- the
+illumination-weighted inner product of two frames over their region of
+overlap -- at different levels and on different backends:
+
+  * Gramian  (the MATRIX)      -- the Hermitian matrix H of all pairwise
+        overlap inner products between overlapping frames. Functions:
+        Gramiam_plan / Gramiam_calc (CPU) / Gramiam_calc_cuda (GPU).
+        ("Gramiam" is a long-standing misspelling of "Gramian", kept for
+        compatibility -- renaming would churn many scripts/notebooks.)
+
+  * braket   (one ENTRY, CPU)  -- <bra|ket>, a single element of H computed
+        from the overlap of two frames. bra() / ket() / braket_i() are the
+        readable reference; _braket_val_numba() is the parallel CPU version.
+
+  * zQQz     (entries, GPU)    -- z*QQz, the same element computed inside the
+        CUDA kernel (src/zQQz.cu, "dotp"), illumination + normalization
+        applied per pixel. src/zQQz2.cu generalizes it to separate
+        left/right illuminations (the coupled position-retrieval blocks).
+
+The position-retrieval solver's _pair_overlaps_kernel is the same overlap
+inner product generalized to derivative probes (the O11/O22/Ox terms).
+
+So: Gramian = the matrix; braket / zQQz / pair-overlap = the element
+computation (CPU reference / GPU / generalized). One assembly path
+(plan["val2H"]) turns the per-pair entries into H for both CPU and GPU.
 """
 #!/cds/home/y/yn754/anaconda3/envs/sharpy-env/bin/python
 
