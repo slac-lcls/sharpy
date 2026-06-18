@@ -339,7 +339,7 @@ def position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0)
 if _HAVE_NUMBA:
 
     @_njit(parallel=True, cache=True, fastmath=True)
-    def _pair_overlaps_kernel(frames, pL, pR, qq, col, row, dx, dy, bw, ab, ba):
+    def _braket_coupled_numba(frames, pL, pR, qq, col, row, dx, dy, bw, ab, ba):
         """Parallel coupled <bra|ket> over all pairs (generalized zQQz, both
         orientations). For pair ii = (a=col, b=row), probes applied inline:
 
@@ -378,17 +378,17 @@ if _HAVE_NUMBA:
             ba[ii] = sba
 
 
-def _pair_overlaps(frames, pL, pR, qq, col, row, dx, dy, bw):
+def _braket_coupled(frames, pL, pR, qq, col, row, dx, dy, bw):
     """Coupled overlap inner products for both pair orientations.
 
     Numba-parallel kernel on CPU; falls back to the pure-Python reference
-    `_pair_overlaps_fused` if numba is unavailable or on GPU.
+    `_braket_coupled_ref` if numba is unavailable or on GPU.
     """
     if _HAVE_NUMBA and not config.GPU:
         nnz = len(col)
         ab = xp.empty(nnz, dtype=xp.complex128)
         ba = xp.empty(nnz, dtype=xp.complex128)
-        _pair_overlaps_kernel(
+        _braket_coupled_numba(
             xp.ascontiguousarray(frames),
             xp.ascontiguousarray(pL),
             xp.ascontiguousarray(pR),
@@ -400,10 +400,10 @@ def _pair_overlaps(frames, pL, pR, qq, col, row, dx, dy, bw):
             int(bw), ab, ba,
         )
         return ab, ba
-    return _pair_overlaps_fused(frames, pL, pR, qq, col, row, dx, dy, bw)
+    return _braket_coupled_ref(frames, pL, pR, qq, col, row, dx, dy, bw)
 
 
-def _pair_overlaps_fused(frames, pL, pR, qq, col, row, dx, dy, bw):
+def _braket_coupled_ref(frames, pL, pR, qq, col, row, dx, dy, bw):
     """Coupled overlap inner products with the probes applied *inline*.
 
     CPU mirror of the generalized zQQz kernel (left/right illumination): for
@@ -527,9 +527,9 @@ def position_solve_coupled(
     # off-diagonal overlap terms O11, O22, Ox (note the leading minus sign),
     # computed with the probes applied inline -- no Lx/Ly/Rx/Ry intermediates
     # (CPU mirror of the generalized left/right-illumination zQQz kernel).
-    ab11, ba11 = _pair_overlaps(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw)
-    ab22, ba22 = _pair_overlaps(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw)
-    abx, bax = _pair_overlaps(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw)
+    ab11, ba11 = _braket_coupled(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw)
+    ab22, ba22 = _braket_coupled(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw)
+    abx, bax = _braket_coupled(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw)
 
     H1 = _block_from_pairs(-ab11, -ba11, col, row, ccx, nframes)
     H2 = _block_from_pairs(-ab22, -ba22, col, row, ccy, nframes)

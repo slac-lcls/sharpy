@@ -64,6 +64,15 @@ def _load():
         f64,                   # frames_norm
         c128,                  # out
     ]
+    lib.zqqz_braket_coupled.restype = None
+    lib.zqqz_braket_coupled.argtypes = [
+        c128, c128, c128, c128,  # frames, pL, pR, qq
+        i64, i64, i64, i64,      # col, row, dx, dy
+        ctypes.c_int,            # bw
+        ctypes.c_long,           # nnz
+        ctypes.c_int,            # nx
+        c128, c128,              # ab, ba (out)
+    ]
     return lib
 
 
@@ -96,6 +105,35 @@ def gramiam_val_omp(framesl, framesr, col, row, dx, dy, bw, frames_norm):
     _LIB_HANDLE.zqqz_braket(framesl, framesr, col, row, dx, dy,
                             int(bw), int(nnz), int(nx), frames_norm, out)
     return out
+
+
+def braket_coupled_omp(frames, pL, pR, qq, col, row, dx, dy, bw):
+    """Coupled <bra|ket> (both orientations) via the OpenMP C kernel.
+
+    C/OpenMP counterpart of position_retrieval._braket_coupled_numba: frames
+    weighted by left/right probes pL, pR and normalization qq. Returns
+    (ab, ba), each (nnz,) complex128 -- the off-diagonal O11/O22/Ox entries.
+    """
+    global _LIB_HANDLE
+    if _LIB_HANDLE is None:
+        _LIB_HANDLE = _load()
+
+    frames = np.ascontiguousarray(frames, dtype=np.complex128)
+    pL = np.ascontiguousarray(pL, dtype=np.complex128)
+    pR = np.ascontiguousarray(pR, dtype=np.complex128)
+    qq = np.ascontiguousarray(qq, dtype=np.complex128)
+    col = np.ascontiguousarray(col, dtype=np.int64)
+    row = np.ascontiguousarray(row, dtype=np.int64)
+    dx = np.ascontiguousarray(dx, dtype=np.int64)
+    dy = np.ascontiguousarray(dy, dtype=np.int64)
+    nx = frames.shape[1]
+    nnz = col.size
+    ab = np.empty(nnz, dtype=np.complex128)
+    ba = np.empty(nnz, dtype=np.complex128)
+
+    _LIB_HANDLE.zqqz_braket_coupled(frames, pL, pR, qq, col, row, dx, dy,
+                                    int(bw), int(nnz), int(nx), ab, ba)
+    return ab, ba
 
 
 if __name__ == "__main__":

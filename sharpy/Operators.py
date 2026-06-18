@@ -22,8 +22,9 @@ overlap -- at different levels and on different backends:
         applied per pixel. src/zQQz2.cu generalizes it to separate
         left/right illuminations (the coupled position-retrieval blocks).
 
-The position-retrieval solver's _pair_overlaps_kernel is the same overlap
-inner product generalized to derivative probes (the O11/O22/Ox terms).
+The position-retrieval solver's _braket_coupled_numba is the same overlap
+inner product generalized to derivative probes (the O11/O22/Ox terms) --
+the CPU analog of zQQz2.cu.
 
 So: Gramian = the matrix; braket / zQQz / pair-overlap = the element
 computation (CPU reference / GPU / generalized). One assembly path

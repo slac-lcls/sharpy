@@ -55,6 +55,35 @@ def test_zqqz_cpu_matches_braket():
     assert err < 1e-12
 
 
+def test_zqqz_cpu_coupled_matches_ref():
+    """Coupled OpenMP C kernel vs the Python _braket_coupled_ref."""
+    from position_retrieval import _braket_coupled_ref
+
+    rng = np.random.default_rng(2)
+    nx = ny = 32
+    nnx = nny = 8
+    step = 5
+    Nx = Ny = nnx * step
+    nf = nnx * nny
+
+    def cx(s):
+        return (rng.standard_normal(s) + 1j * rng.standard_normal(s)).astype(np.complex128)
+
+    frames, pL, pR, qq = cx((nf, nx, ny)), cx((nf, nx, ny)), cx((nf, nx, ny)), cx((nf, nx, ny))
+    tx, ty = np.meshgrid(np.arange(nnx) * step, np.arange(nny) * step, indexing="ij")
+    plan = position_plan(tx.ravel().astype(float), ty.ravel().astype(float),
+                         nf, nx, ny, Nx, Ny)
+    col, row, dx, dy, bw = plan["col"], plan["row"], plan["dx"], plan["dy"], plan["bw"]
+
+    abr, bar = _braket_coupled_ref(frames, pL, pR, qq, col, row, dx, dy, bw)
+    abc, bac = zqqz_cpu.braket_coupled_omp(frames, pL, pR, qq, col, row, dx, dy, bw)
+    sc = max(np.max(np.abs(abr)), np.max(np.abs(bar)))
+    err = max(np.max(np.abs(abc - abr)), np.max(np.abs(bac - bar))) / sc
+    print(f"max rel error (coupled OpenMP C vs ref): {err:.2e}")
+    assert err < 1e-12
+
+
 if __name__ == "__main__":
     test_zqqz_cpu_matches_braket()
+    test_zqqz_cpu_coupled_matches_ref()
     print("OK")
