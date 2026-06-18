@@ -46,6 +46,12 @@ else:
 
 from Operators import Splitc, Overlapc, map_frames, ket
 
+try:
+    from numba import njit as _njit, prange as _prange
+    _HAVE_NUMBA = True
+except Exception:
+    _HAVE_NUMBA = False
+
 
 def probe_derivatives(probe):
     """First and second spatial derivatives of the probe (Taylor coefficients).
@@ -330,6 +336,73 @@ def position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0)
     return {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy, "bw": bw}
 
 
+if _HAVE_NUMBA:
+
+    @_njit(parallel=True, cache=True, fastmath=True)
+    def _pair_overlaps_kernel(frames, pL, pR, qq, col, row, dx, dy, bw, ab, ba):
+        """Parallel coupled <bra|ket> over all pairs (generalized zQQz, both
+        orientations). For pair ii = (a=col, b=row), probes applied inline:
+
+            ab[ii] = sum_overlap conj(frames_a conj(pL_a)) (frames_b conj(pR_b) qq_b)
+            ba[ii] = sum_overlap conj(frames_b conj(pL_b)) (frames_a conj(pR_a) qq_a)
+
+        Same strategy as the GPU kernel: one parallel iteration per pair, a
+        serial inner sum over the overlap. CPU twin of zQQz2.cu.
+        """
+        nnz = col.shape[0]
+        nx = frames.shape[1]
+        for ii in _prange(nnz):
+            a = col[ii]
+            b = row[ii]
+            dxi = dx[ii]
+            dyi = dy[ii]
+            wn_r = max(0, -dyi) + bw   # "-shift" window (bra of a)
+            wn_c = max(0, -dxi) + bw
+            wp_r = max(0, dyi) + bw    # "+shift" window (ket of b)
+            wp_c = max(0, dxi) + bw
+            hgt = nx - abs(dyi) - 2 * bw
+            wid = nx - abs(dxi) - 2 * bw
+            sab = 0.0 + 0.0j
+            sba = 0.0 + 0.0j
+            for i in range(hgt):
+                for j in range(wid):
+                    la_r = wn_r + i; la_c = wn_c + j      # frame a window
+                    rb_r = wp_r + i; rb_c = wp_c + j      # frame b window
+                    fa = frames[a, la_r, la_c]
+                    fb = frames[b, rb_r, rb_c]
+                    sab += (np.conj(fa) * pL[a, la_r, la_c]
+                            * fb * np.conj(pR[b, rb_r, rb_c]) * qq[b, rb_r, rb_c])
+                    sba += (np.conj(fb) * pL[b, rb_r, rb_c]
+                            * fa * np.conj(pR[a, la_r, la_c]) * qq[a, la_r, la_c])
+            ab[ii] = sab
+            ba[ii] = sba
+
+
+def _pair_overlaps(frames, pL, pR, qq, col, row, dx, dy, bw):
+    """Coupled overlap inner products for both pair orientations.
+
+    Numba-parallel kernel on CPU; falls back to the pure-Python reference
+    `_pair_overlaps_fused` if numba is unavailable or on GPU.
+    """
+    if _HAVE_NUMBA and not config.GPU:
+        nnz = len(col)
+        ab = xp.empty(nnz, dtype=xp.complex128)
+        ba = xp.empty(nnz, dtype=xp.complex128)
+        _pair_overlaps_kernel(
+            xp.ascontiguousarray(frames),
+            xp.ascontiguousarray(pL),
+            xp.ascontiguousarray(pR),
+            xp.ascontiguousarray(qq),
+            xp.ascontiguousarray(col).astype(np.int64),
+            xp.ascontiguousarray(row).astype(np.int64),
+            xp.ascontiguousarray(dx).astype(np.int64),
+            xp.ascontiguousarray(dy).astype(np.int64),
+            int(bw), ab, ba,
+        )
+        return ab, ba
+    return _pair_overlaps_fused(frames, pL, pR, qq, col, row, dx, dy, bw)
+
+
 def _pair_overlaps_fused(frames, pL, pR, qq, col, row, dx, dy, bw):
     """Coupled overlap inner products with the probes applied *inline*.
 
@@ -454,9 +527,9 @@ def position_solve_coupled(
     # off-diagonal overlap terms O11, O22, Ox (note the leading minus sign),
     # computed with the probes applied inline -- no Lx/Ly/Rx/Ry intermediates
     # (CPU mirror of the generalized left/right-illumination zQQz kernel).
-    ab11, ba11 = _pair_overlaps_fused(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw)
-    ab22, ba22 = _pair_overlaps_fused(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw)
-    abx, bax = _pair_overlaps_fused(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw)
+    ab11, ba11 = _pair_overlaps(frames, probe_x, probe_x, QQinv_split, col, row, dx, dy, bw)
+    ab22, ba22 = _pair_overlaps(frames, probe_y, probe_y, QQinv_split, col, row, dx, dy, bw)
+    abx, bax = _pair_overlaps(frames, probe_x, probe_y, QQinv_split, col, row, dx, dy, bw)
 
     H1 = _block_from_pairs(-ab11, -ba11, col, row, ccx, nframes)
     H2 = _block_from_pairs(-ab22, -ba22, col, row, ccy, nframes)
