@@ -605,21 +605,15 @@ def Gramiam_calc(framesl, framesr, plan,frames_norm):
 
     timers["Gramiam"] += timer() - time0
     time0 = timer()
-    
-    
-    # H=sp.sparse.csr_matrix((val.ravel(), (col, row)), shape=(nframes,nframes))
-    if GPU == False:
-        #put in kernel
-        H = sp.sparse.coo_matrix((val.ravel(), (col, row)), shape=(nframes, nframes))
-        H = H + (sp.sparse.triu(H, 1)).getH()
-        H = H.tocsr() #solve 
-        timers["Gramiam_completion"] += timer() - time0
-    else:
-        H = sparse.coo_matrix((val.ravel(), (col, row)), shape=(nframes, nframes))
-        H += sparse.triu(H, k=1).conj().T
-        H = H.tocsr()
-        timers["Gramiam_completion"] += timer() - time0
-        
+
+    # Assemble the Hermitian H from the triu values. Use the SAME precomputed
+    # sparse structure as Gramiam_calc_cuda (plan["val2H"], built once in
+    # mapu2all): it just refills H.data and fills the lower triangle by
+    # conjugation, instead of rebuilding coo->csr every call. One assembly
+    # path now serves both the CPU and GPU Gramian.
+    H = plan["val2H"](val.ravel())
+    timers["Gramiam_completion"] += timer() - time0
+
     return H
 
 
@@ -994,9 +988,12 @@ def Eigensolver_c(H,num_iter=5):
     return omega
 
 def mapu2all(row, col , nframes):
-       
-    # initialize sparse array
-    val0=xp.empty(col.size, dtype = xp.complex64)
+
+    # initialize sparse array. complex64 on GPU (matches the RawKernel output);
+    # complex128 on CPU so the reference Gramian keeps full precision (eigsh is
+    # unreliable in single precision -- power iteration is used on GPU instead).
+    Hdtype = xp.complex64 if GPU else xp.complex128
+    val0=xp.empty(col.size, dtype = Hdtype)
     Soo=sparse.coo_matrix((val0,(row,col)))
     H=Soo.tocsr()
    
