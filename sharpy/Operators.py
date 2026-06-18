@@ -12,6 +12,12 @@ import matplotlib.pyplot as plt
 import math
 import numpy_groupies
 
+try:
+    from numba import njit as _njit, prange as _prange
+    _HAVE_NUMBA = True
+except Exception:
+    _HAVE_NUMBA = False
+
 import config
 import pkg_resources
 
@@ -502,6 +508,45 @@ def braket_i(ii,framesl,framesr,col,row,dx,dy,bw):
    #    val[ii] = braket(framesl[col[ii]], framesr[row[ii]], dd[ii], bw)
     return val
 #braket_i = cp.fuse(kernel_name='braket_i')(braket_i)
+
+
+if _HAVE_NUMBA:
+
+    @_njit(parallel=True, cache=True, fastmath=True)
+    def _braket_val_numba(framesl, framesr, col, row, dx, dy, bw, frames_norm, out):
+        """Parallel CPU <bra|ket> over all overlapping pairs (CPU twin of zQQz.cu).
+
+        Same strategy as Gramiam_calc_cuda: one parallel iteration per pair
+        (the CUDA block) with a serial inner sum over the overlap (the CUDA
+        threads + BlockReduce collapse to this on CPU). For each pair ii,
+
+            out[ii] = <bra | ket> / (||frames_norm[col]|| ||frames_norm[row]||)
+
+        where, exactly as in bra()/ket(),
+            bra = overlap window of the LEFT frame  framesl[col]  shifted (-dx,-dy)
+            ket = overlap window of the RIGHT frame framesr[row]  shifted (+dx,+dy)
+        and <bra|ket> = sum conj(bra) * ket over the overlap.
+        """
+        nnz = col.shape[0]
+        nx = framesl.shape[1]  # square frames (ket uses nx for both axes)
+        for ii in _prange(nnz):
+            c = col[ii]
+            r = row[ii]
+            dxi = dx[ii]
+            dyi = dy[ii]
+            # bra window (left frame, -dx,-dy);  ket window (right frame, +dx,+dy)
+            bra_r0 = max(0, -dyi) + bw
+            bra_c0 = max(0, -dxi) + bw
+            ket_r0 = max(0, dyi) + bw
+            ket_c0 = max(0, dxi) + bw
+            hgt = nx - abs(dyi) - 2 * bw
+            wid = nx - abs(dxi) - 2 * bw
+            acc = 0.0 + 0.0j
+            for a in range(hgt):           # <bra|ket> = sum conj(bra) * ket
+                for b in range(wid):
+                    acc += np.conj(framesl[c, bra_r0 + a, bra_c0 + b]) \
+                        * framesr[r, ket_r0 + a, ket_c0 + b]
+            out[ii] = acc / (frames_norm[c] * frames_norm[r])
     
 
 def Gramiam_calc(framesl, framesr, plan,frames_norm):
@@ -532,14 +577,32 @@ def Gramiam_calc(framesl, framesr, plan,frames_norm):
     
     time0 = timer()
     #print(nnz)
-    for ii in range(nnz):
-        #braket_i(ii)
-        val[ii] = braket_i(ii,framesl,framesr,col,row,dx,dy,bw)
-        val[ii] /= frames_norm[col[ii]]*frames_norm[row[ii]] #calculate D @ H @ D 
-    
+    if (not GPU) and _HAVE_NUMBA:
+        # fast CPU path: parallel <bra|ket> kernel (same strategy as the GPU
+        # Gramiam_calc_cuda). Fills `val` with the preconditioned (D@H@D)
+        # inner products in one threaded pass instead of a Python loop.
+        val = xp.empty(nnz, dtype=xp.complex128)
+        _braket_val_numba(
+            xp.ascontiguousarray(framesl),
+            xp.ascontiguousarray(framesr),
+            xp.ascontiguousarray(col).astype(np.int64),
+            xp.ascontiguousarray(row).astype(np.int64),
+            xp.ascontiguousarray(dx).astype(np.int64),
+            xp.ascontiguousarray(dy).astype(np.int64),
+            int(bw),
+            xp.ascontiguousarray(frames_norm),
+            val,
+        )
+    else:
+        # reference path: explicit <bra|ket> per overlapping pair
+        for ii in range(nnz):
+            #braket_i(ii)
+            val[ii] = braket_i(ii,framesl,framesr,col,row,dx,dy,bw)
+            val[ii] /= frames_norm[col[ii]]*frames_norm[row[ii]] #calculate D @ H @ D
+
     #print('true value',val)
-    
-    
+
+
     timers["Gramiam"] += timer() - time0
     time0 = timer()
     
