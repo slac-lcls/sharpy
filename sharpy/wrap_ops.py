@@ -1,3 +1,26 @@
+"""
+GPU kernel wrappers.
+
+Thin Python wrappers around the raw CUDA kernels in src/*.cu. GPU-only --
+this module imports cupy at top, so it must be imported only under
+`config.GPU` (Operators.py / Solvers.py guard their imports accordingly).
+See the Operators.py module docstring for the Gramian / braket / zQQz
+naming glossary.
+
+Key wrappers
+------------
+  split_cuda(image, frames, ...)     image -> frames   (src/split.cu)
+  overlap_cuda(image, frames, ...)   frames -> image   (src/overlap.cu)
+  Gramian_plan(...)                  precompute overlap geometry and a
+                                     `gram_calc` closure that launches the
+                                     zQQz Gramian kernel (src/zQQz.cu)
+  refine_illumination_cuda(...)      pairwise illumination refinement
+                                     (src/refine_illumination.cu)
+
+The Gramian assembly itself (val -> sparse H) lives in
+Operators.Gramiam_calc_cuda via plan["val2H"].
+"""
+
 import pkg_resources
 import cupy as cp
 import cupyx.scipy.sparse as sparse
@@ -115,43 +138,6 @@ def split_cuda(image, frames, translations, illumination):
         ((int(nblocks),), (int(nthreads),), \
         (cp.ascontiguousarray(image), frames, cp.ascontiguousarray(translations), cp.ascontiguousarray(illumination), int(image.shape[0]), int(image.shape[1]), int(frames.shape[0]), int(frames.shape[1]), int(frames.shape[2]), int(nthreads), int(tsize)))
     return frames
-
-def Gramiam_calc_cuda(frames, illumination,normalization,frames_norm, gram_calc):
-    col = plan['col']
-    row = plan['row']
-    dx = plan['dx']
-    dy = plan['dy']
-    bw = plan['bw']
-    frame_width=plan['nx']
-    frame_height=plan['ny']
-    nnz = len(col)
-    #value = xp.zeros(nnz,dtype = xp.complex64)
-    value = plan['value'] #xp.zeros(nnz,dtype = xp.complex64)
-
-    #frame_height = frames.shape[1]
-    #frame_width = frames.shape[2]
-    nthreads = 128
-    nblocks = nnz
-  
-    t0 = timer()
-    
-    value = gram_calc(frames,frames_norm, illumination, normalization)
-
-    
-
-    #print('out',value)
-    #print('value by Cuda',value)
-    # Try cupy sparse
-    timers['Gramiam'] = timer() - t0
-    
-    nframes = frames.shape[0]
-    H = sparse.coo_matrix((value.ravel(), (col, row)), shape=(nframes, nframes))
-    H += sparse.triu(H, k=1).conj().T
-    H = H.tocsr()
-    timers['Gramiam_completion']=timer() - t0
-    return H
-
-
 
 def Gramian_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     # embed all geometric parameters into the gramiam function

@@ -1,3 +1,27 @@
+"""
+Ptycho solvers: the iterative reconstruction loops.
+
+Each solver alternates a data constraint (Fourier-magnitude projection) with
+an overlap/image update, optionally with Gramian phase synchronization and/or
+position retrieval. See the Operators.py module docstring for the
+naming/vocabulary glossary (Gramian / braket / zQQz) and the key operators.
+
+Key solvers
+-----------
+  Alternating_projections        CPU AP loop (NumPy), optional Gramian sync.
+  Alternating_projections_c      GPU AP loop (CuPy + CUDA Split/Overlap/zQQz),
+                                 the production reconstruction with sync.
+  Alternating_projections_position
+                                 AP loop with scan-position retrieval
+                                 (method="diag" | "coupled"); see
+                                 position_retrieval.py.
+  plot_intermediate              debug montage of intermediate images.
+
+In operator terms each iteration is:
+  Split -> Illuminate -> Propagate -> Project_data -> IPropagate
+        -> [synchronize_frames_c] -> Overlap  (-> next iterate)
+"""
+
 import numpy as np
 from timeit import default_timer as timer
 from Operators import (
