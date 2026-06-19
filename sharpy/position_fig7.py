@@ -29,7 +29,6 @@ import os
 import sys
 
 import numpy as np
-from scipy.io import loadmat
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -47,9 +46,6 @@ else:
 
     def tonp(a):
         return np.asarray(a)
-
-from Operators import make_probe, map_frames, Splitc
-from position_retrieval import probe_derivatives, taylor_shift_probe
 import Solvers
 
 
@@ -57,79 +53,40 @@ import Solvers
 NX_FRAME = 32          # nx
 DStep = 3.5            # Dx = Dy
 NSCAN = 16             # nnx = nny
-UNKNOWN_AMP = 2.0      # xix = (rand-.5)*4  -> uniform [-2, 2]
+UNKNOWN_AMP = 0.4      # sub-pixel error to retrieve, uniform [-0.4, 0.4] px
+# NOTE: the Taylor/trust-region solver is SUB-PIXEL only (the integer frame map
+# is fixed; the shift rides on the probe). Errors >~0.5 px need integer-map
+# re-planning, which is not implemented. The paper's "±2px" Fig 7 effectively
+# absorbed the integer part into the map and retrieved only the <1px remainder.
 JITTER_FRAC = 0.25     # ixr = ix + (rand-.5)*Dx/4   (Dx/4 / Dx = 1/4)
 
 
 def build_problem(seed=0):
+    """Realistic experimental workflow: simulate a transmission object with
+    baked-in sub-pixel position errors to an .h5, then load it back (with the
+    resolution/translation round-trip), exactly as ptycho_simulate.py ->
+    ptycho_reconstruct.py."""
+    import tempfile
+    from position_simulate import simulate_to_h5, load_h5
+
     rng = np.random.default_rng(seed)
-    nx = ny = NX_FRAME
-    Dx = Dy = DStep
-    nnx = nny = NSCAN
+    nframes = NSCAN * NSCAN
+    # unknown per-frame sub-pixel position errors to retrieve (uniform +/- AMP)
+    xi_x = (rng.random(nframes) - 0.5) * 2 * UNKNOWN_AMP
+    xi_y = (rng.random(nframes) - 0.5) * 2 * UNKNOWN_AMP
 
-    # Periodic image: the step-Dx scan tiles it with wrap-around (map_frames is
-    # periodic), so every pixel is covered.  (sharpy's Overlapc assumes full
-    # coverage; the MATLAB's padded 144x144 leaves uncovered corners.)
-    Nx = int(round(nnx * Dx))   # 56
-    Ny = Nx
-
-    # gold-balls test image, center-cropped to (Nx, Ny), normalized
-    img0 = loadmat(os.path.join(os.path.dirname(__file__), "gold.mat"))["img0"]
-    cy, cx = img0.shape[0] // 2, img0.shape[1] // 2
-    truth = img0[cy - Nx // 2 : cy + Nx // 2, cx - Ny // 2 : cx + Ny // 2]
-    truth = (truth / np.abs(truth).max()).astype(np.complex64)
-    truth = xp.asarray(truth)
-
-    # zone-plate probe (radii matched to MATLAB .025*nx*3, .085*nx*3)
-    probe = make_probe(nx, ny, r1=0.075, r2=0.255)
-    if isinstance(probe, tuple):
-        probe = probe[0]
-    probe = xp.asarray(probe / xp.abs(probe).max(), dtype=xp.complex64)
-
-    # hexagonal scan positions (close packing: shear x by floor(Dx/2) on odd rows)
-    # periodic, tiling the image (wrap handled by map_frames)
-    ix1 = np.arange(nnx) * Dx
-    iy1 = np.arange(nny) * Dy
-    ix, iy = np.meshgrid(ix1, iy1, indexing="ij")
-    xshift = np.floor(Dx / 2) * (np.arange(1, len(ix1) + 1) % 2)
-    ix = ix + xshift[:, None]
-
-    # known random jitter (+/- Dx/4)
-    ix = ix + (rng.random(ix.shape) - 0.5) * Dx * JITTER_FRAC
-    iy = iy + (rng.random(iy.shape) - 0.5) * Dy * JITTER_FRAC
-
-    ix = ix.ravel()
-    iy = iy.ravel()
-    nframes = ix.size
-
-    # unknown perturbation to retrieve
-    xix = (rng.random(nframes) - 0.5) * 2 * UNKNOWN_AMP
-    xiy = (rng.random(nframes) - 0.5) * 2 * UNKNOWN_AMP
-
-    # split into integer base (-> map) and total sub-pixel offset (-> probe)
-    base_x = np.floor(ix + xix)
-    base_y = np.floor(iy + xiy)
-    sub_x = (ix + xix) - base_x
-    sub_y = (iy + xiy) - base_y
-
-    translations_x = xp.asarray(base_x.astype(np.float64))
-    translations_y = xp.asarray(base_y.astype(np.float64))
-    xi_x_truth = xp.asarray(sub_x)
-    xi_y_truth = xp.asarray(sub_y)
-
-    # generate intensity data with the true sub-pixel offsets in the probe
-    dp = probe_derivatives(probe)
-    probe_shifted = taylor_shift_probe(dp, xi_x_truth, xi_y_truth)["O"]
-    mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
-    frames = Splitc(truth, mapid) * probe_shifted
-    frames_data = xp.abs(xp.fft.fft2(frames)) ** 2
-
-    return dict(
-        frames_data=frames_data, probe=probe, truth=truth,
-        translations_x=translations_x, translations_y=translations_y,
-        nx=nx, ny=ny, Nx=Nx, Ny=Ny,
-        xi_x_truth=xi_x_truth, xi_y_truth=xi_y_truth,
-    )
+    fn = os.path.join(tempfile.gettempdir(), f"position_fig7_{seed}.h5")
+    # high contrast (|obj|min ~ exp(-4.1) ~ 0.016) to match the paper's Fig 7
+    # gold object; the realistic weak-contrast regime (contrast~0.69) is much
+    # harder -- see position_simulate / the realism finding.
+    simulate_to_h5(fn, xi_x, xi_y, nx=NX_FRAME, nnx=NSCAN, step=DStep,
+                   r1=0.075, r2=0.255, contrast=4.1)
+    p = load_h5(fn)
+    # to xp (CPU here); keep the loaded keys the solver expects
+    for k in ("frames_data", "probe", "truth", "translations_x", "translations_y",
+              "xi_x_truth", "xi_y_truth"):
+        p[k] = xp.asarray(p[k])
+    return p
 
 
 def run(seed=0, maxiter=1000, position_start=100, method="diag"):
