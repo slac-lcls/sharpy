@@ -804,6 +804,7 @@ def Alternating_projections_position(
     reg=1e-10,
     method="diag",
     backend=None,
+    replan=False,
     img_truth=None,
     xi_x_truth=None,
     xi_y_truth=None,
@@ -844,6 +845,11 @@ def Alternating_projections_position(
     backend : {None, "auto", "python", "numba", "omp"}
         Overlap-kernel backend for the coupled solver (None -> module
         default; see position_retrieval.set_kernel_backend). Ignored by diag.
+    replan : bool
+        Map re-planning (opt-in): migrate the integer part of each per-frame
+        shift into the integer frame map, keeping only the <0.5px residual in
+        the Taylor model. Extends the representable shift range. Requires an
+        apodized probe to be intensity-consistent; default off.
     reg : float
         Tikhonov weight in the image least squares.
     img_truth : (Nx, Ny) complex, optional
@@ -883,6 +889,11 @@ def Alternating_projections_position(
     # Accumulated sub-pixel shift estimate (starts at zero -> probe broadcast).
     xi_x = xp.zeros(nframes)
     xi_y = xp.zeros(nframes)
+
+    # For map re-planning: keep the initial integer positions so the *total*
+    # recovered shift = residual xi + the integers migrated into the map.
+    translations_x0 = translations_x + 0.0
+    translations_y0 = translations_y + 0.0
 
     def probe_and_norm(xi_x, xi_y):
         probe_stack = taylor_shift_probe(dp, xi_x, xi_y)["O"]  # (nframes, nx, ny)
@@ -931,6 +942,26 @@ def Alternating_projections_position(
                     frames, dp, img, mapid, Nx, Ny, xi_x, xi_y,
                     reg=reg, max_step=max_step,
                 )
+
+            # Map re-planning: migrate the integer part of the shift into the
+            # integer frame map, keeping only the <0.5px residual in the Taylor
+            # model (which is all it can represent). Verified equivalence (in
+            # intensity, for an apodized probe): a probe xi_x shift of +n equals
+            # a map shift of translations_y by -n (the relative shift inverts,
+            # and x<->y are transposed by map_frames' 'xy' meshgrid).
+            if replan:
+                n_x = xp.round(xi_x)
+                n_y = xp.round(xi_y)
+                if float(xp.max(xp.abs(n_x))) or float(xp.max(xp.abs(n_y))):
+                    translations_y = translations_y - n_x
+                    translations_x = translations_x - n_y
+                    xi_x = xi_x - n_x
+                    xi_y = xi_y - n_y
+                    mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+                    if method == "coupled":
+                        plan = position_plan(translations_x, translations_y,
+                                             nframes, nx, ny, Nx, Ny)
+
             probe_stack, normalization = probe_and_norm(xi_x, xi_y)
 
         # Overlap (image) projection with the current per-frame probe.
@@ -946,12 +977,18 @@ def Alternating_projections_position(
             if img_truth is not None:
                 residuals[k, 0] = mse_calc(img_truth, img)
             if track_xi:
+                # total recovered shift = residual xi + integers in the map
+                tot_x = xi_x + (translations_y0 - translations_y)
+                tot_y = xi_y + (translations_x0 - translations_x)
                 residuals[k, 3] = xp.sqrt(
-                    xp.sum((xi_x - xi_x_truth) ** 2 + (xi_y - xi_y_truth) ** 2)
+                    xp.sum((tot_x - xi_x_truth) ** 2 + (tot_y - xi_y_truth) ** 2)
                     / den_xi
                 )
 
     if img_truth is not None and nrm_truth != 0:
         residuals[:, 0] /= nrm_truth
 
-    return img, frames, xi_x, xi_y, residuals
+    # return the TOTAL recovered shift (residual + migrated integers)
+    xi_x_total = xi_x + (translations_y0 - translations_y)
+    xi_y_total = xi_y + (translations_x0 - translations_x)
+    return img, frames, xi_x_total, xi_y_total, residuals
