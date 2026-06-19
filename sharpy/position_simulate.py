@@ -22,7 +22,7 @@ import numpy as np
 import h5py
 
 from Operators import make_probe, map_frames, Splitc, cropmat
-from position_retrieval import probe_derivatives, taylor_shift_probe
+from position_retrieval import shift_probe_fourier
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -76,9 +76,10 @@ def simulate_to_h5(fname, xi_x, xi_y, nx=32, nnx=16, step=3.5,
     xi_x = np.asarray(xi_x, dtype=np.float64)
     xi_y = np.asarray(xi_y, dtype=np.float64)
 
-    # bake the position errors into the data via the probe Taylor shift
-    dp = probe_derivatives(probe)
-    probe_shifted = taylor_shift_probe(dp, xi_x, xi_y)["O"]
+    # bake the position errors into the data via the TRUE band-limited shift
+    # (Fourier phase ramp) -- not the Taylor model the solver inverts, so the
+    # test is honest (true shift in, Taylor model out).
+    probe_shifted = shift_probe_fourier(probe, xi_x, xi_y)
     mapid = map_frames(tx, ty, nx, ny, Nx, Ny)
     frames = Splitc(truth, mapid) * probe_shifted
     data = np.abs(np.fft.fft2(frames)) ** 2          # measured intensity

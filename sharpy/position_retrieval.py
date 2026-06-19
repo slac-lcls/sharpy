@@ -85,35 +85,66 @@ def _resolve_backend(backend=None):
     return name
 
 
-def probe_derivatives(probe):
+def probe_derivatives(probe, method="fourier"):
     """First and second spatial derivatives of the probe (Taylor coefficients).
 
-    Mirrors the MATLAB `gradient`-based construction in Poverlap_branch2.m:
+    Used by taylor_shift_probe as: O + x*xi + y*eta + xx*xi^2 + xy*xi*eta +
+    yy*eta^2, so the returned coefficients are dx, dy, dxx/2, dxy, dyy/2.
 
-        dp.O = probe
-        [dp.x, dp.y]  = gradient(probe)
-        [dp.xx, dp.xy] = gradient(dp.x)
-        [~,    dp.yy] = gradient(dp.y)
-        dp.xx /= 2;  dp.yy /= 2        # second-order Taylor coefficients
+    method="fourier" (default): spectral derivatives via a linear ramp in
+        Fourier space, dx f = IFFT(i*kx*F). These are the EXACT derivatives
+        within the probe's band limit, so the 2nd-order Taylor model is the
+        best quadratic fit to a true sub-pixel shift -- markedly better than
+        finite differences, especially near the band edge (the lens aperture
+        sets k_max, which limits how large a shift the Taylor model can
+        represent: it needs k_max*shift <~ 1).
+    method="fd": np.gradient finite differences (the original MATLAB
+        Poverlap_branch2.m construction; kept as reference).
 
-    Returns a dict with keys O, x, y, xx, xy, yy, each (nx, ny).
-
-    Note on axes: np.gradient(a) returns [d/d-axis0, d/d-axis1].  We treat
-    axis 0 as x and axis 1 as y to match the MATLAB column/row convention
-    used throughout sharpy's map_frames.
+    Axes: axis 0 = x, axis 1 = y, matching sharpy's map_frames convention.
     """
     O = probe
-    gx, gy = xp.gradient(O)
-    gxx, gxy = xp.gradient(gx)
-    _, gyy = xp.gradient(gy)
+    if method == "fd":
+        gx, gy = xp.gradient(O)
+        gxx, gxy = xp.gradient(gx)
+        _, gyy = xp.gradient(gy)
+        return {"O": O, "x": gx, "y": gy, "xx": gxx / 2.0, "xy": gxy, "yy": gyy / 2.0}
+
+    # spectral (Fourier-ramp) derivatives -- exact within the band limit
+    nx, ny = O.shape
+    kx = (2 * np.pi * xp.fft.fftfreq(nx)).reshape(nx, 1)
+    ky = (2 * np.pi * xp.fft.fftfreq(ny)).reshape(1, ny)
+    F = xp.fft.fft2(O)
+
+    def d(mult):
+        return xp.fft.ifft2(mult * F)
+
     return {
         "O": O,
-        "x": gx,
-        "y": gy,
-        "xx": gxx / 2.0,
-        "xy": gxy,
-        "yy": gyy / 2.0,
+        "x": d(1j * kx),
+        "y": d(1j * ky),
+        "xx": d(-(kx ** 2)) / 2.0,
+        "xy": d(-(kx * ky)),
+        "yy": d(-(ky ** 2)) / 2.0,
     }
+
+
+def shift_probe_fourier(probe, xi_x, xi_y):
+    """Exact band-limited sub-pixel shift of the probe via a Fourier phase ramp.
+
+    probe(x+xi) = IFFT( FFT(probe) * exp(i*(kx*xi_x + ky*xi_y)) ), per frame.
+    Returns a (nframes, nx, ny) stack. This is the *true* shift (all Taylor
+    orders), useful for generating honest test data -- as opposed to
+    taylor_shift_probe, which is the 2nd-order model the solver inverts.
+    Same +xi sign convention as taylor_shift_probe.
+    """
+    nx, ny = probe.shape
+    kx = (2 * np.pi * xp.fft.fftfreq(nx)).reshape(1, nx, 1)
+    ky = (2 * np.pi * xp.fft.fftfreq(ny)).reshape(1, 1, ny)
+    F = xp.fft.fft2(probe)[xp.newaxis, :, :]
+    ramp = xp.exp(1j * (kx * xi_x[:, xp.newaxis, xp.newaxis]
+                        + ky * xi_y[:, xp.newaxis, xp.newaxis]))
+    return xp.fft.ifft2(F * ramp, axes=(1, 2))
 
 
 def _bcast(stack2d, per_frame):
