@@ -129,6 +129,31 @@ def probe_derivatives(probe, method="fourier"):
     }
 
 
+def apodization_mask(nx, ny, support_frac=0.5, taper_frac=0.4):
+    """Smooth radial mask that is 1 in the center and 0 at the frame borders.
+
+    Multiplying the probe by this enforces the oversampling/anti-aliasing
+    condition: the exit wave (probe*object) must fill <= 1/2 the frame so that
+    |FT|^2 (whose support is the exit-wave autocorrelation, twice as wide) does
+    not alias. support_frac=0.5 -> probe support ~ half the frame width; a
+    raised-cosine taper (taper_frac of the radius) keeps it smooth (zero at the
+    edges also makes the probe shift cleanly, no boundary wrap).
+    """
+    yy, xx = xp.meshgrid(xp.arange(nx) - nx / 2.0,
+                         xp.arange(ny) - ny / 2.0, indexing="ij")
+    r = xp.sqrt(xx ** 2 + yy ** 2)
+    r_out = support_frac * (nx / 2.0)          # zero beyond this radius
+    r_in = r_out * (1.0 - taper_frac)          # unity inside this radius
+    t = xp.clip((r_out - r) / (r_out - r_in), 0.0, 1.0)
+    return (0.5 * (1.0 - xp.cos(xp.pi * t))).astype(xp.float64)
+
+
+def apodize_probe(probe, support_frac=0.5, taper_frac=0.4):
+    """Apodize a probe to zero at the borders (~<= 1/2 frame support)."""
+    m = apodization_mask(probe.shape[0], probe.shape[1], support_frac, taper_frac)
+    return (probe * m).astype(probe.dtype)
+
+
 def shift_probe_fourier(probe, xi_x, xi_y):
     """Exact band-limited sub-pixel shift of the probe via a Fourier phase ramp.
 

@@ -22,7 +22,7 @@ import numpy as np
 import h5py
 
 from Operators import make_probe, map_frames, Splitc, cropmat
-from position_retrieval import shift_probe_fourier
+from position_retrieval import shift_probe_fourier, apodize_probe
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -41,8 +41,8 @@ def transmission_object(Nx, Ny, contrast=0.69, phase_frac=0.5, gold_png=None):
 
 
 def simulate_to_h5(fname, xi_x, xi_y, nx=32, nnx=16, step=3.5,
-                   r1=0.075, r2=0.255, contrast=0.69, wavelength=0.1,
-                   detector_pixel_size=100.0, resolution=1.0):
+                   r1=0.075, r2=0.255, contrast=0.69, apodize=True,
+                   wavelength=0.1, detector_pixel_size=100.0, resolution=1.0):
     """Write a dataset (transmission object + baked-in position errors) to
     `fname` in the ptycho_simulate.py schema, plus the true xi.
 
@@ -63,6 +63,10 @@ def simulate_to_h5(fname, xi_x, xi_y, nx=32, nnx=16, step=3.5,
     if isinstance(probe, tuple):
         probe = probe[0]
     probe = np.asarray(probe / np.abs(probe).max(), dtype=np.complex64)
+    if apodize:
+        # zero the probe at the borders so the exit wave fills <= 1/2 the frame
+        # -> |FT|^2 is not aliased (oversampling), and the probe shifts cleanly.
+        probe = apodize_probe(probe)
 
     # hexagonal periodic scan; integer base positions (sub-pixel goes in xi)
     ix1 = np.arange(nnx) * step
