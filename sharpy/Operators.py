@@ -1258,6 +1258,77 @@ def refine_illumination_function(
     #return illumination, normalization
     return illumination
 
+
+def refine_illumination_deflated(img, illumination, frames, mapid,
+                                 beta=0.0, eps=1e-2, lens_mask=None,
+                                 residual=True):
+    """Probe (illumination) update with optional average-transparency deflation
+    (eq.16 of Marchesini & Wu, arXiv:1408.1922; MATLAB FPoverlap_x.m,
+    Fix_probe_intrnl*), in two variants.
+
+    The plain update (beta=0) is the regularized least-squares probe step
+    (same as refine_illumination_function):
+
+        illum = (sum_n frames_n conj(O_n) + eps*illum0) / (sum_n |O_n|^2 + eps)
+
+    where O_n = Split(img) are the current object frames. Deflation subtracts the
+    scalar average transparency  mm * illum  before the update.
+
+    residual=True: mm is taken from the RESIDUAL z - O*P:
+        mm = <illum, frames - O*illum> / (nframes * ||illum||^2)
+      The residual -> 0 at the solution, so the deflation SELF-CANCELS at the
+      fixed point -> NO bias/plateau (reaches the same floor as plain eq.7). BUT
+      it also provides essentially NO acceleration: empirically beta>0 is
+      identical to beta=0 here -- the leftover term lies along the probe's own
+      scale (the scalar gauge / object update already absorb it). KEY LESSON: the
+      bias and the speedup of z-deflation are the SAME mechanism (subtracting a
+      transparency that is NONZERO at the solution); remove the bias and you
+      remove the speedup. So residual=True ~= plain eq.7. Default for safety.
+
+    residual=False (the original eq.16): mm from z itself:
+        mm = <illum, frames> / (nframes * ||illum||^2)
+      mm*illum is NONZERO at the solution -> biases the probe fixed point -> the
+      reconstruction PLATEAUS above the plain-eq.7 floor (and a fixed beta
+      re-grows the mode and diverges; only an ANNEALED beta is usable, and it
+      still plateaus). Gives an early-iteration head start (useful only if you
+      stop early). Kept for reference / reproducing the paper's behaviour.
+
+    CPU/GPU agnostic.
+
+    Parameters
+    ----------
+    img : (Nx, Ny) complex          current image (object) estimate
+    illumination : (nx, ny) complex current probe estimate
+    frames : (nframes, nx, ny)      current exit-wave estimate (post data proj.)
+    mapid : frame<->image index map (from map_frames)
+    beta : float                    deflation strength this call (0 = plain eq.7)
+    eps : float                     LS regularization (relative to max |O|^2)
+    lens_mask : (nx, ny) or None    optional Fourier aperture constraint
+    residual : bool                 deflate the residual (self-cancelling) vs z
+    """
+    object_frames = Splitc(img, mapid)
+    norm_frames = xp.sum(xp.abs(object_frames) ** 2, 0)
+    eps_illum = xp.max(xp.abs(norm_frames)) * eps
+
+    z = frames
+    if beta:
+        nframes = frames.shape[0]
+        # average transparency: from the residual (self-cancelling) or from z
+        src = z - object_frames * illumination[xp.newaxis] if residual else z
+        mm = xp.sum(xp.conj(illumination)[xp.newaxis] * src) / (
+            nframes * xp.sum(xp.abs(illumination) ** 2) + 1e-30
+        )
+        z = z - beta * mm * illumination[xp.newaxis]
+
+    illum = (xp.sum(z * xp.conj(object_frames), 0) + eps_illum * illumination) / (
+        norm_frames + eps_illum
+    )
+
+    if lens_mask is not None:
+        illum = xp.fft.ifft2(xp.fft.fft2(illum) * lens_mask)
+    return illum
+
+
 if GPU:
     from wrap_ops import overlap_cuda,split_cuda
 #refine illumination based on pairwise relationship between frames
