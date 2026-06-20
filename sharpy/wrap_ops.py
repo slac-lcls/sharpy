@@ -168,7 +168,7 @@ def Gramian_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
 
     # we cam pass the function instead of the plan
     def gram_calc(frames,frames_norm, illumination, normalization, value=val):
-        cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+        cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
         ((int(nblocks),),(int(nthreads),), \
         (value,frames,frames_norm, illumination, normalization,col,row,dx,dy,bw,nnz, nx, ny))
         return value
@@ -176,7 +176,7 @@ def Gramian_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
 
     '''    
     gram_calc= lambda val,frames,frames_norm, illumination, normalization : 
-         cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+         cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
         ((int(nblocks),),(int(nthreads),), \
         (value,frames,frames_norm, illumination, normalization,col,row,dx,dy,bw,nnz, nx, ny))
     '''

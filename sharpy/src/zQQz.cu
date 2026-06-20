@@ -4,8 +4,8 @@
 //#include <iostream>
 //#include <cub/cub.cuh> 
 //#include <cupy/cub/cub/cub.cuh>
-#include <cub/block/block_reduce.cuh>
-//#include <cupy/cub/cub/block/block_reduce.cuh>
+//#include <cub/block/block_reduce.cuh>
+#include <cupy/cub/cub/block/block_reduce.cuh>
 
 extern "C" __global__ void 
 dotp(

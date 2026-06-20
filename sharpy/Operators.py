@@ -731,7 +731,7 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm):
     nthreads = 128
     nnz = len(col)
     nblocks = nnz
-    cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+    cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
     ((int(nblocks),),(int(nthreads),), \
     (value,frames,frames_norm,illumination,normalization,col,row,dx,dy,bw,nnz, frame_height, frame_width))
         
@@ -810,7 +810,7 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
         def gram_calc(frames,frames_norm, illumination, normalization, value=val+0):
         #def gram_calc(frames,frames_norm, illumination, normalization, value=val):
        
-            cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True)\
+            cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
             ((int(nblocks),),(int(nthreads),), \
             (value,frames,frames_norm, illumination, normalization,col.astype(int),row.astype(int),dx,dy,bw,nnz, nx, ny))
             return value
