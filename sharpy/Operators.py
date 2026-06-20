@@ -854,7 +854,17 @@ else:
 #######
 ####Eigensolver is causing problems, need implementation
 #######
-def Eigensolver(H,num_iter):
+_eig_v0 = None  # cached dominant eigenvector, for power-iteration warm start
+
+
+def eig_reset():
+    """Drop the cached eigenvector (call between unrelated reconstructions)."""
+    global _eig_v0
+    _eig_v0 = None
+
+
+def Eigensolver(H, num_iter, v0=None, tol=1e-6):
+    global _eig_v0
     time0 = timer()
 
     nframes = xp.shape(H)[0]
@@ -897,16 +907,32 @@ def Eigensolver(H,num_iter):
             ## of illumination =0). Either change initialization or only sync after a stable 
             ## estimation of illumination found.
             ####
-            eigenvectors = xp.ones((nframes,1),xp.complex64)
-            H.todense()
+            # Power iteration (single-precision robust -- no Lanczos loss of
+            # orthogonality, so no phase jumps in omega/|omega|). WARM-START from
+            # the previous call's eigenvector (_eig_v0) when available, else ones:
+            # the consensus eigenvector is ~constant-phase, so ones is already close
+            # and the previous AP step is closer -> converges in ~1-2 matvecs
+            # regardless of frame count. Stop early once it stops changing.
+            if v0 is not None and v0.shape[0] == nframes:
+                eigenvectors = xp.asarray(v0, dtype=xp.complex64).reshape(nframes, 1) + 0.0
+            elif _eig_v0 is not None and _eig_v0.shape[0] == nframes:
+                eigenvectors = _eig_v0 + 0.0
+            else:
+                eigenvectors = xp.ones((nframes, 1), xp.complex64)
+            eigenvectors /= xp.linalg.norm(eigenvectors)
             for _ in range(num_iter):
-                #print(np.linalg.norm(eigenvectors))
-                eigenvectors = H @ eigenvectors
-                eigenvectors /= xp.linalg.norm(eigenvectors)
-            
+                vn = H @ eigenvectors
+                vn /= xp.linalg.norm(vn)
+                if float(xp.linalg.norm(vn - eigenvectors)) < tol:
+                    eigenvectors = vn
+                    break
+                eigenvectors = vn
+            _eig_v0 = eigenvectors + 0.0          # cache for next AP iteration's warm start
+
         else:
             eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense())
             eigenvectors = xp.array(eigenvectors)
+            _eig_v0 = xp.asarray(eigenvectors[:, -1]).reshape(nframes, 1) + 0.0
         
         #eigenvalues, eigenvectors = eigsh(H1 , k=2,ncv = 6, v0 = v0, maxiter = 10,which="LM", tol=1e-6,return_eigenvectors = True) # if dont specify starting point v0, converges to another eigenvector
         #eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense()) #working
