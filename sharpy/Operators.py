@@ -73,7 +73,6 @@ import multiprocessing as mp
 import matplotlib.pyplot as plt
 
 import math
-import numpy_groupies
 
 try:
     from numba import njit as _njit, prange as _prange
@@ -411,16 +410,23 @@ def Splitc(img, mapid):
 
 
 def Overlapc(frames, Nx, Ny, mapid):  # check
-    # overlap frames onto an image using aggregate function
+    # overlap frames onto an image by scatter-add (adjoint of Splitc).
+    # Uses xp.bincount so it runs on BOTH numpy and cupy -- numpy_groupies
+    # is CPU-only and raises on cupy arrays. minlength=Nx*Ny zero-fills
+    # pixels no frame covers, so partial-coverage (padded) geometries work.
+    # mapid = mapidx + mapidy*Nx (row-stride Nx) => the image is [y, x] with
+    # width Nx, i.e. shape (Ny, Nx); reshaping to (Nx, Ny) only happens to be
+    # correct when Nx == Ny.
     time0 = timer()
-    # size=Nx*Ny zero-fills image pixels that no frame covers; without it
-    # aggregate returns only up to max(mapid)+1 entries and the reshape
-    # fails on partial-coverage (padded) geometries.
-    accum = xp.reshape(
-        numpy_groupies.aggregate(mapid.ravel(), frames.ravel(), size=Nx * Ny),
-        (Nx, Ny),
-    )
-
+    g = mapid.ravel()
+    f = frames.ravel()
+    if xp.iscomplexobj(f):
+        accum = xp.bincount(g, weights=f.real, minlength=Nx * Ny) + 1j * xp.bincount(
+            g, weights=f.imag, minlength=Nx * Ny
+        )
+    else:
+        accum = xp.bincount(g, weights=f, minlength=Nx * Ny)
+    accum = xp.reshape(accum, (Ny, Nx))
     timers["Overlap"] += timer() - time0
     return accum
 
@@ -441,14 +447,20 @@ def Overlapd(frames, SS, shape):  # check
 def Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny):
     mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
 
-    # for cupy we need a sparse matrix
+    # for cupy we need a sparse matrix. shape=(Nx*Ny, mapid.size) is REQUIRED:
+    # without it coo_matrix infers rows = max(mapid)+1, so on partial-coverage
+    # geometries (object larger than the scan -> far corner unlit) SS has fewer
+    # than Nx*Ny rows and Overlapd's reshape fails. (Ny, Nx) matches the
+    # [y, x] layout of mapid (see Overlapc).
     col = xp.arange(mapid.size)
     val = xp.ones((mapid.size), dtype=np.float32)
-    SS = sparse.coo_matrix((val.ravel(), (mapid.ravel(), col.ravel())))
+    SS = sparse.coo_matrix(
+        (val.ravel(), (mapid.ravel(), col.ravel())), shape=(Nx * Ny, mapid.size)
+    )
     SS = sparse.csr_matrix(SS)
 
     Split = lambda img: Splitc(img, mapid)
-    Overlap = lambda frames: Overlapd(frames, SS, (Nx, Ny))
+    Overlap = lambda frames: Overlapd(frames, SS, (Ny, Nx))
     return Split, Overlap
 
 
@@ -491,7 +503,7 @@ def Overlapc0(frames, Nx, Ny, mapid):
     ) + 1j * xp.bincount(
         mapid.ravel(), weights=(frames.ravel()).imag, minlength=Nx * Ny
     )
-    ret.shape = (Nx, Ny)
+    ret.shape = (Ny, Nx)
     return ret
 
 

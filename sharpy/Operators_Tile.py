@@ -9,7 +9,6 @@ import numpy as np
 import scipy as sp
 
 import math
-import numpy_groupies
 
 import config
 import pkg_resources
