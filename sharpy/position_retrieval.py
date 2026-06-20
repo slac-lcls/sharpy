@@ -222,6 +222,7 @@ def position_solve_diag(
     xi_y,
     reg=1e-10,
     max_step=0.5,
+    method="taylor",
 ):
     """One diagonal position-retrieval update.
 
@@ -230,7 +231,8 @@ def position_solve_diag(
     frames : (nframes, nx, ny) complex
         Current frame estimate z (e.g. output of the data projection).
     dp : dict
-        Probe Taylor coefficients from `probe_derivatives` (unshifted).
+        Probe derivatives from `probe_derivatives` (unshifted); needs dp["O"],
+        dp["x"], dp["y"] (the latter two are the spectral first derivatives).
     xrec0 : (Nx, Ny) complex
         Current image estimate, used for the Tikhonov regularization.
     mapid : (nframes, nx, ny) int
@@ -243,17 +245,29 @@ def position_solve_diag(
         Tikhonov weight toward xrec0 (MATLAB reg=1e-10).
     max_step : float
         Trust-region cap on per-frame step, in pixels (MATLAB 0.5).
+    method : {"taylor", "exact"}
+        How to re-linearize the probe at the current shift. "taylor" = the
+        2nd-order Taylor model (cheap; valid only within ~1/k_max). "exact" =
+        the exact band-limited shifted probe and shifted spectral derivatives
+        (shift_probe_fourier; shift commutes with d/dx for a band-limited probe),
+        which is exact at the current estimate -> machine-precision in-range
+        recovery and a larger capture radius (~1.7x) for a few extra FFTs.
 
     Returns
     -------
     xi_x, xi_y : (nframes,) float
         Updated shift estimate.
     """
-    # Recenter the Taylor expansion about the current shift.
-    st = taylor_shift_probe(dp, xi_x, xi_y)
-    probe_O = st["O"]  # (nframes, nx, ny)
-    probe_x = st["x"]
-    probe_y = st["y"]
+    # Re-linearize the probe about the current shift (Taylor model or exact).
+    if method == "exact":
+        probe_O = shift_probe_fourier(dp["O"], xi_x, xi_y)
+        probe_x = shift_probe_fourier(dp["x"], xi_x, xi_y)
+        probe_y = shift_probe_fourier(dp["y"], xi_x, xi_y)
+    else:
+        st = taylor_shift_probe(dp, xi_x, xi_y)
+        probe_O = st["O"]  # (nframes, nx, ny)
+        probe_x = st["x"]
+        probe_y = st["y"]
 
     # Image least squares:  psi_img = QQinv * (Q*[z] + reg*xrec0),  psi = split(psi_img)
     #   QQinv = 1 / (sum_overlap |probe|^2 + reg)
