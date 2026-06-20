@@ -1,75 +1,74 @@
 from cupyx.scipy import fftpack
 
+# Cached cuFFT plans. A cupy FFT plan is specific to the input SHAPE (incl. the
+# batch dimension) and DTYPE, so we cache the plan together with the (shape,
+# dtype) key it was built for and re-plan whenever that key changes. Reusing a
+# plan for a different batch size / dtype silently produces WRONG results (it
+# does not raise) -- this previously caused reconstructions to stagnate when the
+# number of frames changed within one process (e.g. running several scan sizes
+# in one notebook kernel).
 global plan1D
 global plan2D
 plan1D = None
 plan2D = None
+_key1D = None
+_key2D = None
 # print("Plan1D",plan1D)
 owrite = True
 Plan = True
 
 
-def fft_reset(x):
-    global plan1D
-    global plan2D
+def fft_reset(x=None):
+    global plan1D, plan2D, _key1D, _key2D
     plan1D = None
     plan2D = None
+    _key1D = None
+    _key2D = None
+
+
+def _plankey(x):
+    return (x.shape, x.dtype)
 
 
 def fft(x):
-    global plan1D
-    # print("Plan1D",plan1D)
-    if plan1D == None and Plan:
+    global plan1D, _key1D
+    if not Plan:
+        return fftpack.fft(x, overwrite_x=owrite)
+    k = _plankey(x)
+    if plan1D is None or _key1D != k:
         plan1D = fftpack.get_fft_plan(x, axes=(-1))
-
-    #    print('plan1d', plan1D)
-    #    print('plan1d', plan1D)
-    #    print('plan1d', plan1D)
-    try:
-        return fftpack.fft(x, overwrite_x=owrite, plan=plan1D)
-    except:
-        plan1D = fftpack.get_fft_plan(x, axes=(-1))
-        return fftpack.fft(x, overwrite_x=owrite, plan=plan1D)
-
-    # return x
+        _key1D = k
+    return fftpack.fft(x, overwrite_x=owrite, plan=plan1D)
 
 
 def ifft(x):
-    global plan1D
-    if plan1D == None and Plan:
+    global plan1D, _key1D
+    if not Plan:
+        return fftpack.ifft(x, overwrite_x=owrite)
+    k = _plankey(x)
+    if plan1D is None or _key1D != k:
         plan1D = fftpack.get_fft_plan(x, axes=(-1))
-
+        _key1D = k
     return fftpack.ifft(x, overwrite_x=owrite, plan=plan1D)
-
-    # return
-    # return x
 
 
 def fft2(x):
-    global plan2D
-    if plan2D == None and Plan:
+    global plan2D, _key2D
+    if not Plan:
+        return fftpack.fft2(x, overwrite_x=owrite)
+    k = _plankey(x)
+    if plan2D is None or _key2D != k:
         plan2D = fftpack.get_fft_plan(x, axes=(-2, -1))
-        if False:
-            print('plan2D is None')
-            print(type(x.dtype))
-            print(plan2D)
-    else:
-        #fft_reset(x)
-        #plan2D = fftpack.get_fft_plan(x, axes=(-2, -1))
-        if False:
-            print('Using existing plan2D')
-            print(type(x.dtype))
-            print(plan2D)
-    # return
+        _key2D = k
     return fftpack.fft2(x, overwrite_x=owrite, plan=plan2D)
-    # return x
 
 
 def ifft2(x):
-    global plan2D
-    if plan2D == None and Plan:
+    global plan2D, _key2D
+    if not Plan:
+        return fftpack.ifft2(x, overwrite_x=owrite)
+    k = _plankey(x)
+    if plan2D is None or _key2D != k:
         plan2D = fftpack.get_fft_plan(x, axes=(-2, -1))
-
-    #   return
+        _key2D = k
     return fftpack.ifft2(x, overwrite_x=owrite, plan=plan2D)
-    # return x
