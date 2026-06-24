@@ -894,7 +894,11 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-6):
 
     nframes = xp.shape(H)[0]
     # print('nframes',nframes)
-    if GPU: 
+    # This eigenvector solve runs on BOTH backends: the power iteration's `H @ v`
+    # and xp reductions work for cupyx and scipy sparse alike. It was previously
+    # gated by `if GPU:`, which left `eigenvectors` unbound on CPU (UnboundLocalError)
+    # and broke synchronize_frames_c there.
+    if True:
         
         #print('IS H herm', H - H.transpose().conj())
         #use sparsity, and hermitian, use only triu
@@ -955,7 +959,7 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-6):
             _eig_v0 = eigenvectors + 0.0          # cache for next AP iteration's warm start
 
         else:
-            eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense())
+            eigenvalues,eigenvectors = np.linalg.eigh((H.get() if GPU else H).todense())
             eigenvectors = xp.array(eigenvectors)
             _eig_v0 = xp.asarray(eigenvectors[:, -1]).reshape(nframes, 1) + 0.0
         
