@@ -793,6 +793,25 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     dx_np  = dx_all[keep].astype(np.int64)
     dy_np  = dy_all[keep].astype(np.int64)
 
+    # The 3×3 periodic tiling can return the SAME (row, col) pair via several
+    # image copies. The original dense-matrix path kept exactly ONE entry per
+    # pair (the minimal/wrapped image, via wrap_boundary), so coo→csr never
+    # merged entries. Left un-deduplicated, the duplicates (a) make H.data
+    # (merged by tocsr) smaller than val2H's index bookkeeping expects →
+    # IndexError, and (b) would double-count overlaps. De-duplicate per
+    # (row, col), keeping the closest image (smallest l∞ |dx|,|dy|), to match
+    # the pre-KD-tree Gramian exactly.
+    _key   = row_np.astype(np.int64) * nframes + col_np.astype(np.int64)
+    _linf  = np.maximum(np.abs(dx_np), np.abs(dy_np))
+    _order = np.lexsort((_linf, _key))          # group by pair, closest image first
+    _ks    = _key[_order]
+    _first = np.empty(_order.size, dtype=bool)
+    _first[0] = True
+    _first[1:] = _ks[1:] != _ks[:-1]
+    _sel   = _order[_first]
+    row_np = row_np[_sel]; col_np = col_np[_sel]
+    dx_np  = dx_np[_sel];  dy_np  = dy_np[_sel]
+
     # ── val2H needs the FULL symmetric (row, col) list ────────────────────────
     val2H = mapu2all(xp.array(row_np), xp.array(col_np), nframes)
 
