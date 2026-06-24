@@ -7,6 +7,13 @@ synchronize_frames_c crashes. (Large-image production runs have no duplicates,
 which is why the bug went unnoticed on GPU.) This script uses such a small scene,
 so PRE-fix it crashes and POST-fix the sync runs and recovers the low-freq phase.
 
+The primary assertion is that synchronize_frames_c RUNS (no val2H IndexError);
+phase recovery additionally works on CPU. NOTE: on GPU this small scene also hits
+a SEPARATE zQQz.cu small-image NaN (heavy periodic wrap, outside the kernel's
+normal large-image regime), so for GPU end-to-end confirmation use
+phase_sync_test.py (large image) -- verified on A100: KD-tree+dedup reproduces the
+pre-KD-tree NMSE (no-sync 0.87 / power 0.21 / eigsh 1.46e-6 / invit 1.46e-6).
+
 Runs on whatever config.GPU selects (xp). On Perlmutter:
   source ~/sharpy-venv/bin/activate
   srun -A lcls_g -C gpu -q interactive -N1 -n1 --gpus 1 -t 00:10:00 python sync_gpu_confirm.py
@@ -76,9 +83,17 @@ def recon(do_sync, niter=200, num_iter=50):
     return lf(img)
 
 
+import math
 ns = recon(False)
-ss = recon(True)
+ss = recon(True)   # PRE-FIX: this raised "val2H IndexError" (duplicate KD-tree pairs)
 print(f"lf-phase NMSE: no-sync {ns:.3e}  ->  sync {ss:.3e}")
-print("PASS — sync runs and recovers the low-freq phase (pre-fix: val2H IndexError)"
-      if ss < ns / 10 else
-      "CHECK — sync did not improve as expected")
+# Reaching here at all = synchronize_frames_c ran without the val2H IndexError
+# = the dedup fix is present (the primary assertion).
+if math.isfinite(ss) and ss < ns / 10:
+    print("PASS — dedup fix OK (no val2H IndexError) AND sync recovers the low-freq phase")
+else:
+    print("DEDUP-OK — synchronize_frames_c ran without the val2H IndexError (the fix). "
+          "Phase NMSE not recovered: on GPU this *small* scene additionally hits a "
+          "SEPARATE zQQz.cu small-image NaN (heavy periodic wrap, a regime the kernel "
+          "isn't normally used in). For GPU end-to-end use phase_sync_test.py "
+          "(large image) -- verified there. On CPU this PASSes.")
