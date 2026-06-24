@@ -80,8 +80,8 @@ try:
 except Exception:
     _HAVE_NUMBA = False
 
+import os
 import config
-import pkg_resources
 
 GPU = config.GPU
 
@@ -92,6 +92,7 @@ if GPU:
     from fft_plan import fft2, ifft2
     import cupyx as cpx
     import cupy as cp
+    from wrap_ops import gram_raw_kernel
 
 else:
     xp = np
@@ -692,24 +693,20 @@ def Gramiam_calc(framesl, framesr, plan,frames_norm):
     return H
 
 
-resource_package = __name__
+_src = os.path.join(os.path.dirname(__file__), 'src')
 
-zQQz_raw_kernel = None
-if zQQz_raw_kernel == None:
-    resource_path = '/'.join(('src','zQQz.cu'))
-    file_name = pkg_resources.resource_filename(resource_package, resource_path)
-    with open(file_name, 'r') as myfile:
-        zQQz_raw_kernel = myfile.read()
+with open(os.path.join(_src, 'zQQz.cu'), 'r') as f:
+    zQQz_raw_kernel = f.read()
 
 
-def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm):
-    
+def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=timers):
+
     t0 = timer()
-   
+
     value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
-   
+
     timers['Gramiam'] = timer()-t0
-    
+
     t0 = timer()
     H = plan["val2H"](value.ravel())
     timers['Gramiam_completion'] = timer()-t0
@@ -759,65 +756,79 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm):
     return H
 
 def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
-    # embed all geometric parameters into the gramiam function
-    
-    # calculates the difference of the coordinates between all frames
-    dx = translations_x.ravel(order="F").reshape(nframes, 1)
-    dy = translations_y.ravel(order="F").reshape(nframes, 1)
-    dx = xp.subtract(dx, xp.transpose(dx))
-    dy = xp.subtract(dy, xp.transpose(dy))
-    
-    # calculates the wrapping effect for a period boundary
-    #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(float) - (dx > (Nx / 2)).astype(float)))
-    def wrap_boundary(dx,Nx):
-        return -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
-    # cp.fuse is CuPy-only; on the CPU (NumPy) path use the plain function.
-    if GPU:
-        wrap_boundary = cp.fuse(kernel_name="wrap_boundary")(wrap_boundary)
+    from scipy.spatial import KDTree
 
-    #dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
-    dx = wrap_boundary(dx,Nx)
-    #dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(float) - (dy > (Ny / 2)).astype(float)))
-    #@xp.fuse(kernel_name="wrap_boundary2")
-    #dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(int) - (dy > (Ny / 2)).astype(int)))
-    dy =  wrap_boundary(dy,Ny)
-    # find the all the frames idex that overlaps
-    row, col = xp.where((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)) 
-    
-    # complete matrix using only values for the triu part
-    val2H = mapu2all(row, col , nframes) # why are col-row swapped? Maybe the .T
-    
-    #find the the upper triu of idex that overlaps
-    col,row = xp.where(xp.triu((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)))
-    
-    # displacement dx and dy
-    dx = dx[row,col]
-    dy = dy[row,col]
-    
-    
-    nnz = col.size
-    #val=xp.empty((nnz,1),dtype=xp.complex64) 
-    val=xp.zeros((nnz,1),dtype=xp.complex64) 
-    
-    # plan = {"col": xp.ascontiguousarray(col), "row": xp.ascontiguousarray(row), "dx": dx, "dy": dy,"val": val, "bw": bw}
-    plan = {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy,"val": val, "bw": bw,"val2H":val2H,"gram_calc":None}
-    
-    # we can pass the function instead of the plan
-    if GPU: 
+    # Overlap thresholds — match original: abs(dx)<ny-2bw, abs(dy)<nx-2bw
+    thresh_dx = ny - 2 * bw
+    thresh_dy = nx - 2 * bw
+
+    # ── KD-tree neighbor search: O(N·k) memory, replaces the O(N²) dx/dy matrix ─
+    # Pull translations to CPU numpy for the KD-tree (translations are tiny).
+    tx = cp.asnumpy(translations_x.ravel()) if GPU else np.asarray(translations_x.ravel(), dtype=float)
+    ty = cp.asnumpy(translations_y.ravel()) if GPU else np.asarray(translations_y.ravel(), dtype=float)
+    points = np.column_stack([tx, ty])          # (nframes, 2)
+
+    # 3×3 periodic image copies handle the toroidal (Nx × Ny) wrap-around.
+    offsets = np.array([(sx * Nx, sy * Ny) for sx in (-1, 0, 1) for sy in (-1, 0, 1)])
+    tiled       = np.vstack([points + off for off in offsets])   # (9·nframes, 2)
+    tile_frame  = np.tile(np.arange(nframes), 9)                 # original frame index per tiled pt
+
+    # Bounding-box (l∞) query to get candidate pairs, then exact rectangle filter.
+    r_box = max(thresh_dx, thresh_dy)
+    hits  = KDTree(points).query_ball_tree(KDTree(tiled), r=r_box, p=np.inf)
+
+    # Vectorised flatten of hit lists → (all_i, all_k) index arrays.
+    counts = np.array([len(h) for h in hits], dtype=np.intp)
+    all_i  = np.repeat(np.arange(nframes), counts)
+    all_k  = np.array([k for h in hits for k in h], dtype=np.intp)
+
+    # dx_ij = tx[j]_wrap - tx[i]  (sign convention: tiled copy minus query point)
+    dx_all = tiled[all_k, 0] - points[all_i, 0]
+    dy_all = tiled[all_k, 1] - points[all_i, 1]
+
+    keep   = (np.abs(dx_all) < thresh_dx) & (np.abs(dy_all) < thresh_dy)
+    # row_np = matrix row index (standard), col_np = matrix col index (standard)
+    row_np = all_i[keep].astype(np.int32)
+    col_np = tile_frame[all_k[keep]].astype(np.int32)
+    dx_np  = dx_all[keep].astype(np.int64)
+    dy_np  = dy_all[keep].astype(np.int64)
+
+    # ── val2H needs the FULL symmetric (row, col) list ────────────────────────
+    val2H = mapu2all(xp.array(row_np), xp.array(col_np), nframes)
+
+    # ── TRIU pairs for gram_calc ───────────────────────────────────────────────
+    # Original naming convention (from xp.where(xp.triu(...))):
+    #   plan["col"] = matrix row index  (first xp.where output, ≤ plan["row"])
+    #   plan["row"] = matrix col index  (second xp.where output)
+    # dx_kernel = dx_matrix[plan["row"], plan["col"]]
+    #           = tx[plan["col"]] - tx[plan["row"]]   (no-wrap sign)
+    # From KD-tree: dx_np = tx[j]_wrap - tx[i], so dx_kernel = -dx_np.
+    triu   = row_np <= col_np
+    col_t  = xp.array(row_np[triu])           # plan["col"] = matrix row idx
+    row_t  = xp.array(col_np[triu])           # plan["row"] = matrix col idx
+    dx_t   = xp.array(-dx_np[triu], dtype=xp.int64)   # kernel expects long long int
+    dy_t   = xp.array(-dy_np[triu], dtype=xp.int64)
+
+    nnz = int(col_t.size)
+    val = xp.zeros((nnz, 1), dtype=xp.complex64)
+
+    plan = {
+        "col": col_t.astype(int), "row": row_t.astype(int),
+        "dx": dx_t, "dy": dy_t, "val": val, "bw": bw,
+        "val2H": val2H, "gram_calc": None,
+    }
+
+    if GPU:
         nthreads = 128
-        nnz = len(col)
-        nblocks = nnz 
-        def gram_calc(frames,frames_norm, illumination, normalization, value=val+0):
-        #def gram_calc(frames,frames_norm, illumination, normalization, value=val):
-       
-            cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
-            ((int(nblocks),),(int(nthreads),), \
-            (value,frames,frames_norm, illumination, normalization,col.astype(int),row.astype(int),dx,dy,bw,nnz, nx, ny))
+        nblocks  = nnz
+        def gram_calc(frames, frames_norm, illumination, normalization, value=val+0):
+            cp.RawKernel(zQQz_raw_kernel, "dotp", jitify=True, options=("--std=c++17",))(
+                (int(nblocks),), (int(nthreads),),
+                (value, frames, frames_norm, illumination, normalization,
+                 col_t.astype(int), row_t.astype(int), dx_t, dy_t, bw, nnz, nx, ny))
             return value
-        
         plan["gram_calc"] = gram_calc
-      
- 
+
     return plan
     
 def Precondition_calc(frames, bw=0):

@@ -21,49 +21,29 @@ The Gramian assembly itself (val -> sparse H) lives in
 Operators.Gramiam_calc_cuda via plan["val2H"].
 """
 
-import pkg_resources
+import os
 import cupy as cp
 import cupyx.scipy.sparse as sparse
 
 # hardcodeds
 nthreads = 256
 
+_src = os.path.join(os.path.dirname(__file__), 'src')
+
 # ==================
 # load cuda kernels
 # ==================
-split_raw_kernel = None
-overlap_raw_kernel = None
-gram_raw_kernel = None
-refine_illum_raw_kernel = None
+with open(os.path.join(_src, 'split.cu'), 'r') as f:
+    split_raw_kernel = f.read()
 
-resource_package = __name__
+with open(os.path.join(_src, 'overlap.cu'), 'r') as f:
+    overlap_raw_kernel = f.read()
 
-# split kernel (image, [frames,0], translations, [illumination,0])
-# if split_raw_kernel is None:
-resource_path = '/'.join(('src', 'split.cu'))
-file_name = pkg_resources.resource_filename(resource_package, resource_path)
-with open(file_name, 'r') as myfile:
-     split_raw_kernel = myfile.read()
+with open(os.path.join(_src, 'zQQz.cu'), 'r') as f:
+    gram_raw_kernel = f.read()
 
-# overlap kenrel (image, frames, translations, illumination)
-#if overlap_raw_kernel is None:
-resource_path = '/'.join(('src', 'overlap.cu'))
-file_name = pkg_resources.resource_filename(resource_package, resource_path)
-with open(file_name, 'r') as myfile:
-     overlap_raw_kernel = myfile.read()
-
-# Gramian kernel
-# if gram_raw_kernel == None:
-resource_path = '/'.join(('src','zQQz.cu'))
-file_name = pkg_resources.resource_filename(resource_package, resource_path)
-with open(file_name, 'r') as myfile:
-    gram_raw_kernel = myfile.read()
-        
-
-resource_path = '/'.join(('src','refine_illumination.cu'))
-file_name = pkg_resources.resource_filename(resource_package, resource_path)
-with open(file_name, 'r') as myfile:
-    refine_illum_raw_kernel = myfile.read()
+with open(os.path.join(_src, 'refine_illumination.cu'), 'r') as f:
+    refine_illum_raw_kernel = f.read()
         
 # ==================
 # wrap cuda kernels
@@ -145,30 +125,31 @@ def Gramian_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
 
     dx = translations_x.ravel(order="F").reshape(nframes, 1)
     dy = translations_y.ravel(order="F").reshape(nframes, 1)
-    dx = xp.subtract(dx, xp.transpose(dx))
-    dy = xp.subtract(dy, xp.transpose(dy))
+    dx = cp.subtract(dx, cp.transpose(dx))
+    dy = cp.subtract(dy, cp.transpose(dy))
 
     # calculates the wrapping effect for a period boundary
     dx = -(dx + Nx * ((dx < (-Nx / 2)).astype(int) - (dx > (Nx / 2)).astype(int)))
     dy = -(dy + Ny * ((dy < (-Ny / 2)).astype(int) - (dy > (Ny / 2)).astype(int)))
 
     # find the frames idex that overlaps (only the lower tril)
-    col, row = xp.where(xp.tril((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)).T)
-    # maybe we need triu and remove the transpose ? 
-    
+    col, row = cp.where(cp.tril((abs(dy) < nx - 2 * bw) * (abs(dx) < ny - 2 * bw)).T)
+    # maybe we need triu and remove the transpose ?
+
     # keep only the useful dx,dy
     dx = dx[row,col]
     dy = dy[row,col]
-    
+
     nnz = col.size
-       
-    val=xp.empty((nnz,1),dtype=xp.complex64)
+    nblocks = nnz
+
+    val=cp.empty((nnz,1),dtype=cp.complex64)
 
     plan = {"col": col.astype(int), "row": row.astype(int), "dx": dx, "dy": dy,"val": val, "bw": bw, "frame_width": nx, "frame_height": ny}
 
     # we cam pass the function instead of the plan
     def gram_calc(frames,frames_norm, illumination, normalization, value=val):
-        cp.RawKernel(zQQz_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
+        cp.RawKernel(gram_raw_kernel,"dotp",jitify=True,options=("--std=c++17",))\
         ((int(nblocks),),(int(nthreads),), \
         (value,frames,frames_norm, illumination, normalization,col,row,dx,dy,bw,nnz, nx, ny))
         return value
