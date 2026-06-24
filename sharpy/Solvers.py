@@ -810,6 +810,76 @@ def plot_intermediate(images):
 # Alternating projections with position retrieval
 # (Section IV of arXiv:1209.4924; port of doraar0_shift.m + fit_shift.m)
 ############################################
+def fit_drift_global(
+    frames_data, illumination, translations_x, translations_y, nx, ny, Nx, Ny,
+    model="linear", drift_max=5.0, ngrid=11, sweeps=3, ap_iters=10,
+):
+    """Global parametric drift fit (Section III.A / Eckert "rigid source projection").
+
+    Recover a *structured* per-frame drift by minimizing the TOTAL Fourier-
+    magnitude data misfit over a low-dimensional model of the shift -- a few
+    scalars -- via coordinate-descent grid search. Each coordinate is swept over
+    its whole plausible range (GLOBAL, no per-frame capture basin), so this
+    catches drift far beyond the ~1/k_max basin of the local solver; the residual
+    is then polished by the per-frame solver in the AP loop.
+
+    The shift is modelled as xi = B @ c on the centered nominal scan coordinate
+    s = (translations - mean):
+      model="linear" : B = [sx, sy]              -> A.s  (magnification/rotation/
+                       shear; 4 coeffs) = the real-space analog of Eckert's
+                       affine rigid source projection of the scan grid.
+      model="poly2"  : B = [sx, sy, sx^2, sx*sy, sy^2]  (10 coeffs) for curved drift.
+
+    Returns per-frame (xi_x, xi_y). The constant (global translation) term is
+    omitted -- it is the unobservable position gauge.
+    """
+    from Operators import Splitc, Overlapc, map_frames
+    from position_retrieval import shift_probe_fourier
+
+    mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+    sx = translations_x - xp.mean(translations_x)
+    sy = translations_y - xp.mean(translations_y)
+    scale = max(float(xp.max(xp.abs(sx))), float(xp.max(xp.abs(sy))), 1.0)
+    sx = sx / scale
+    sy = sy / scale
+    cols = [sx, sy, sx * sx, sx * sy, sy * sy] if model == "poly2" else [sx, sy]
+    k = len(cols)
+    B = xp.stack(cols, axis=1)  # (nframes, k)
+
+    def xi_of(C):
+        return B @ C[:k], B @ C[k:]
+
+    def misfit(C):
+        xi_x, xi_y = xi_of(C)
+        ps = shift_probe_fourier(illumination, xi_x, xi_y)
+        norm = Overlapc(xp.abs(ps) ** 2, Nx, Ny, mapid)
+        norm = xp.where(xp.abs(norm) < 1e-6 * float(xp.max(xp.abs(norm))), 1.0, norm)
+        im = xp.ones((Nx, Ny), dtype=ps.dtype)
+        frames = Splitc(im, mapid) * ps
+        mse = 0.0
+        for _ in range(ap_iters):
+            frames, mse = Project_data(frames, frames_data, compute_residuals=True)
+            im = Overlapc(frames * xp.conj(ps), Nx, Ny, mapid) / norm
+            frames = Splitc(im, mapid) * ps
+        _, mse = Project_data(frames, frames_data, compute_residuals=True)
+        return float(mse)
+
+    C = xp.zeros(2 * k)
+    half = float(drift_max)
+    for _ in range(int(sweeps)):
+        for i in range(2 * k):
+            grid = float(C[i]) + xp.linspace(-half, half, ngrid)
+            best_g, best_e = float(C[i]), float("inf")
+            for g in grid:
+                C[i] = g
+                e = misfit(C)
+                if e < best_e:
+                    best_e, best_g = e, float(g)
+            C[i] = best_g
+        half = half * 2.0 / (ngrid - 1)  # shrink toward the grid spacing to refine
+    return xi_of(C)
+
+
 def Alternating_projections_position(
     img,
     illumination,
@@ -829,6 +899,11 @@ def Alternating_projections_position(
     diag_method="taylor",
     backend=None,
     replan=False,
+    drift_fit=False,
+    drift_model="linear",
+    drift_max=5.0,
+    xi_x_init=None,
+    xi_y_init=None,
     prelocalize=False,
     prelocalize_radius=4,
     prelocalize_rounds=6,
@@ -891,6 +966,22 @@ def Alternating_projections_position(
         shift into the integer frame map, keeping only the <0.5px residual in
         the Taylor model. Extends the representable shift range. Requires an
         apodized probe to be intensity-consistent; default off.
+    drift_fit : bool
+        Opt-in global parametric drift fit before the loop (see fit_drift_global):
+        recovers STRUCTURED drift (magnification/rotation/shear/poly) by global
+        search on the total data misfit -- no per-frame capture basin, catches
+        drift far beyond ~1/k_max. The fit alone is the endpoint for purely
+        structured drift; a *free* per-frame refine afterward over-fits it, so
+        either set position_start >= maxiter (fit only) or keep per-frame updates
+        for genuine random jitter only.
+    drift_model : {"linear", "poly2"}
+        Drift basis: "linear" = affine of the nominal scan (A.s; the real-space
+        analog of Eckert's rigid source projection); "poly2" adds quadratic terms.
+    drift_max : float
+        Max drift (px) the global search spans per coefficient.
+    xi_x_init, xi_y_init : (nframes,), optional
+        Explicit per-frame shift warm start (integer part migrated into the map,
+        residual into the Taylor model). Mutually exclusive with drift_fit.
     reg : float
         Tikhonov weight in the image least squares.
     img_truth : (Nx, Ny) complex, optional
@@ -937,6 +1028,29 @@ def Alternating_projections_position(
     # recovered shift = residual xi + the integers migrated into the map.
     translations_x0 = translations_x + 0.0
     translations_y0 = translations_y + 0.0
+
+    # Warm start: a global parametric drift fit (structured drift, beyond the
+    # local basin), or an explicit per-frame xi guess. The integer part is
+    # migrated into the map so the Taylor/exact model holds only the residual;
+    # the total-shift accounting (translations_*0 captured above) recovers it.
+    if drift_fit:
+        xi_x, xi_y = fit_drift_global(
+            frames_data, illumination, translations_x, translations_y,
+            nx, ny, Nx, Ny, model=drift_model, drift_max=drift_max,
+        )
+    elif xi_x_init is not None:
+        xi_x = xi_x_init + 0.0
+        xi_y = xi_y_init + 0.0
+    if drift_fit or xi_x_init is not None:
+        n_x = xp.round(xi_x)
+        n_y = xp.round(xi_y)
+        translations_y = translations_y - n_x
+        translations_x = translations_x - n_y
+        xi_x = xi_x - n_x
+        xi_y = xi_y - n_y
+        mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+        if method == "coupled":
+            plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
 
     def probe_and_norm(xi_x, xi_y):
         probe_stack = taylor_shift_probe(dp, xi_x, xi_y)["O"]  # (nframes, nx, ny)
