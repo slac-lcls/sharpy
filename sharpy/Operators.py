@@ -1137,15 +1137,18 @@ def Eigensolver_invit(H, eps=1e-4, steps=1, tol=1e-8, mode="cg"):
         x = xp.ones(nframes, dtype=H.dtype)
     x0 = x + 0.0
     if mode == "direct":
+        # inverse-power iteration via a REUSABLE factorization (cupyx/scipy splu): factor
+        # (Lsym+epsI) ONCE, then a few inverse-iteration solves. This is the "shift-invert /
+        # inverse-power" route -- the per-call cost is the factorization (cuSOLVER on GPU),
+        # NOT the solves. (cupyx eigsh has no sigma, so true shift-invert-Lanczos isn't
+        # available; inverse-power iteration is the realizable equivalent, same dominant cost.)
         if GPU:
-            from cupyx.scipy.sparse.linalg import spsolve as _spsolve
-            for _ in range(steps):
-                x = _spsolve(M, x); x /= xp.linalg.norm(x)
+            from cupyx.scipy.sparse.linalg import splu as _splu
         else:
             from scipy.sparse.linalg import splu as _splu
-            lu = _splu(M.tocsc())             # factor once, reuse across the few steps
-            for _ in range(steps):
-                x = lu.solve(x); x /= xp.linalg.norm(x)
+        lu = _splu(M.tocsc())
+        for _ in range(steps):
+            x = lu.solve(x); x /= xp.linalg.norm(x)
     else:
         if GPU:
             from cupyx.scipy.sparse.linalg import cg as _cg
