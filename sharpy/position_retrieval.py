@@ -680,3 +680,59 @@ def position_solve_coupled(
     r = xp.sqrt(dxi_x ** 2 + dxi_y ** 2)
     scale = xp.where(r > 0, xp.minimum(r, max_step) / xp.where(r > 0, r, 1.0), 0.0)
     return xi_x + dxi_x * scale, xi_y + dxi_y * scale
+
+
+# ---------------------------------------------------------------------------
+# Multiplex-comb COARSE pre-localizer (Section III.A of arXiv:1209.4924).
+# The Section IV Taylor/exact solver is the local linearization of the
+# incoherent multiplex model  a_n^2 = Omega(|F z|^2 . B|omega|^2)  (Eq.24),
+# which is LINEAR in the per-component weights.  So a frame's coarse position
+# can be found by a convex non-negative fit over a COMB of candidate shifted
+# probes -- capture = comb span, not the Taylor radius ~1/k_max, and no basin.
+# This is the basin-free coarse stage of a coarse-to-fine pipeline
+# (multiplex comb -> exact re-linearization); see position_multiplex_capture_test.py.
+# ---------------------------------------------------------------------------
+def multiplex_prelocalize(frames_data, img, dp, mapid, radius=4):
+    """Coarse integer per-frame shift from a multiplex comb on the intensity data.
+
+    For each frame, score a grid of candidate integer probe shifts c against the
+    measured intensity by the matched filter (= the 1-sparse / single-occupancy
+    limit of the Eq.24 non-negative multiplex solve): pick the c maximizing
+    <I_n, D_{n,c}>^2 / ||D_{n,c}||^2, with D_{n,c} = |F(O_n . P(c))|^2 the
+    candidate detector intensity built from the current consensus object frames
+    O_n = Split(img).  Convex / basin-free, so the capture range is the comb span.
+
+    Needs object CONTRAST within each frame (a flat object gives a shift-
+    invariant |F(O P(c))|^2 and the comb degenerates).  Returns coarse integer
+    shifts (cx, cy) in the probe-shift (xi) convention; migrate into the map as
+    translations_y -= cx, translations_x -= cy (the probe<->map transpose+invert).
+
+    Parameters
+    ----------
+    frames_data : (nframes, nx, ny) real   measured intensities |F z|^2.
+    img : (Nx, Ny) complex                  current consensus image estimate.
+    dp : dict                               probe derivatives; uses dp["O"].
+    mapid : (nframes, nx, ny) int           current frame<->image map.
+    radius : int                            comb half-width (candidates in +-radius).
+    """
+    O = Splitc(img, mapid)                                   # (nf, nx, ny)
+    nf = O.shape[0]
+    npix = O.shape[1] * O.shape[2]
+    I = frames_data.reshape(nf, npix)
+    best = xp.full(nf, -1.0)
+    cx = xp.zeros(nf)
+    cy = xp.zeros(nf)
+    for cxj in range(-radius, radius + 1):
+        for cyj in range(-radius, radius + 1):
+            Pj = shift_probe_fourier(dp["O"],
+                                     xp.asarray([float(cxj)]),
+                                     xp.asarray([float(cyj)]))[0]
+            Dj = (xp.abs(xp.fft.fft2(O * Pj)) ** 2).reshape(nf, npix)
+            num = xp.sum(Dj * I, axis=1)                     # <I_n, D_n,c>
+            den = xp.sum(Dj * Dj, axis=1) + 1e-30            # ||D_n,c||^2
+            score = xp.maximum(num, 0.0) ** 2 / den
+            upd = score > best
+            best = xp.where(upd, score, best)
+            cx = xp.where(upd, float(cxj), cx)
+            cy = xp.where(upd, float(cyj), cy)
+    return cx, cy

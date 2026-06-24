@@ -826,8 +826,13 @@ def Alternating_projections_position(
     max_step=0.5,
     reg=1e-10,
     method="diag",
+    diag_method="taylor",
     backend=None,
     replan=False,
+    prelocalize=False,
+    prelocalize_radius=4,
+    prelocalize_rounds=6,
+    prelocalize_every=10,
     img_truth=None,
     xi_x_truth=None,
     xi_y_truth=None,
@@ -865,6 +870,19 @@ def Alternating_projections_position(
         Position solver: "diag" = independent per-frame 2x2 solve;
         "coupled" = full Eq. (27) sparse solve with off-diagonal overlap
         coupling (more accurate, converges faster).
+    diag_method : {"taylor", "exact"}
+        Re-linearization for the diagonal solver: "taylor" = 2nd-order Taylor
+        model (cheap, valid ~1/k_max); "exact" = exact band-limited shifted
+        probe + derivatives (machine precision in-range, wider basin). Ignored
+        by the coupled solver.
+    prelocalize : bool
+        One-shot multiplex coarse pre-localization (Section III.A) before the
+        first position update: a convex, basin-free NNLS/matched-filter fit over
+        a comb of candidate shifted probes on the consensus object localizes the
+        integer per-frame shift, migrated into the map. Extends capture well
+        beyond the local solver's ~1/k_max basin (pair with diag_method="exact").
+    prelocalize_radius : int
+        Comb half-width in pixels for prelocalize (candidates in +-radius).
     backend : {None, "auto", "python", "numba", "omp"}
         Overlap-kernel backend for the coupled solver (None -> module
         default; see position_retrieval.set_kernel_backend). Ignored by diag.
@@ -899,6 +917,7 @@ def Alternating_projections_position(
         position_solve_diag,
         position_solve_coupled,
         position_plan,
+        multiplex_prelocalize,
     )
 
     nframes = frames_data.shape[0]
@@ -912,6 +931,7 @@ def Alternating_projections_position(
     # Accumulated sub-pixel shift estimate (starts at zero -> probe broadcast).
     xi_x = xp.zeros(nframes)
     xi_y = xp.zeros(nframes)
+    prelocalize_count = 0  # multiplex coarse pre-localization rounds done
 
     # For map re-planning: keep the initial integer positions so the *total*
     # recovered shift = residual xi + the integers migrated into the map.
@@ -955,6 +975,33 @@ def Alternating_projections_position(
             and position_every
             and np.mod(ii, position_every) == 0
         ):
+            # Multiplex coarse pre-localization (Section III.A): convex,
+            # basin-free integer localization from the *consensus* object,
+            # catching large shifts (> the Taylor/exact capture basin). Run as a
+            # coarse-to-fine BOOTSTRAP over a few rounds (every prelocalize_every
+            # iters): each round localizes a fraction of frames, migrates their
+            # integers into the map (probe<->map transpose+invert), and the
+            # sharpened consensus lets the next round catch more -- breaking the
+            # positions<->image chicken-and-egg that a single shot can't. Only
+            # migrated frames have xi reset; the <0.5px residual is left to the
+            # solver below, and the TOTAL-shift accounting picks up the migration.
+            if (prelocalize and prelocalize_count < prelocalize_rounds
+                    and np.mod(ii - position_start, prelocalize_every) == 0):
+                cx, cy = multiplex_prelocalize(frames_data, img, dp, mapid,
+                                               radius=prelocalize_radius)
+                moved = (cx != 0) | (cy != 0)
+                if float(xp.sum(moved)) > 0:
+                    translations_y = translations_y - cx
+                    translations_x = translations_x - cy
+                    mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+                    xi_x = xp.where(moved, 0.0, xi_x)
+                    xi_y = xp.where(moved, 0.0, xi_y)
+                    if method == "coupled":
+                        plan = position_plan(translations_x, translations_y,
+                                             nframes, nx, ny, Nx, Ny)
+                    probe_stack, normalization = probe_and_norm(xi_x, xi_y)
+                prelocalize_count += 1
+
             if method == "coupled":
                 xi_x, xi_y = position_solve_coupled(
                     frames, dp, img, mapid, Nx, Ny, xi_x, xi_y, plan,
@@ -963,7 +1010,7 @@ def Alternating_projections_position(
             else:
                 xi_x, xi_y = position_solve_diag(
                     frames, dp, img, mapid, Nx, Ny, xi_x, xi_y,
-                    reg=reg, max_step=max_step,
+                    reg=reg, max_step=max_step, method=diag_method,
                 )
 
             # Map re-planning: migrate the integer part of the shift into the
@@ -988,7 +1035,14 @@ def Alternating_projections_position(
             probe_stack, normalization = probe_and_norm(xi_x, xi_y)
 
         # Overlap (image) projection with the current per-frame probe.
-        img = Overlapc(frames * xp.conj(probe_stack), Nx, Ny, mapid) / normalization
+        # Floor the normalization at uncovered pixels (a scan with a border,
+        # rather than a periodic tiling, leaves normalization=0 there) so the
+        # division stays finite; covered pixels are unchanged.
+        nrm = xp.where(
+            xp.abs(normalization) < 1e-6 * float(xp.max(xp.abs(normalization))),
+            1.0, normalization,
+        )
+        img = Overlapc(frames * xp.conj(probe_stack), Nx, Ny, mapid) / nrm
 
         # Split back to frames and re-illuminate.
         frames = Splitc(img, mapid) * probe_stack
