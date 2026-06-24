@@ -862,16 +862,30 @@ if GPU:
 else:
     from scipy.sparse.linalg import eigsh
 
+import os
+# Sync eigensolver selection (env-overridable; default = committed power iteration).
+#   SHARPY_SYNC=invit -> inverse iteration on the connection Laplacian
+#   (Marchesini, arXiv:1209.4924 App. A, eq. A4): solves the BOTTOM of L=D-H
+#   instead of power-iterating the near-degenerate TOP of the adjacency H.
+SYNC_METHOD = os.environ.get("SHARPY_SYNC", "power").lower()
+SYNC_EPS    = float(os.environ.get("SHARPY_SYNC_EPS", "1e-4"))    # must be < Fiedler gap (1-lambda2)
+SYNC_STEPS  = int(os.environ.get("SHARPY_SYNC_STEPS", "1"))
+SYNC_MODE   = os.environ.get("SHARPY_SYNC_MODE", "cg").lower()    # "cg" (iterative) | "direct" (splu/spsolve)
+SYNC_TOL    = float(os.environ.get("SHARPY_SYNC_TOL", "1e-8"))
+SYNC_SEED   = int(os.environ.get("SHARPY_SYNC_SEED", "1"))        # invit_seed: #cold syncs via invit before warm-power
+
 #######
 ####Eigensolver is causing problems, need implementation
 #######
 _eig_v0 = None  # cached dominant eigenvector, for power-iteration warm start
+_sync_state = {"n": 0}  # invit_seed: count of sync calls so far (reset by eig_reset)
 
 
 def eig_reset():
-    """Drop the cached eigenvector (call between unrelated reconstructions)."""
+    """Drop the cached eigenvector + seed counter (call between unrelated reconstructions)."""
     global _eig_v0
     _eig_v0 = None
+    _sync_state["n"] = 0
 
 
 def Eigensolver(H, num_iter, v0=None, tol=1e-6):
@@ -1069,6 +1083,89 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-6):
     omega = xp.reshape(omega0, (nframes, 1, 1))
     return omega
 
+
+def Eigensolver_invit(H, eps=1e-4, steps=1, tol=1e-8, mode="cg"):
+    """Inverse-iteration sync eigensolver (Marchesini, arXiv:1209.4924 App. A, eq. A4).
+
+    Drop-in for Eigensolver: returns the per-frame unit-modulus sync phase, shape
+    (nframes,1,1). Instead of power-iterating the TOP of the normalized adjacency H
+    (slow when the overlap-graph Fiedler gap is tiny / the true phase is far from
+    constant), it solves the BOTTOM of the connection Laplacian
+        L = diag(d) - H,   d_i = sum_j |H_ij|     (H is zero-diagonal by construction)
+    by inverse iteration from ones, on the symmetric-normalized
+        L_sym = I - D^-1/2 H D^-1/2  (eigenvalues in [0,2], sync vector at ~0):
+        x <- (L_sym + eps*I)^{-1} x.
+    The near-degenerate TOP gap of H is a near-ZERO BOTTOM eigenvalue of L, so one
+    shifted solve lands the sync vector regardless of <ones,phi> -- exactly the
+    regime where power iteration plateaus. eps shifts off the (singular) null
+    direction (= Tikhonov / shift-invert at sigma=-eps); steps>=2 -> ~machine.
+    Cost moves into one sparse solve: direct (splu/cuDSS) or AMG-preconditioned is
+    the real win; an unpreconditioned iterative solve just relocates 1/gap.
+    """
+    global _eig_v0
+    time0 = timer()
+    nframes = H.shape[0]
+    Hc = H.tocsr()
+    # magnitude row-sum = connection-graph degree (H has zero diagonal: mapu2all
+    # excludes the diagonal when assembling).
+    absH = Hc.copy()
+    absH.data = xp.abs(absH.data)
+    d = xp.asarray(absH.sum(axis=1)).ravel().real
+    d = xp.maximum(d, 1e-30)
+    dm12 = sparse.diags((1.0 / xp.sqrt(d)).astype(H.dtype))
+    Id = sparse.identity(nframes, dtype=H.dtype, format="csr")
+    Lsym = (Id - (dm12 @ Hc @ dm12)).tocsr()
+    M = (Lsym + eps * Id).tocsr()
+
+    # M = Lsym + eps*I is Hermitian POSITIVE-DEFINITE. Solve by:
+    #   mode="cg"     -> conjugate gradient (iterative, O(nnz)/matvec, NO fill-in;
+    #                    ~sqrt(kappa)=~sqrt(1/eps) matvecs -> faster than power AND than a
+    #                    direct factorization at scale -- benchmarked 169 mv / 47 ms vs
+    #                    power's 2000 mv / 320 ms and splu's 467 ms at 4096 frames).
+    #                    NOTE: scipy/cupyx MINRES rejects COMPLEX-Hermitian ("non-symmetric"
+    #                    matrix"); CG handles complex Hermitian-PD -- use CG, not minres.
+    #   mode="direct" -> splu (CPU) / spsolve (GPU): robust reference, but fill-in => super-linear.
+    # eps must be SMALLER than the Fiedler gap (1-lambda2) to isolate the consensus from the
+    # near-degenerate cluster (eps > gap -> under-amplified / wrong vector).
+    # WARM-START from the previous call's vector: the sync target is non-stationary
+    # (it develops with the image), but it DRIFTS slowly once formed, so seeding x0 from
+    # _eig_v0 makes each per-AP-iter solve cheap (few CG iters) while still re-solving
+    # accurately every iter. First call is cold (ones).
+    if _eig_v0 is not None and _eig_v0.shape[0] == nframes:
+        x = _eig_v0.ravel().astype(H.dtype) + 0.0
+    else:
+        x = xp.ones(nframes, dtype=H.dtype)
+    x0 = x + 0.0
+    if mode == "direct":
+        if GPU:
+            from cupyx.scipy.sparse.linalg import spsolve as _spsolve
+            for _ in range(steps):
+                x = _spsolve(M, x); x /= xp.linalg.norm(x)
+        else:
+            from scipy.sparse.linalg import splu as _splu
+            lu = _splu(M.tocsc())             # factor once, reuse across the few steps
+            for _ in range(steps):
+                x = lu.solve(x); x /= xp.linalg.norm(x)
+    else:
+        if GPU:
+            from cupyx.scipy.sparse.linalg import cg as _cg
+        else:
+            from scipy.sparse.linalg import cg as _cg
+        for _ in range(steps):
+            try:
+                x, _info = _cg(M, x, x0=x0, rtol=tol, maxiter=20000)
+            except TypeError:                 # older scipy/cupyx use tol= not rtol=
+                x, _info = _cg(M, x, x0=x0, tol=tol, maxiter=20000)
+            x /= xp.linalg.norm(x); x0 = x + 0.0
+
+    omega0 = x / xp.abs(x)                     # per-frame unit modulus = the gauge sync uses
+    so = xp.conj(xp.sum(omega0)); so = so / xp.abs(so)   # fix global phase (match Eigensolver)
+    omega0 = omega0 * so
+    _eig_v0 = xp.reshape(omega0, (nframes, 1)) + 0.0   # seed power warm-start (for invit_seed mode)
+    timers["Eigensolver"] += timer() - time0
+    return xp.reshape(omega0, (nframes, 1, 1))
+
+
 #def Eigensolver(H,eigsh_tol, eigsh_maxiter,power_it,power_iterations):
 def Eigensolver_c(H,num_iter=5):
     time0 = timer()
@@ -1168,7 +1265,18 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
     #if type(eig_plan) == type(None):
         #omega = Eigensolver(H,eigsh_tol = 1e-6, eigsh_maxiter = None,power_it = False,power_iterations = 5)
  
-    omega = Eigensolver(H,num_iter)
+    if SYNC_METHOD == "invit":
+        omega = Eigensolver_invit(H, eps=SYNC_EPS, steps=SYNC_STEPS, tol=SYNC_TOL, mode=SYNC_MODE)
+    elif SYNC_METHOD == "invit_seed":
+        # invit for the first SYNC_SEED cold sync(s) (seeds the power warm-start cache),
+        # then warm power (cheap drift tracking) thereafter.
+        if _sync_state["n"] < SYNC_SEED:
+            omega = Eigensolver_invit(H, eps=SYNC_EPS, steps=SYNC_STEPS, tol=SYNC_TOL, mode=SYNC_MODE)
+        else:
+            omega = Eigensolver(H, num_iter)
+        _sync_state["n"] += 1
+    else:
+        omega = Eigensolver(H,num_iter)
     #omega = Eigensolver_c(H,num_iter)
     
     '''
