@@ -7,12 +7,13 @@ synchronize_frames_c crashes. (Large-image production runs have no duplicates,
 which is why the bug went unnoticed on GPU.) This script uses such a small scene,
 so PRE-fix it crashes and POST-fix the sync runs and recovers the low-freq phase.
 
-The primary assertion is that synchronize_frames_c RUNS (no val2H IndexError);
-phase recovery additionally works on CPU. NOTE: on GPU this small scene also hits
-a SEPARATE zQQz.cu small-image NaN (heavy periodic wrap, outside the kernel's
-normal large-image regime), so for GPU end-to-end confirmation use
-phase_sync_test.py (large image) -- verified on A100: KD-tree+dedup reproduces the
-pre-KD-tree NMSE (no-sync 0.87 / power 0.21 / eigsh 1.46e-6 / invit 1.46e-6).
+Confirms two fixes together: (1) the KD-tree Gramiam_plan dedup (no val2H
+IndexError), and (2) the small-image GPU kernel NaN -- root-caused to the zQQz.cu
+RawKernel reinterpreting complex128 frames (promoted by a float64 image division)
+as complex64, fixed by casting kernel inputs to complex64 in Gramiam_calc_cuda
+(commit 1d5ce07). Now PASSes on BOTH CPU and GPU (no-sync ~0.71 -> sync ~2.7e-4).
+Large-image GPU end-to-end is also verified by phase_sync_test.py (no-sync 0.87 /
+power 0.21 / eigsh 1.46e-6 / invit 1.46e-6, unchanged).
 
 Runs on whatever config.GPU selects (xp). On Perlmutter:
   source ~/sharpy-venv/bin/activate
