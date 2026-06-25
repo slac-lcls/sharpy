@@ -24,9 +24,14 @@ dotp(
     int nnz,
     int frame_height, int frame_width) {
         
-        typedef cub::BlockReduce< thrust::complex< float > , 128> BlockReduce;
-        
-        
+        // Reduce the real and imaginary parts separately with the (well-supported)
+        // float specialization of cub::BlockReduce. The complex specialization
+        // cub::BlockReduce<thrust::complex<float>> produced value/run-state-dependent
+        // NaNs (mishandled custom-type temporaries in the block reduction) on small,
+        // heavily-overlapped scenes -- see the small-image GPU sync NaN task.
+        typedef cub::BlockReduce< float , 128> BlockReduce;
+
+
         // Allocate shared memory for BlockReduce
         __shared__ typename BlockReduce::TempStorage temp_storage;
         
@@ -102,9 +107,13 @@ dotp(
 
                 }
       
-        // Compute the block-wide sum for thread0
-        thrust::complex< float >  Sum1 = BlockReduce(temp_storage).Sum(Sum0);
-        //thrust::complex< float >  Sum1 = Sum0 ;
+        // Compute the block-wide sum for thread0 (real and imaginary parts
+        // separately; __syncthreads between the two reuses of the shared
+        // TempStorage, as cub::BlockReduce requires).
+        float Sum_r = BlockReduce(temp_storage).Sum(Sum0.real());
+        __syncthreads();
+        float Sum_i = BlockReduce(temp_storage).Sum(Sum0.imag());
+        thrust::complex< float >  Sum1(Sum_r, Sum_i);
 
         /*we know it is hermitian*/
         if (col00 == row00)
