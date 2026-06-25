@@ -703,6 +703,16 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
 
     t0 = timer()
 
+    # The zQQz.cu RawKernel hardcodes thrust::complex<float> for every array, so
+    # it reinterprets the raw bytes as complex64. If any input is complex128
+    # (e.g. a dtype promotion upstream -- a float64 in the image division can lift
+    # frames to complex128), the kernel misreads the 16-byte elements as 8-byte
+    # and returns garbage/NaN. Cast to complex64 (no-op/no-copy when already so).
+    frames        = frames.astype(xp.complex64, copy=False)
+    illumination  = illumination.astype(xp.complex64, copy=False)
+    normalization = normalization.astype(xp.complex64, copy=False)
+    frames_norm   = frames_norm.astype(xp.complex64, copy=False)
+
     value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
 
     timers['Gramiam'] = timer()-t0
