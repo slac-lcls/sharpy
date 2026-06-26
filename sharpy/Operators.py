@@ -902,6 +902,7 @@ SYNC_STEPS  = int(os.environ.get("SHARPY_SYNC_STEPS", "1"))
 SYNC_MODE   = os.environ.get("SHARPY_SYNC_MODE", "cg").lower()    # "cg" (iterative) | "direct" (splu/spsolve)
 SYNC_TOL    = float(os.environ.get("SHARPY_SYNC_TOL", "1e-8"))
 SYNC_SEED   = int(os.environ.get("SHARPY_SYNC_SEED", "1"))        # invit_seed: #cold syncs via invit before warm-power
+SYNC_EIGTOL = float(os.environ.get("SHARPY_SYNC_EIGTOL", "1e-7")) # power-iteration GAP-AWARE stop tol (distance-to-eigenvector; 0 = full num_iter)
 
 #######
 ####Eigensolver is causing problems, need implementation
@@ -917,7 +918,12 @@ def eig_reset():
     _sync_state["n"] = 0
 
 
-def Eigensolver(H, num_iter, v0=None, tol=1e-6):
+def Eigensolver(H, num_iter, v0=None, tol=1e-7):
+    # tol is the GAP-AWARE stopping tolerance (estimated distance-to-eigenvector,
+    # NOT the raw step). Default 1e-7 reaches the deep sync floor at every frame
+    # count tested (256/1024/4096) ~9x faster than running the full num_iter; a
+    # looser 1e-6 floors a bit high at >=4096, 1e-8 costs ~full time. tol=0 disables
+    # the early-out entirely. See the loop below + sharpy_delight_fig1_reproduction.
     global _eig_v0
     time0 = timer()
 
@@ -969,8 +975,7 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-6):
             # orthogonality, so no phase jumps in omega/|omega|). WARM-START from
             # the previous call's eigenvector (_eig_v0) when available, else ones:
             # the consensus eigenvector is ~constant-phase, so ones is already close
-            # and the previous AP step is closer -> converges in ~1-2 matvecs
-            # regardless of frame count. Stop early once it stops changing.
+            # and the previous AP step is closer.
             if v0 is not None and v0.shape[0] == nframes:
                 eigenvectors = xp.asarray(v0, dtype=xp.complex64).reshape(nframes, 1) + 0.0
             elif _eig_v0 is not None and _eig_v0.shape[0] == nframes:
@@ -978,13 +983,30 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-6):
             else:
                 eigenvectors = xp.ones((nframes, 1), xp.complex64)
             eigenvectors /= xp.linalg.norm(eigenvectors)
+            # GAP-AWARE early-out. The naive step test (|v_n - v_{n-1}| < tol) stops
+            # FAR too early on a near-degenerate overlap graph: the Fiedler gap
+            # shrinks ~1/N, so consecutive iterates are a tiny step apart while the
+            # eigenvector is still Fiedler-contaminated -> wrong per-frame gauge ->
+            # the reconstruction FLOORS at large N (poster Fig 1.1). Power iteration
+            # contracts geometrically at rate rho ~= lambda2/lambda1, so the step
+            # shrinks like (1-rho)*distance_to_limit; the TRUE distance is therefore
+            # ~step*rho/(1-rho). Estimate rho from the ratio of successive steps and
+            # stop on that distance, NOT the raw step: rho->1 (tiny gap) keeps
+            # iterating until the gauge is actually resolved, rho<<1 (well separated)
+            # still stops in ~1-2 matvecs. tol=0 disables the early-out (full num_iter).
+            prev_step = None
             for _ in range(num_iter):
                 vn = H @ eigenvectors
                 vn /= xp.linalg.norm(vn)
-                if float(xp.linalg.norm(vn - eigenvectors)) < tol:
-                    eigenvectors = vn
-                    break
+                step = float(xp.linalg.norm(vn - eigenvectors))
                 eigenvectors = vn
+                if step < 1e-12:                      # machine-exact (perfect warm start)
+                    break
+                if prev_step is not None and step < prev_step:
+                    rho = step / prev_step            # observed contraction ~ lambda2/lambda1
+                    if step * rho / (1.0 - rho) < tol:  # gap-aware distance-to-limit
+                        break
+                prev_step = step
             _eig_v0 = eigenvectors + 0.0          # cache for next AP iteration's warm start
 
         else:
@@ -1309,10 +1331,10 @@ def synchronize_frames_c(frames, illumination, frames_norm, normalization, plan,
         if _sync_state["n"] < SYNC_SEED:
             omega = Eigensolver_invit(H, eps=SYNC_EPS, steps=SYNC_STEPS, tol=SYNC_TOL, mode=SYNC_MODE)
         else:
-            omega = Eigensolver(H, num_iter)
+            omega = Eigensolver(H, num_iter, tol=SYNC_EIGTOL)
         _sync_state["n"] += 1
     else:
-        omega = Eigensolver(H,num_iter)
+        omega = Eigensolver(H, num_iter, tol=SYNC_EIGTOL)
     #omega = Eigensolver_c(H,num_iter)
     
     '''
