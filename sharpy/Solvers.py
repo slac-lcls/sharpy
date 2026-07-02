@@ -35,6 +35,7 @@ from Operators import (
 )
 from ap_accel import line_search as _line_search
 from Operators import Replicate_frame, synchronize_illum_c,refine_illumination_pairwise,refine_illumination_function
+import Operators  # for the live _FUSED_PROXD flag + _diffnorm (fused eps_S residual)
 import config
 if config.GPU:
     from wrap_ops import overlap_cuda,split_cuda
@@ -286,7 +287,13 @@ def Alternating_projections(
 
         t0 = timer()
 
-        frames_old = frames + 0.0  # make a copy
+        if Operators._FUSED_PROXD:
+            # reference, not a copy: every step below rebinds `frames` to a new
+            # array (never mutates in place), so the old buffer stays alive via
+            # this ref; skip it entirely when the eps_S residual isn't needed.
+            frames_old = frames if compute_residuals else None
+        else:
+            frames_old = frames + 0.0  # make a copy
         timers["copies"] += timer() - t0
 
         # if GPU and ii<2:

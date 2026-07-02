@@ -160,18 +160,127 @@ if GPU:
 
     @cp.fuse(kernel_name="ProxD")
     def ProxD(x, y, eps):
-        # return   x* cpx.rsqrt(((x*x.conj()).real+eps)/(y+eps))
-        # return   x* cpx.rsqrt(((xp.real(x)*xp.real(x.real)+xp.imag(x)**2)+eps)/(y+eps))
-        #return x * cpx.rsqrt(((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps) / (y + eps))
-        return x * xp.sqrt((y + eps) )/ xp.sqrt(((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
+        # AGM (amplitude / sqrt-Gaussian) HARD magnitude projection: |z| <- sqrt(data),
+        # phase kept. Single sqrt-of-ratio (was two sqrt + a divide). GPU-fast reciprocal
+        # form: x * cpx.rsqrt((|x|^2+eps)/(y+eps)) (as in Prox_data_r) -- the
+        # SHARPY_FUSED_PROXD RawKernel below already uses rsqrtf. Noise-model hook
+        # (KL/Anscombe): see ProxD_noise + the note above Project_data.
+        return x * xp.sqrt((y + eps) / ((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
 
 
 else:
 
     def ProxD(x, y, eps):
-        # return   x* cpx.rsqrt(((x*x.conj()).real+eps)/(y+eps))
-        # return   x* cpx.rsqrt(((xp.real(x)*xp.real(x.real)+xp.imag(x)**2)+eps)/(y+eps))
+        # AGM hard magnitude projection (numpy has no rsqrt ufunc -> sqrt-of-ratio).
         return x * xp.sqrt((y + eps) / ((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
+
+
+# ---------------------------------------------------------------------------
+# Noise-model-selectable data prox (REFERENCE; NOT wired in -> default stays AGM-hard).
+# KEY: at the HARD projection limit (plain AP, tau=None) EVERY model collapses to
+# |z| <- sqrt(data), so the metric only matters once sharpy runs a RELAXED / proximal
+# data step (finite tau: RAAR-with-prox / ADMM). Anscombe additionally needs the photon
+# GAIN ("what 1 photon means" -- y must be COUNTS, not ADU). Formulas validated in
+# scratchpad/proxd_noise.py; memory bpr-survey-proxd (arXiv:2211.06619 eqs 14-16).
+# ---------------------------------------------------------------------------
+def ProxD_noise(x, y, tau=None, metric="amplitude", eps=eps):
+    """Magnitude data prox. tau=None -> hard (== ProxD). metric='amplitude' (AGM /
+    sqrt-Gaussian) or 'poisson' (IPM / KL). y = intensity (COUNTS for poisson)."""
+    r = xp.sqrt(xp.real(x) ** 2 + xp.imag(x) ** 2 + eps)
+    if tau is None:
+        m = xp.sqrt(y + eps)                              # hard limit == ProxD
+    elif metric == "amplitude":
+        m = (tau * xp.sqrt(y + eps) + r) / (1.0 + tau)    # relaxed AGM (convex combo)
+    else:  # 'poisson'/KL (IPM): positive root of (2+1/tau) m^2 - (r/tau) m - 2y = 0
+        A = 2.0 + 1.0 / tau
+        m = (r / tau + xp.sqrt((r / tau) ** 2 + 8.0 * y * A)) / (2.0 * A)
+    return x * (m / r)
+
+
+# ---------------------------------------------------------------------------
+# Fused ProxD + data-residual: ONE kernel computes  z <- ProxD(z)  AND
+# ssq = sum |z - ProxD(z)|^2 = sum (|z| - sqrt(data))^2  in a single memory pass,
+# in place (zero temporaries).  Replaces the two-pass path (|z| alloc + sqrt(data)
+# alloc + ProxD alloc + a separate norm reduction).  Opt-in via SHARPY_FUSED_PROXD=1
+# (default off -> byte-identical to the cp.fuse ProxD path below).  Supersedes the
+# dead `dotnorm2` ReductionKernel further down: a ReductionKernel can emit only the
+# scalar, not also write back the projected array; a RawKernel does both.
+# Requires complex64/float32, C-contiguous (production GPU dtypes); off-spec inputs
+# fall back to the plain path so we never silently corrupt.  atomicAdd(double) => sm_60+.
+# ---------------------------------------------------------------------------
+_FUSED_PROXD = GPU and os.environ.get("SHARPY_FUSED_PROXD", "0") == "1"
+
+if GPU:
+    # Dependency-free: treat complex64 as interleaved float* (re,im), built-in
+    # intrinsics only (rsqrtf/atomicAdd) + a hand-rolled shared-mem reduction.
+    # NO thrust/cub/cupy-complex includes -> no jitify (those headers break NVRTC
+    # here). Launch 256 threads (matches sh[256] + the power-of-two reduction).
+    _proxd_resid_src = r"""
+    extern "C" __global__ void proxd_resid(
+            float* z, const float* data, double* g_ssq,
+            const float eps, const int do_resid, const long long n) {
+        // n = number of COMPLEX elements; z holds 2n floats (re,im interleaved).
+        __shared__ double sh[256];
+        double local = 0.0;
+        const long long gstride = (long long)gridDim.x * blockDim.x;
+        for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n; i += gstride) {
+            float re = z[2*i], im = z[2*i + 1];
+            float di = data[i];
+            float r2 = re*re + im*im;
+            // AGM scale s = |Pz|/|z| = sqrt((data+eps)/(r2+eps)); rsqrtf = one SFU op
+            // (kernel is DRAM-bound: the win is the fusion, not the rsqrt).
+            // Noise-model hook: swap s for the KL/IPM or Anscombe target -- see ProxD_noise.
+            float s  = rsqrtf((r2 + eps) / (di + eps));
+            z[2*i] = re * s; z[2*i + 1] = im * s;     // ProxD, in place
+            if (do_resid) {
+                // |z-Pz|^2 = r2(1-s)^2 == (|z|-sqrt(data))^2 (to float eps); no extra sqrt.
+                float t = 1.0f - s;
+                local += (double)(r2 * t * t);
+            }
+        }
+        if (do_resid) {                              // block reduce -> atomicAdd
+            int tid = threadIdx.x;
+            sh[tid] = local; __syncthreads();
+            for (int w = blockDim.x >> 1; w > 0; w >>= 1) {
+                if (tid < w) sh[tid] += sh[tid + w];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(g_ssq, sh[0]);
+        }
+    }
+    """
+    _proxd_resid = cp.RawKernel(_proxd_resid_src, "proxd_resid")
+    _proxd_ssq = cp.zeros(1, dtype=cp.float64)        # persistent accumulator (zeroed per call)
+
+
+def _proxd_resid_apply(frames, frames_data, compute_residuals):
+    """Fused ProxD + residual on Fourier-space `frames`, in place. Returns (frames, mse).
+    Falls back to the plain cp.fuse path for any off-spec dtype/layout."""
+    if not (GPU and frames.dtype == xp.complex64 and frames_data.dtype == xp.float32
+            and frames.flags.c_contiguous and frames_data.flags.c_contiguous):
+        if compute_residuals:
+            mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+        else:
+            mse = eps
+        return ProxD(frames, frames_data, eps), mse
+    n = frames.size
+    threads = 256                                     # must match cub::BlockReduce<..,256>
+    blocks = min(65535, (n + threads - 1) // threads) # grid-stride covers the rest
+    do_resid = 1 if compute_residuals else 0
+    if do_resid:
+        _proxd_ssq.fill(0)
+    _proxd_resid((blocks,), (threads,),
+                 (frames, frames_data, _proxd_ssq, eps, np.int32(do_resid), np.int64(n)))
+    mse = xp.sqrt(_proxd_ssq[0]) if do_resid else eps
+    return frames, mse
+
+
+# NOTE: a fused ReductionKernel for the eps_S residual ||frames-frames_old|| was
+# tried and REVERTED -- it ran 30x SLOWER than xp.linalg.norm (0.35 ms) on A100
+# (10.4 ms/call; the complex .real()/.imag() map deoptimizes the reduction).
+# xp.linalg.norm(a-b) is already cuBLAS-nrm2-fast, so the residual is NOT fused;
+# only the frames_old COPY is dropped (reference trick in Solvers, memory win).
 
 
 def Project_data(frames, frames_data, compute_residuals=False):
@@ -182,35 +291,23 @@ def Project_data(frames, frames_data, compute_residuals=False):
     timers["Propagate"] += timer() - time0
 
     time0 = timer()
-
-    # compute mse
-    if compute_residuals:
-        mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+    if _FUSED_PROXD:
+        # one kernel: ProxD in place + data residual, zero temporaries
+        frames, mse = _proxd_resid_apply(frames, frames_data, compute_residuals)
+        timers["Prox_data"] += timer() - time0
     else:
-        mse = eps
+        # compute mse
+        if compute_residuals:
+            mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+        else:
+            mse = eps
 
-    timers["mse_data"] += timer() - time0
+        timers["mse_data"] += timer() - time0
 
-    time0 = timer()
-    # if False:
-    #     fd = xp.float32(1)/(frames_data+eps)
-    #     timers['fd']+=timer()-time0
+        time0 = timer()
+        frames = ProxD(frames, frames_data, eps)
 
-    #     time0=timer()
-    #     frames *= cpx.rsqrt(((frames*frames.conj()).real+eps)*fd)
-    # else:
-    #      frames *= xp.sqrt((frames_data+eps)/((frames*franmes.conj()).real+eps))
-    #      # frames *= cpx.rsqrt(((frames*frames.conj()).real+eps)/(frames_data+eps))
-    # print('using proxD')
-    frames = ProxD(frames, frames_data, eps)
-
-    # frames *= xp.sqrt((frames_data+eps)/((frames*frames.conj()).real+eps))
-
-    # frames *= xp.sqrt((frames_data+eps)/(xp.abs(frames)**2+eps))
-    # frames *= xp.sqrt((frames_data+eps)/((frames.real*frames.real + frames.imag*frames.imag)+eps))
-    # frames *= xp.sqrt((frames_data+eps)/((frames*frames.conj()).real+eps))
-
-    timers["Prox_data"] += timer() - time0
+        timers["Prox_data"] += timer() - time0
 
     time0 = timer()
     frames = IPropagate(frames)
