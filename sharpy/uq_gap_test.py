@@ -42,10 +42,13 @@ NMODES = int(os.environ.get("NMODES", 21))
 
 
 def gramian_gap(ctx):
-    """Top-NMODES eigenvalues of the preconditioned Gramian Hn from TRUTH frames
-    (geometry/structure only). Returns (fiedler_gap, tr_pinv) where
-    tr_pinv = sum_{i>=2} 1/(1 - lam_i/lam_1) = Tr of the Laplacian pseudo-inverse
-    over the top cluster -- the AGGREGATE-error predictor (single gap = worst mode only)."""
+    """Spectrum of the preconditioned Gramian Hn from TRUTH frames (geometry only).
+    Returns (fiedler_gap, tr21, tr_band):
+      tr21    = sum_{i=2..21} 1/mu_i               (fixed-count trace, comparison)
+      tr_band = sum over the LOW-BAND graph modes  (mode count ~ pi/4*(K*step/nx)^2
+                = the # of per-frame-phase modes with spatial scale coarser than a
+                frame, i.e. exactly the modes the q<1/nx error monitor integrates)
+    Single gap = worst mode only; tr_band = the band-matched aggregate predictor."""
     truth_frames = Illuminate_frames(T.Splitc(ctx["truth"], ctx["mapid"]), ctx["probe"])
     if GPU:
         H = Operators.Gramiam_calc_cuda(truth_frames, ctx["Gramiam"], ctx["probe"],
@@ -55,20 +58,26 @@ def gramian_gap(ctx):
         framesl = Illuminate_frames(truth_frames, xp.conj(ctx["probe"]))
         framesr = framesl * ctx["inorm_split"]
         Hs = Gramiam_calc(framesl, framesr, ctx["Gramiam"], ctx["frames_norm"])
-    lam = cpu_eigsh(Hs.astype(np.complex128), k=NMODES, which="LM", return_eigenvectors=False)
+    n = Hs.shape[0]
+    m_band = int(np.ceil(0.25 * np.pi * (np.sqrt(n) * ctx["step"] / T.nx) ** 2)) + 1
+    k = min(max(NMODES, m_band), n - 2)
+    lam = cpu_eigsh(Hs.astype(np.complex128), k=k, which="LM", return_eigenvectors=False)
     lam = np.sort(np.real(lam))[::-1]
-    mu = 1.0 - lam[1:] / lam[0]                  # Laplacian eigenvalues of modes 2..NMODES
-    mu = mu[mu > 1e-12]
-    return float((lam[0] - lam[1]) / lam[0]), float(np.sum(1.0 / mu))
+    mu = 1.0 - lam[1:] / lam[0]                  # Laplacian eigenvalues, modes 2..k
+    mu = np.maximum(mu, 1e-12)
+    tr21 = float(np.sum(1.0 / mu[:NMODES - 1]))
+    tr_band = float(np.sum(1.0 / mu[:m_band - 1]))
+    return float((lam[0] - lam[1]) / lam[0]), tr21, tr_band, m_band
 
 
-print(f"{'K':>3} {'STEPD':>5} {'ovl%':>4} {'frames':>6} | {'gap':>9} {'TrLpinv':>9} | {'ph/frame':>8} "
-      f"| {'E_low':>8} {'E_high':>8} | {'E*sqrt(PH*g)':>12} {'E*sqrt(PH*nf/Tr)':>16}")
+print(f"{'K':>3} {'STEPD':>5} {'ovl%':>4} {'frames':>6} | {'gap':>9} {'Tr21':>9} {'TrBand':>9} {'M':>3} "
+      f"| {'ph/frame':>8} | {'E_low':>8} {'E_high':>8} | {'E*s(PH*g)':>9} {'E*s(PH*nf/T21)':>14} "
+      f"{'E*s(PH*nf/TrB)':>14}")
 for K, stepd in GEOMS:
     T.STEPD = stepd
     ctx = T.build(K)
     data_clean = ctx["data"] + 0
-    gap, trp = gramian_gap(ctx)
+    gap, tr21, trb, m_band = gramian_gap(ctx)
     ovl = 100 * (1 - ctx["step"] / T.nx)
     for PH in PH_LIST:
         # Poisson noise at PH photons/frame (counts = data*s, s from clean mean)
@@ -79,12 +88,11 @@ for K, stepd in GEOMS:
         ctx["frames_norm"] = Precondition_calc(ctx["data"], bw=ctx["Gramiam"]["bw"])
         c = T.run(ctx, 1, MAXIT, solver=T.eigsh_sync)
         E_lo, E_hi = float(c[-1, 0]), float(c[-1, 1])
-        # aggregate predictor: E^2 ~ TrLpinv / (PH * nframes)  (per-mode 1/(dose*mu),
-        # summed over the cluster, normalized by total frames/energy)
-        pred2 = E_lo * np.sqrt(PH * ctx["nframes"] / trp)
-        print(f"{K:>3} {stepd:>5} {ovl:>4.0f} {ctx['nframes']:>6} | {gap:>9.3e} {trp:>9.3e} | {PH:>8.0f} "
-              f"| {E_lo:>8.4f} {E_hi:>8.4f} | {E_lo*np.sqrt(PH*gap):>12.4f} {pred2:>16.4f}")
+        nf = ctx["nframes"]
+        print(f"{K:>3} {stepd:>5} {ovl:>4.0f} {nf:>6} | {gap:>9.3e} {tr21:>9.3e} {trb:>9.3e} {m_band:>3} "
+              f"| {PH:>8.0f} | {E_lo:>8.4f} {E_hi:>8.4f} | {E_lo*np.sqrt(PH*gap):>9.4f} "
+              f"{E_lo*np.sqrt(PH*nf/tr21):>14.4f} {E_lo*np.sqrt(PH*nf/trb):>14.4f}")
     ctx["data"] = data_clean
-print("\nCOLLAPSE TEST: col 1 (E*sqrt(PH*gap)) = single-worst-mode reading; col 2 "
-      "(E*sqrt(PH*nf/TrLpinv)) = aggregate/trace reading. Whichever is ~constant across "
-      "BOTH dose and geometry is the right UQ statistic (floors when other errors dominate).")
+print("\nCOLLAPSE TEST: single gap = worst mode only; Tr21 = fixed-count trace; TrBand = "
+      "band-matched trace (M = # graph modes coarser than a frame = what the q<1/nx monitor "
+      "integrates). The statistic that is ~constant across dose AND geometry is the UQ error bar.")
