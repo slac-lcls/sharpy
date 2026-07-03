@@ -1006,6 +1006,7 @@ SYNC_EIGTOL = float(os.environ.get("SHARPY_SYNC_EIGTOL", "1e-7")) # power-iterat
 #######
 _eig_v0 = None  # cached dominant eigenvector, for power-iteration warm start
 _sync_state = {"n": 0}  # invit_seed: count of sync calls so far (reset by eig_reset)
+_invit_cache = {}  # invit: cached CSR row-index array (overlap-graph sparsity is scan-fixed)
 
 
 def eig_reset():
@@ -1013,6 +1014,7 @@ def eig_reset():
     global _eig_v0
     _eig_v0 = None
     _sync_state["n"] = 0
+    _invit_cache.clear()
 
 
 def Eigensolver(H, num_iter, v0=None, tol=1e-7):
@@ -1259,15 +1261,41 @@ def Eigensolver_invit(H, eps=1e-4, steps=1, tol=1e-8, mode="cg"):
     nframes = H.shape[0]
     Hc = H.tocsr()
     # magnitude row-sum = connection-graph degree (H has zero diagonal: mapu2all
-    # excludes the diagonal when assembling).
-    absH = Hc.copy()
-    absH.data = xp.abs(absH.data)
-    d = xp.asarray(absH.sum(axis=1)).ravel().real
+    # excludes the diagonal when assembling). The overlap-graph SPARSITY is fixed
+    # by the scan, so cache the CSR row-index array once and refill the degree by
+    # bincount each call (no |H| copy, no sparse allocation).
+    key = (nframes, Hc.nnz)
+    if _invit_cache.get("key") != key:
+        _invit_cache["key"] = key
+        # COO row indices of the fixed sparsity (cupy.repeat rejects array repeats)
+        _invit_cache["rows"] = Hc.tocoo().row.astype(xp.int64)
+    d = xp.bincount(_invit_cache["rows"], weights=xp.abs(Hc.data), minlength=nframes).real
     d = xp.maximum(d, 1e-30)
-    dm12 = sparse.diags((1.0 / xp.sqrt(d)).astype(H.dtype))
-    Id = sparse.identity(nframes, dtype=H.dtype, format="csr")
-    Lsym = (Id - (dm12 @ Hc @ dm12)).tocsr()
-    M = (Lsym + eps * Id).tocsr()
+    s = (1.0 / xp.sqrt(d)).astype(H.dtype)
+
+    if mode == "cg_asm" or mode == "direct":
+        # assembled (Lsym + eps I): reference path / needed for the factorization
+        dm12 = sparse.diags(s)
+        Id = sparse.identity(nframes, dtype=H.dtype, format="csr")
+        Lsym = (Id - (dm12 @ Hc @ dm12)).tocsr()
+        M = (Lsym + eps * Id).tocsr()
+    else:
+        # mode="cg" (default): MATRIX-FREE. CG only needs matvecs, and
+        #   (Lsym + eps I) x = (1+eps) x - s .* (H @ (s .* x)),
+        # so skip the sparse triple product + CSR merges entirely -- the per-call
+        # assembly WAS the dominant cost (100x larger eps cut CG matvecs ~10x but
+        # wall-time only 1.5x). Each CG step now costs ONE H@v, same as a power step.
+        if GPU:
+            from cupyx.scipy.sparse.linalg import LinearOperator as _LO
+        else:
+            from scipy.sparse.linalg import LinearOperator as _LO
+        one_eps = H.dtype.type(1.0 + eps)
+
+        def _mv(x):
+            x = x.ravel()
+            return one_eps * x - s * (Hc @ (s * x))
+
+        M = _LO((nframes, nframes), matvec=_mv, dtype=H.dtype)
 
     # M = Lsym + eps*I is Hermitian POSITIVE-DEFINITE. Solve by:
     #   mode="cg"     -> conjugate gradient (iterative, O(nnz)/matvec, NO fill-in;
