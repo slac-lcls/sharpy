@@ -25,40 +25,61 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import time
 import numpy as np
 import config
 import Operators
 from Operators import (map_frames, Splitc, Overlapc, Illuminate_frames, Project_data,
-                       Gramiam_plan, Precondition_calc, synchronize_frames_c, eig_reset, xp)
-from scipy.sparse.linalg import eigsh as sp_eigsh
+                       Gramiam_plan, Precondition_calc, synchronize_frames_c, eig_reset,
+                       eigsh as be_eigsh, GPU, xp)
 
 nx = ny = int(os.environ.get("NX", 64))
 STEPD = int(os.environ.get("STEPD", 4))
 QCUT = float(os.environ.get("QCUT", 0))   # low-band edge in cycles/px; 0 = auto 1/nx (inter-frame band)
 PHS = float(os.environ.get("PHS", 2.0))   # phase-field width, cycles across the IMAGE
+NUMITER = int(os.environ.get("NUMITER", 5))  # power-arm budget (module-level: importers use it too)
 
 _POWER = Operators.Eigensolver          # the committed power-iteration solver
 _eigsh_v0 = {"v": None}                 # warm start across sync calls within a run
 
 
 def eigsh_sync(H, num_iter, v0=None, tol=1e-7):
-    """Drop-in for Operators.Eigensolver: FULL top eigenvector via ARPACK eigsh(LM).
+    """Drop-in for Operators.Eigensolver: FULL top eigenvector via eigsh(LM).
 
     The eigensolver-study winner for the varying-low-freq-phase regime (in-loop
     power at num_iter~5 is L2-budget-limited and under-converges exactly there).
-    complex128 for ARPACK stability; returns unit-modulus, common-phase-removed
-    omega shaped (nframes,1,1), matching Eigensolver's contract.
+    CPU: scipy ARPACK, complex128, warm-started. GPU: cupyx Lanczos (no v0 arg),
+    ncv=3/maxiter=EIGMAXIT(20) = the config validated in phase_sync_test.py.
+    Returns unit-modulus, common-phase-removed omega (nframes,1,1), matching
+    Eigensolver's contract.
     """
     n = H.shape[0]
-    w0 = _eigsh_v0["v"]
-    if w0 is not None and w0.shape[0] != n:
-        w0 = None
-    lam, V = sp_eigsh(H.astype(np.complex128), k=1, which="LM", v0=w0, tol=1e-8)
-    w = V[:, 0]
-    _eigsh_v0["v"] = w.copy()
-    w = w / (np.abs(w) + 1e-30)                      # unit modulus per frame
-    s = np.conj(w.sum()); s /= (abs(s) + 1e-30)      # remove the common phase
-    return (w * s).astype(np.complex64).reshape(n, 1, 1)
+    if GPU and os.environ.get("EIGSH_GPU", "cpu") == "gpu":
+        # pure-GPU Lanczos. MEASURED FAILURE at ncv=3/maxiter=20 on the near-degenerate
+        # phantom cluster (gap ~1e-3 at K=40): under-converged Ritz vector corrupts the
+        # gauge every sync (low band pins ~0.95, worse than AP). Needs a big budget.
+        lam, V = be_eigsh(H, k=1, ncv=int(os.environ.get("EIGNCV", 8)),
+                          maxiter=int(os.environ.get("EIGMAXIT", 200)), which="LM")
+        w = V[:, int(xp.argmax(lam))]
+    else:
+        # accurate ARPACK (scipy), warm-started; on GPU pull the (tiny, O(nnz)) H to
+        # host -- the robust default, a few ms at <=6400 frames.
+        from scipy.sparse.linalg import eigsh as arpack_eigsh
+        Hc = (H.get() if GPU else H).astype(np.complex128)
+        w0 = _eigsh_v0["v"]
+        if w0 is not None and w0.shape[0] != n:
+            w0 = None
+        # EIGNCV_HOST: widen the Krylov basis when the top cluster is near-degenerate
+        # (gap shrinks with N; default ncv=20 destabilizes by ~6400 frames)
+        ncv = os.environ.get("EIGNCV_HOST")
+        kw = {"ncv": min(n, int(ncv))} if ncv else {}
+        lam, V = arpack_eigsh(Hc, k=1, which="LM", v0=w0, tol=1e-8, **kw)
+        wc = V[:, 0]
+        _eigsh_v0["v"] = wc.copy()
+        w = xp.asarray(wc)
+    w = w / (xp.abs(w) + 1e-30)                          # unit modulus per frame
+    s = xp.conj(w.sum()); s /= (xp.abs(s) + 1e-30)       # remove the common phase
+    return (w * s).astype(xp.complex64).reshape(n, 1, 1)
 
 
 def phantom(Nx, Ny, seed=0):
@@ -151,6 +172,19 @@ def run(ctx, sync_every, maxit, solver=None):
     return np.array(curve)                                     # (maxit, 2) [low, high]
 
 
+def timed_run(*a, **k):
+    """run() + wall-time (GPU-synced)."""
+    if GPU:
+        import cupy
+        cupy.cuda.Stream.null.synchronize()
+    t0 = time.perf_counter()
+    c = run(*a, **k)
+    if GPU:
+        import cupy
+        cupy.cuda.Stream.null.synchronize()
+    return c, time.perf_counter() - t0
+
+
 def iters_to(col, thr):
     w = np.where(col < thr)[0]
     return int(w[0]) + 1 if w.size else None
@@ -163,7 +197,6 @@ def fmt(n):
 if __name__ == "__main__":
     MAXIT = int(os.environ.get("MAXIT", 300))
     SE = int(os.environ.get("SYNCEVERY", 1))
-    NUMITER = int(os.environ.get("NUMITER", 5))
     LOWTHR = float(os.environ.get("LOWTHR", 0.1))
     KLIST = [int(k) for k in os.environ.get("KLIST", "10 20 30").split()]
     summary = []
@@ -171,9 +204,11 @@ if __name__ == "__main__":
         ctx = build(K)
         print(f"\n===== K={K}: img {ctx['Nx']}x{ctx['Ny']}, {ctx['nframes']} frames x {nx}, "
               f"step {ctx['step']} (overlap {100*(1-ctx['step']/nx):.0f}%), low-band q<1/nx =====")
-        ap = run(ctx, 0, MAXIT)
-        po = run(ctx, SE, MAXIT, solver=None)          # power arm (committed in-loop solver)
-        ei = run(ctx, SE, MAXIT, solver=eigsh_sync)    # eigsh arm (study winner)
+        ap, t_ap = timed_run(ctx, 0, MAXIT)
+        po, t_po = timed_run(ctx, SE, MAXIT, solver=None)        # power arm (committed in-loop solver)
+        ei, t_ei = timed_run(ctx, SE, MAXIT, solver=eigsh_sync)  # eigsh arm (study winner)
+        print(f"wall-time: AP {t_ap:.2f}s ({1e3*t_ap/MAXIT:.1f}ms/it) | power {t_po:.2f}s "
+              f"({1e3*t_po/MAXIT:.1f}ms/it) | eigsh {t_ei:.2f}s ({1e3*t_ei/MAXIT:.1f}ms/it)")
         print(f"{'iter':>5} | {'AP low':>8} {'AP high':>8} | {'pow low':>8} {'pow high':>8} | {'eig low':>8} {'eig high':>8}")
         for it in [0, 4, 9, 19, 39, 79, MAXIT - 1]:
             if it < MAXIT:
@@ -181,14 +216,15 @@ if __name__ == "__main__":
                       f"| {ei[it,0]:>8.4f} {ei[it,1]:>8.4f}")
         row = (K, ctx["nframes"],
                iters_to(ap[:, 0], LOWTHR), iters_to(po[:, 0], LOWTHR), iters_to(ei[:, 0], LOWTHR),
-               ap[-1, 0], po[-1, 0], ei[-1, 0], ap[-1, 1], ei[-1, 1])
+               ap[-1, 0], po[-1, 0], ei[-1, 0], ap[-1, 1], ei[-1, 1], t_ap, t_ei)
         summary.append(row)
 
     print(f"\n===== SCALING: iters to LOW-band < {LOWTHR} (and final low err) =====")
     print(f"{'K':>3} {'frames':>7} | {'AP':>5} {'power':>5} {'eigsh':>5} | "
-          f"{'AP fin':>8} {'pow fin':>8} {'eig fin':>8} | {'AP hi':>7} {'eig hi':>7}")
-    for K, nf, a, p, e, af, pf, ef, ah, eh in summary:
+          f"{'AP fin':>8} {'pow fin':>8} {'eig fin':>8} | {'AP hi':>7} {'eig hi':>7} | "
+          f"{'AP ms/it':>8} {'eig ms/it':>9}")
+    for K, nf, a, p, e, af, pf, ef, ah, eh, ta, te in summary:
         print(f"{K:>3} {nf:>7} | {fmt(a)} {fmt(p)} {fmt(e)} | {af:>8.4f} {pf:>8.4f} {ef:>8.4f} "
-              f"| {ah:>7.4f} {eh:>7.4f}")
+              f"| {ah:>7.4f} {eh:>7.4f} | {1e3*ta/MAXIT:>8.1f} {1e3*te/MAXIT:>9.1f}")
     print("\nEXPECT: AP-only low-band iters GROW with N (Fiedler ~1/N diffusion); eigsh-sync stays "
           "~flat (coarse-correction); HIGH band ~same all arms (sync is low-freq only).")
