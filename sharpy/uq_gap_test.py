@@ -39,6 +39,25 @@ rng = np.random.default_rng(11)
 
 
 NMODES = int(os.environ.get("NMODES", 21))
+WEIGHTED = os.environ.get("WEIGHTED", "1") == "1"
+
+
+def mode_weights(ctx, V, lam):
+    """MODE-TO-IMAGE weights: for graph mode v_m, the image perturbation from
+    per-frame phases delta_phi = v_m is
+        dO_m(r) = sum_i v_m,i * W_i(r) * O(r),   W_i = |probe|^2 footprint / norm,
+    and w_m = ||low-band(dO_m)||^2 / ||O||^2. Replaces mode COUNTING with the
+    actual weighting (the open UQ refinement)."""
+    truth, probe, mapid = ctx["truth"], ctx["probe"], ctx["mapid"]
+    tf = T.Splitc(truth, mapid) * (xp.abs(probe) ** 2)[None]
+    w = np.zeros(V.shape[1])
+    for m in range(V.shape[1]):
+        vm = xp.asarray(V[:, m])
+        dO = T.Overlapc(tf * vm[:, None, None].astype(xp.complex64),
+                        ctx["Nx"], ctx["Ny"], mapid) / ctx["normalization"]
+        D = xp.fft.fft2(dO)
+        w[m] = float(xp.linalg.norm(D[ctx["low_mask"]])) ** 2 / ctx["Tnrm"] ** 2
+    return w
 
 
 def gramian_gap(ctx):
@@ -61,38 +80,52 @@ def gramian_gap(ctx):
     n = Hs.shape[0]
     m_band = int(np.ceil(0.25 * np.pi * (np.sqrt(n) * ctx["step"] / T.nx) ** 2)) + 1
     k = min(max(NMODES, m_band), n - 2)
-    lam = cpu_eigsh(Hs.astype(np.complex128), k=k, which="LM", return_eigenvectors=False)
-    lam = np.sort(np.real(lam))[::-1]
+    lam, V = cpu_eigsh(Hs.astype(np.complex128), k=k, which="LM")
+    o = np.argsort(np.real(lam))[::-1]
+    lam = np.real(lam)[o]; V = V[:, o]
     mu = 1.0 - lam[1:] / lam[0]                  # Laplacian eigenvalues, modes 2..k
     mu = np.maximum(mu, 1e-12)
     tr21 = float(np.sum(1.0 / mu[:NMODES - 1]))
     tr_band = float(np.sum(1.0 / mu[:m_band - 1]))
-    return float((lam[0] - lam[1]) / lam[0]), tr21, tr_band, m_band
+    tr_w = None
+    if WEIGHTED:
+        w = mode_weights(ctx, V[:, 1:], lam[1:])  # skip the consensus mode
+        tr_w = float(np.sum(w / mu))              # E^2 ~ TrW / PH (mode-weighted)
+    return float((lam[0] - lam[1]) / lam[0]), tr21, tr_band, m_band, tr_w
 
 
-print(f"{'K':>3} {'STEPD':>5} {'ovl%':>4} {'frames':>6} | {'gap':>9} {'Tr21':>9} {'TrBand':>9} {'M':>3} "
-      f"| {'ph/frame':>8} | {'E_low':>8} {'E_high':>8} | {'E*s(PH*g)':>9} {'E*s(PH*nf/T21)':>14} "
-      f"{'E*s(PH*nf/TrB)':>14}")
+print(f"{'K':>3} {'STEPD':>5} {'ovl%':>4} {'frames':>6} | {'gap':>9} {'TrBand':>9} {'TrW':>9} {'M':>3} "
+      f"| {'ph/frame':>8} | {'E_low':>8} {'E_high':>8} | {'E*s(PH*g)':>9} {'E*s(PH*nf/TrB)':>14} "
+      f"{'E*s(PH/TrW)':>11}")
 for K, stepd in GEOMS:
     T.STEPD = stepd
     ctx = T.build(K)
     data_clean = ctx["data"] + 0
-    gap, tr21, trb, m_band = gramian_gap(ctx)
+    gap, tr21, trb, m_band, trw = gramian_gap(ctx)
     ovl = 100 * (1 - ctx["step"] / T.nx)
+    REPS = int(os.environ.get("REPS", 1))
     for PH in PH_LIST:
-        # Poisson noise at PH photons/frame (counts = data*s, s from clean mean)
+        # Poisson noise at PH photons/frame (counts = data*s, s from clean mean);
+        # REPS independent realizations -- single-draw scatter was shown to dominate
+        # the apparent cross-geometry residual (PH=1000 ordering FLIPPED between draws).
         s = PH / (float(data_clean.sum()) / ctx["nframes"])
         dn = data_clean.get() if GPU else np.asarray(data_clean)
-        noisy = rng.poisson(dn * s).astype(np.float32) / s
-        ctx["data"] = xp.asarray(noisy)
-        ctx["frames_norm"] = Precondition_calc(ctx["data"], bw=ctx["Gramiam"]["bw"])
-        c = T.run(ctx, 1, MAXIT, solver=T.eigsh_sync)
-        E_lo, E_hi = float(c[-1, 0]), float(c[-1, 1])
+        Es = []
+        for _ in range(REPS):
+            ctx["data"] = xp.asarray(rng.poisson(dn * s).astype(np.float32) / s)
+            ctx["frames_norm"] = Precondition_calc(ctx["data"], bw=ctx["Gramiam"]["bw"])
+            c = T.run(ctx, 1, MAXIT, solver=T.eigsh_sync)
+            Es.append((float(c[-1, 0]), float(c[-1, 1])))
+        E_lo = float(np.mean([e[0] for e in Es])); E_sd = float(np.std([e[0] for e in Es]))
+        E_hi = float(np.mean([e[1] for e in Es]))
         nf = ctx["nframes"]
-        print(f"{K:>3} {stepd:>5} {ovl:>4.0f} {nf:>6} | {gap:>9.3e} {tr21:>9.3e} {trb:>9.3e} {m_band:>3} "
-              f"| {PH:>8.0f} | {E_lo:>8.4f} {E_hi:>8.4f} | {E_lo*np.sqrt(PH*gap):>9.4f} "
-              f"{E_lo*np.sqrt(PH*nf/tr21):>14.4f} {E_lo*np.sqrt(PH*nf/trb):>14.4f}")
+        colw = E_lo * np.sqrt(PH / trw) if trw else float("nan")
+        print(f"{K:>3} {stepd:>5} {ovl:>4.0f} {nf:>6} | {gap:>9.3e} {trb:>9.3e} "
+              f"{(trw if trw else float('nan')):>9.3e} {m_band:>3} "
+              f"| {PH:>8.0f} | {E_lo:>8.4f}±{E_sd:.4f} {E_hi:>8.4f} | {E_lo*np.sqrt(PH*gap):>9.4f} "
+              f"{E_lo*np.sqrt(PH*nf/trb):>14.4f} {colw:>11.4f}")
     ctx["data"] = data_clean
-print("\nCOLLAPSE TEST: single gap = worst mode only; Tr21 = fixed-count trace; TrBand = "
-      "band-matched trace (M = # graph modes coarser than a frame = what the q<1/nx monitor "
-      "integrates). The statistic that is ~constant across dose AND geometry is the UQ error bar.")
+print("\nCOLLAPSE TEST: single gap = worst mode; TrBand = band-matched mode COUNT; TrW = "
+      "MODE-WEIGHTED trace (per-mode image weights w_m = low-band energy of the mode's "
+      "image field; E^2 ~ TrW/PH, no ad-hoc nf normalization). The ~constant column across "
+      "dose AND geometry is the UQ error bar.")
