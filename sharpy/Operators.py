@@ -996,7 +996,7 @@ import os
 SYNC_METHOD = os.environ.get("SHARPY_SYNC", "power").lower()
 SYNC_EPS    = float(os.environ.get("SHARPY_SYNC_EPS", "1e-4"))    # must be < Fiedler gap (1-lambda2)
 SYNC_STEPS  = int(os.environ.get("SHARPY_SYNC_STEPS", "1"))
-SYNC_MODE   = os.environ.get("SHARPY_SYNC_MODE", "cg").lower()    # "cg" (iterative) | "direct" (splu/spsolve)
+SYNC_MODE   = os.environ.get("SHARPY_SYNC_MODE", "cg").lower()    # "cg" matrix-free inverse iter | "si" matrix-free shift-invert Lanczos | "direct" splu/spsolve
 SYNC_TOL    = float(os.environ.get("SHARPY_SYNC_TOL", "1e-8"))
 SYNC_SEED   = int(os.environ.get("SHARPY_SYNC_SEED", "1"))        # invit_seed: #cold syncs via invit before warm-power
 SYNC_EIGTOL = float(os.environ.get("SHARPY_SYNC_EIGTOL", "1e-7")) # power-iteration GAP-AWARE stop tol (distance-to-eigenvector; 0 = full num_iter)
@@ -1316,12 +1316,47 @@ def Eigensolver_invit(H, eps=1e-4, steps=1, tol=1e-8, mode="cg"):
     else:
         x = xp.ones(nframes, dtype=H.dtype)
     x0 = x + 0.0
-    if mode == "direct":
+    if mode == "si":
+        # MATRIX-FREE SHIFT-INVERT LANCZOS. Run eigsh over Minv = (Lsym+eps I)^{-1},
+        # applied by CG (no factorization). The consensus mode -- the SMALLEST eigenvalue
+        # of Lsym+eps I -- becomes the LARGEST of Minv, hence well separated, so Lanczos
+        # targets it without the near-degenerate-cluster ambiguity of a direct eigsh(H).
+        # This is the scipy sigma~0 / OPinv path made matrix-free, and it supplies BOTH
+        # of cupyx eigsh's missing scipy features at once: it IS the shift-invert, and by
+        # making the target dominant it removes the need for a v0 anchor (measured on the
+        # A100: plain cupyx eigsh(H) align 0.18 -> shift-invert eigsh(Minv) align 1.000).
+        # More robust than the CG inverse iteration when ones is a poor anchor (a strongly
+        # varying phase far from consensus), at a few x the cost (Lanczos runs several
+        # inner CG solves); use it as the robust fallback, not the cheap in-loop default.
+        if GPU:
+            from cupyx.scipy.sparse.linalg import cg as _cg, eigsh as _eigsh
+            from cupyx.scipy.sparse.linalg import LinearOperator as _LOi
+        else:
+            from scipy.sparse.linalg import cg as _cg, eigsh as _eigsh
+            from scipy.sparse.linalg import LinearOperator as _LOi
+
+        def _solve(b):
+            b = b.ravel()
+            try:
+                y, _ = _cg(M, b, rtol=tol, maxiter=20000)
+            except TypeError:                     # older scipy/cupyx use tol= not rtol=
+                y, _ = _cg(M, b, tol=tol, maxiter=20000)
+            return y
+
+        Minv = _LOi((nframes, nframes), matvec=_solve, dtype=H.dtype)
+        ncv = int(min(nframes - 1, max(8, 2 * steps + 6)))
+        if GPU:                                    # cupyx eigsh has no v0 (target is dominant)
+            _lam, V = _eigsh(Minv, k=1, which="LM", ncv=ncv, maxiter=300)
+        else:                                      # anchor scipy ARPACK at ones for determinism
+            _lam, V = _eigsh(Minv, k=1, which="LM", ncv=ncv, maxiter=300,
+                             v0=xp.ones(nframes, dtype=H.dtype))
+        x = V[:, 0]
+    elif mode == "direct":
         # inverse-power iteration via a REUSABLE factorization (cupyx/scipy splu): factor
         # (Lsym+epsI) ONCE, then a few inverse-iteration solves. This is the "shift-invert /
         # inverse-power" route -- the per-call cost is the factorization (cuSOLVER on GPU),
-        # NOT the solves. (cupyx eigsh has no sigma, so true shift-invert-Lanczos isn't
-        # available; inverse-power iteration is the realizable equivalent, same dominant cost.)
+        # NOT the solves. (For matrix-free shift-invert Lanczos without a factorization, see
+        # mode="si" above.)
         if GPU:
             from cupyx.scipy.sparse.linalg import splu as _splu
         else:
