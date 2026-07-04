@@ -587,6 +587,24 @@ def _block_from_pairs(ab, ba, col, row, diag, nframes):
     return (M + M.conj().T) * 0.5 * 2.0  # = M.real symmetrized (2*Re via +c.c.)
 
 
+def _sparse_real(M):
+    """Real part of a sparse matrix, portable across scipy and cupyx.
+
+    scipy.sparse matrices expose a ``.real`` property; cupyx.scipy.sparse
+    matrices do not (``AttributeError: 'csr_matrix' object has no attribute
+    'real'``).  On GPU we rebuild a CSR matrix from the real part of the stored
+    ``.data`` with the same indices/indptr -- structurally identical to what
+    scipy's ``.real`` does.  Guarded on ``config.GPU`` so the CPU/scipy path is
+    byte-identical to ``M.real``.
+    """
+    if config.GPU:
+        M = M.tocsr()
+        return _sparse.csr_matrix(
+            (M.data.real.copy(), M.indices, M.indptr), shape=M.shape
+        )
+    return M.real
+
+
 def position_solve_coupled(
     frames,
     dp,
@@ -653,9 +671,9 @@ def position_solve_coupled(
     H2 = _block_from_pairs(-ab22, -ba22, col, row, ccy, nframes)
     Hx = _block_from_pairs(-abx, -bax, col, row, cxy, nframes)
 
-    H1 = H1.real
-    H2 = H2.real
-    Hx = Hx.real
+    H1 = _sparse_real(H1)
+    H2 = _sparse_real(H2)
+    Hx = _sparse_real(Hx)
 
     # assemble [[H1, Hx], [Hx', H2]]
     H = _sparse.bmat([[H1, Hx], [Hx.T, H2]], format="csr")
