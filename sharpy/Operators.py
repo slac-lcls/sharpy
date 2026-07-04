@@ -1423,7 +1423,16 @@ def mapu2all(row, col , nframes):
     val0=xp.empty(col.size, dtype = Hdtype)
     Soo=sparse.coo_matrix((val0,(row,col)))
     H=Soo.tocsr()
-   
+    # The sync's H @ v matvecs (power iteration, invit CG, mode="si") are CSR
+    # SpMV and hit the fast cuSPARSE / SciPy path only when H is in CANONICAL
+    # format (sorted indices, no duplicates). tocsr() guarantees this (cupy #3430:
+    # sum_duplicates + _has_canonical_format=True), and val2H below only rewrites
+    # H.data in place -- it never touches indices/indptr, so the flag is preserved.
+    # Assert it so a future change to the assembly can't silently revert to the
+    # slow SpMV path.
+    assert getattr(H, "_has_canonical_format", True), \
+        "Gramian H must be canonical CSR for the fast H@v SpMV path (cupy #3430)"
+
     # split up upper and lower matrix indices
     iiu = xp.where(row <= col)[0]
     iil1 = xp.where(row > col)[0] # excluding diag
