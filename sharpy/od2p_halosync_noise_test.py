@@ -66,9 +66,12 @@ def halo_sync(frames, ctx, W):
         patches.append((num / den).ravel())
     P = xp.stack(patches)                                       # (nt, Npix)
     Hc = np.asarray(P @ xp.conj(P).T)
-    d = np.sqrt(np.abs(np.diag(Hc)) + 1e-30)
-    Hn = Hc / (d[:, None] * d[None, :]); Hn = Hn - np.diag(np.diag(Hn))
-    om_t = np.linalg.solve(np.eye(nt) - Hn + 1e-3 * np.eye(nt),  # ones-anchored (invit)
+    Hc = Hc - np.diag(np.diag(Hc))                              # adjacency (zero self)
+    deg = np.abs(Hc).sum(axis=1)                                # DEGREE = total overlap
+    deg = np.maximum(deg, 1e-30)
+    s = 1.0 / np.sqrt(deg)
+    Hn = s[:, None] * Hc * s[None, :]                           # D^-1/2 H D^-1/2
+    om_t = np.linalg.solve(np.eye(nt) - Hn + 1e-3 * np.eye(nt),  # PSD Laplacian, ones-anchored
                            np.ones(nt, dtype=Hn.dtype))
     om_t = om_t / (np.abs(om_t) + 1e-30)
     om_t = om_t * np.conj(np.sum(om_t)) / (abs(np.sum(om_t)) + 1e-30)
@@ -86,12 +89,18 @@ def run(ctx, data, mode, W, maxit):
     for it in range(maxit):
         frames, _ = Project_data(frames, data)
         if mode != "none" and it >= WARMUP and it % SE == 0:
-            if mode == "single":
+            if mode in ("single", "vcycle"):
                 om = synchronize_frames_c(frames, probe, ctx["frames_norm"],
                                           ctx["inorm_split"], ctx["Gramiam"],
                                           ctx["Gramiam"]["bw"], 5)
-                frames = frames * om
-            elif mode == "halo":
+                frames = frames * om                            # fine sync = the SMOOTHER
+            if mode == "halo":
+                frames = halo_sync(frames, ctx, W)
+            if mode == "vcycle":
+                # coarse-grid RESIDUAL correction ON TOP of the fine sync: after the
+                # smoother the patches are aligned up to a slow residual, so the coarse
+                # gauge is small (auto-vanishes at high dose) and only corrects the
+                # noise-limited long modes at low dose. This is the multigrid V-cycle.
                 frames = halo_sync(frames, ctx, W)
         img = Overlapc(Illuminate_frames(frames, cprobe), Nx, Ny, mapid) / ctx["normalization"]
         frames = Illuminate_frames(Splitc(img, mapid), probe)
@@ -109,10 +118,10 @@ if __name__ == "__main__":
     ov = 100 * (1 - ctx["step"] / nx)
     print(f"K={K} ({ctx['nframes']} frames x {nx}), img {ctx['Nx']}^2, overlap {ov:.0f}%, "
           f"coarse {NC}x{NC} centres (bilinear blend), MAXIT={MAXIT} SE={SE} REPS={REPS}")
-    print(f"{'ph/px':>7} | {'none':>8} {'single':>8} {'halo':>8}")
+    print(f"{'ph/px':>7} | {'none':>8} {'single':>8} {'halo':>8} {'vcycle':>8}")
     for PH in PHLIST:
         scale = PH / (float(clean.sum()) / clean.size)
-        acc = {m: [] for m in ("none", "single", "halo")}
+        acc = {m: [] for m in ("none", "single", "halo", "vcycle")}
         for r in range(REPS):
             noisy = xp.asarray(rng.poisson(clean * scale).astype(np.float32) / scale)
             ctx["data"] = noisy
@@ -124,6 +133,7 @@ if __name__ == "__main__":
                 except Exception as e:
                     acc[m].append(float("nan")); print(f"  !! {m} PH={PH}: {type(e).__name__}")
         mn = {m: float(np.nanmean(acc[m])) for m in acc}
-        print(f"{PH:>7.2f} | {mn['none']:>8.3f} {mn['single']:>8.3f} {mn['halo']:>8.3f}")
+        print(f"{PH:>7.2f} | {mn['none']:>8.3f} {mn['single']:>8.3f} {mn['halo']:>8.3f} "
+              f"{mn['vcycle']:>8.3f}")
     print("\nEXPECT: halo continuous-gauge sync should NOT hurt at high dose (unlike hard tiles) "
           "and may beat single-level at low dose (aggregated coarse Gramian survives lower photons).")
