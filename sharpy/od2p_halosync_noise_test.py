@@ -33,6 +33,7 @@ SE = int(os.environ.get("SE", 3))
 WARMUP = int(os.environ.get("WARMUP", 8))
 PHLIST = [float(p) for p in os.environ.get("PHLIST", "3 1 0.3 0.1 0.03").split()]
 REPS = int(os.environ.get("REPS", 2))
+VDAMP = float(os.environ.get("VDAMP", 1.0))
 
 
 def bilinear_weights(K, nc):
@@ -76,7 +77,10 @@ def halo_sync(frames, ctx, W):
     om_t = om_t / (np.abs(om_t) + 1e-30)
     om_t = om_t * np.conj(np.sum(om_t)) / (abs(np.sum(om_t)) + 1e-30)
     om_f = W @ om_t                                             # bilinear blend -> per frame
-    om_f = xp.asarray(om_f / (np.abs(om_f) + 1e-30)).astype(xp.complex64)
+    om_f = om_f / (np.abs(om_f) + 1e-30)
+    if VDAMP != 1.0:                                            # damp the (noisy at low dose) correction
+        om_f = np.exp(1j * VDAMP * np.angle(om_f))
+    om_f = xp.asarray(om_f).astype(xp.complex64)
     return frames * om_f[:, None, None]
 
 
