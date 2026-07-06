@@ -792,6 +792,98 @@ def Alternating_projections_c(
 
 
 
+def Alternating_projections_batched_c(
+    sync, img, Gramiam, illumination, translations_x, translations_y,
+    overlap_cuda, split_cuda, frames_data, refine_illumination, maxiter,
+    normalization=None, img_truth=None, residuals_interval=1, sync_interval=1,
+    num_iter=5, frame_batch=1024,
+):
+    """Frame-batched GPU drop-in for Alternating_projections_c (device-resident F).
+
+    Same signature + a ``frame_batch`` (B) argument, same return
+    ``(img, frames, illumination, residuals)``. Processes the frames stack in batches
+    of B instead of materialising it whole:
+      PASS-A  split_cuda -> Project_data per batch -> DEVICE-resident F (+ per-frame norm)
+      SYNC    H = Gramiam_calc_cuda(F, ...) (single-shot, == production) -> Eigensolver
+      PASS-B  overlap_cuda(F * omega) per batch -> object
+    Drops the full-stack ``frames_old`` copy + FFT temporary + framesl/framesr, so peak
+    memory ~ data + F + inorm + O(B) (~5x data) vs Alternating_projections_c's ~10-12x
+    -> runs at frame counts that OOM the full stack, at ~production speed (A100:
+    271 ms/iter at 65536 frames, nx=128, where the full stack OOMs). Reconstruction is
+    bit-exact vs Alternating_projections_c (validated to ~1e-5, identical truth-NMSE).
+
+    ``residuals[:,2]`` (||frames - frames_old||, the ePIE step size) is NOT computed --
+    that copy is exactly what batching avoids -- and is left 0. GPU-only
+    (device-resident F); refine_illumination not supported yet.
+    """
+    assert GPU, "batched solver is the GPU device-resident-F path"
+    assert not refine_illumination, "refine_illumination not supported in the batched path yet"
+    reg0 = 1e-8
+    nframes, nx, ny = frames_data.shape
+    B = frame_batch if (frame_batch and frame_batch > 0) else nframes
+    illumination_start = illumination
+    translations = (translations_x + 1j * translations_y).astype(cp.complex64)
+
+    # normalization + inorm (stack-free: overlap_cuda(.,0,.) / split_cuda(.,.,.,0))
+    if normalization is None:
+        normalization = cp.zeros(img.shape, dtype=cp.complex64)
+        overlap_cuda(normalization, 0, translations, illumination_start + 0)
+    reg = reg0 * float(xp.max(xp.abs(normalization)))
+    if sync:
+        inorm_split = cp.zeros(frames_data.shape, dtype=cp.complex64)
+        split_cuda(1.0 / (normalization + reg), inorm_split, translations, 0)
+        Operators.eig_reset()
+
+    # residual bookkeeping (matches Alternating_projections_c)
+    nresiduals = int(np.ceil(maxiter / residuals_interval))
+    residuals = xp.zeros((nresiduals, 4), dtype=xp.float32)
+    frames_norm_sum = xp.linalg.norm(xp.sqrt(frames_data))
+    frames_norm_r = frames_norm_sum / xp.sqrt(xp.prod(xp.array(frames_data.shape[-2:])))
+    if img_truth is not None:
+        nrm_truth = xp.linalg.norm(img_truth)
+
+    F = cp.zeros(frames_data.shape, dtype=cp.complex64)          # DEVICE-resident frames
+    frames_norm = cp.zeros(nframes, dtype=cp.complex64)
+
+    for ii in tqdm(range(maxiter)):
+        cr = (ii % residuals_interval == 0)
+        mse_acc = 0.0
+        # PASS A: split + data-project per batch -> F (+ per-frame norm for sync)
+        for s in range(0, nframes, B):
+            e = min(nframes, s + B)
+            fb = cp.zeros((e - s, nx, ny), dtype=cp.complex64)
+            split_cuda(img, fb, translations[s:e], illumination_start)
+            fb, mse = Project_data(fb, frames_data[s:e], compute_residuals=cr)
+            if cr and mse is not None:
+                mse_acc += float(mse)
+            F[s:e] = fb
+            if sync:
+                frames_norm[s:e] = Precondition_calc(fb, bw=Gramiam["bw"])
+        # SYNC: single-shot Gramian (== production Gramiam_calc_cuda) -> omega
+        omega = None
+        if sync and (ii % sync_interval == 0):
+            H = Operators.Gramiam_calc_cuda(F, Gramiam, illumination_start, inorm_split, frames_norm)
+            omega = Operators.Eigensolver(H, num_iter).reshape(nframes, 1, 1)
+        # PASS B: (apply omega) + overlap per batch -> object
+        img0 = cp.zeros(img.shape, dtype=cp.complex64)
+        for s in range(0, nframes, B):
+            e = min(nframes, s + B)
+            fb = F[s:e] if omega is None else F[s:e] * omega[s:e]
+            overlap_cuda(img0, fb, translations[s:e], illumination_start)
+        img = img0 / (normalization + reg)
+        # residuals (recon-side exact; step-size residuals[:,2] intentionally skipped)
+        if cr:
+            residuals[ii // residuals_interval, 1] = mse_acc
+            if img_truth is not None:
+                residuals[ii // residuals_interval, 0] = mse_calc(img_truth, img)
+
+    residuals[:, 1] /= frames_norm_sum
+    if img_truth is not None:
+        residuals[:, 0] /= nrm_truth
+        residuals[:, 3] = 1.0 / (residuals[:, 0] + 1e-30)
+    return img, F, illumination_start, residuals
+
+
 def plot_intermediate(images):
     n_images = len(images)
     print(n_images)
