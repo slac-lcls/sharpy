@@ -213,6 +213,7 @@ if __name__ == "__main__":
                 illum, tr, data, Nx, Ny = simulate(NX, nnx, Dx, B)
                 norm, reg = compute_norm(illum, tr, Nx, Ny)
                 Gplan = Gramiam_plan(tr.real, tr.imag, nf, NX, NX, Nx, Ny, bw=0)
+                pool.free_all_blocks()                  # release setup transients: total_bytes -> live (data+norm+plan)
                 cp.cuda.Stream.null.synchronize(); t0 = time.perf_counter()
                 if mode == "fast":
                     img = ap_sync_on_fast(tr, illum, data, norm, reg, Nx, Ny, MAXIT, B, Gplan)
@@ -220,7 +221,8 @@ if __name__ == "__main__":
                     img, _ = ap_sync_on(tr, illum, data, norm, reg, Nx, Ny, MAXIT, B, PCHUNK, Gplan)
                 cp.cuda.Stream.null.synchronize()
                 ms = (time.perf_counter() - t0) / MAXIT * 1e3
-                print(f"{nf:>9} {data.nbytes/1e9:>8.2f} {mode:>10} {'OK':>7} {gpu_used_gb():>8.2f} {ms:>9.1f}")
+                peak_gb = pool.total_bytes() / 1e9      # PEAK reserved during the run (true in-loop peak, not residual)
+                print(f"{nf:>9} {data.nbytes/1e9:>8.2f} {mode:>10} {'OK':>7} {peak_gb:>8.2f} {ms:>9.1f}")
                 del illum, tr, data, norm, Gplan, img; free()
             except (cp.cuda.memory.OutOfMemoryError, MemoryError) as ex:
                 print(f"{nf:>9} {'-':>8} {mode:>10} {'OOM':>7}  ({type(ex).__name__})"); free()

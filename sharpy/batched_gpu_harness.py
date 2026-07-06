@@ -121,17 +121,18 @@ if __name__ == "__main__":
     for nnx in BIG_NNX:
         nf = nnx * nnx
         try:
-            free(); pool.free_all_blocks()
+            free()
             illum, tr, data, Nx, Ny = simulate(NX, nnx, Dx, B)
             norm = compute_norm(illum, tr, Nx, Ny)
+            pool.free_all_blocks()                       # release simulate transients: total_bytes -> live (data+norm)
             cp.cuda.Stream.null.synchronize()
             t0 = time.perf_counter()
             img = ap_sync_off(tr, illum, data, norm, Nx, Ny, MAXIT, B)
             cp.cuda.Stream.null.synchronize()
             ms = (time.perf_counter() - t0) / MAXIT * 1e3
-            used, _ = gpu_mb()
+            peak_gb = pool.total_bytes() / 1e9           # PEAK reserved during the run (true in-loop peak, not residual)
             data_gb = data.nbytes / 1e9
-            print(f"{nf:>9} {data_gb:>8.2f} {'OK':>8} {used/1e3:>8.2f} {ms:>8.1f} {Nx:>7}")
+            print(f"{nf:>9} {data_gb:>8.2f} {'OK':>8} {peak_gb:>8.2f} {ms:>8.1f} {Nx:>7}")
             del illum, tr, data, norm, img; free()
         except (cp.cuda.memory.OutOfMemoryError, MemoryError) as ex:
             print(f"{nf:>9} {'-':>8} {'OOM':>8}  ({type(ex).__name__})")
