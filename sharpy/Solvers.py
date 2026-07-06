@@ -860,16 +860,26 @@ def Alternating_projections_batched_c(
     Both are bit-exact vs Alternating_projections_c (validated ~1e-5, identical truth-NMSE).
 
     ``residuals[:,2]`` (||frames-frames_old||, ePIE step) is NOT computed -- that copy is what
-    batching avoids -- left 0. In HOST mode the returned ``frames`` is a numpy array. GPU-only;
-    refine_illumination not supported yet.
+    batching avoids -- left 0. In HOST mode the returned ``frames`` is a numpy array. GPU-only.
+    ``refine_illumination`` is supported and forces the DEVICE tier (the probe update sums over
+    the whole frames stack, which must be device-resident).
     """
     assert GPU, "batched solver is a GPU path"
-    assert not refine_illumination, "refine_illumination not supported in the batched path yet"
     reg0 = 1e-8
     nframes, nx, ny = frames_data.shape
     B = frame_batch if (frame_batch and frame_batch > 0) else nframes
-    illumination_start = illumination
     translations = (translations_x + 1j * translations_y).astype(cp.complex64)
+
+    # refine_illumination: start from a lens-masked guess and refine the probe each iter (the
+    # update sums over the whole frames stack -> needs F on device -> DEVICE tier only). Else
+    # illumination is the known/fixed probe.
+    illumination_truth = illumination
+    lens_mask = None
+    if refine_illumination:
+        w_initial, lens_mask = make_probe(nx, ny, r1=0.025 * 3, r2=0.085 * 3, fx=+10, fy=-10)
+        illumination_start = cp.asarray(w_initial, dtype=cp.complex64)
+    else:
+        illumination_start = illumination
 
     # ── tier select: device-resident F (fast) vs host-streamed F (any size) ──
     stack_bytes = nframes * nx * ny * 8                          # one complex64 frame stack
@@ -878,6 +888,8 @@ def Alternating_projections_batched_c(
         use_host = free < 2.6 * stack_bytes
     else:
         use_host = (frame_store == "host")
+    if refine_illumination:
+        use_host = False                                        # refine needs the frames stack on device
 
     # normalization + inorm image (stack-free)
     if normalization is None:
@@ -927,15 +939,42 @@ def Alternating_projections_batched_c(
             else:
                 H = Operators.Gramiam_calc_cuda(F, Gramiam, illumination_start, inorm_split, frames_norm)
             omega = Operators.Eigensolver(H, num_iter).reshape(nframes, 1, 1)
-        # PASS B: (apply omega) + overlap per batch -> object
+        # apply the sync phase to F. DEVICE tier: fold omega into the resident F and do ONE
+        # overlap_cuda over the whole stack == Alternating_projections_c (bit-exact img0; also
+        # lets refine see the synced frames). HOST tier: apply omega per streamed batch.
+        if omega is not None and not use_host:
+            F *= omega
         img0 = cp.zeros(img.shape, dtype=cp.complex64)
-        for s in range(0, nframes, B):
-            e = min(nframes, s + B)
-            fb = cp.asarray(F[s:e]) if use_host else F[s:e]
-            if omega is not None:
-                fb = fb * omega[s:e]
-            overlap_cuda(img0, fb, translations[s:e], illumination_start)
-        img = img0 / (normalization + reg)
+        if use_host:
+            for s in range(0, nframes, B):
+                e = min(nframes, s + B)
+                fb = cp.asarray(F[s:e])
+                if omega is not None:
+                    fb = fb * omega[s:e]
+                overlap_cuda(img0, fb, translations[s:e], illumination_start)
+        else:
+            overlap_cuda(img0, F, translations, illumination_start)
+        if refine_illumination:
+            # match Alternating_projections_c's refine img update (Tikhonov toward the previous
+            # img; the diagonal-only reg via xp.eye is kept verbatim for exact parity)
+            reg_img = reg0 * float(xp.max(xp.abs(normalization)))
+            img = (img0 + reg_img * img) / (normalization + reg_img * xp.eye(
+                normalization.shape[0], normalization.shape[1], dtype=normalization.dtype))
+        else:
+            img = img0 / (normalization + reg)
+        # refine illumination (device tier): update the probe from F, then refresh the
+        # normalization + inorm (which depend on the probe) -- matches Alternating_projections_c
+        if refine_illumination:
+            illumination_start = refine_illumination_function(
+                img, illumination_start, illumination_truth, F, translations,
+                split_cuda, overlap_cuda, GPU, lens_mask, ii)
+            illumination_start = illumination_start / xp.max(xp.abs(illumination_start))
+            normalization = cp.zeros(img.shape, dtype=cp.complex64)
+            overlap_cuda(normalization, 0, translations, illumination_start)
+            reg = reg0 * float(xp.max(xp.abs(normalization)))
+            norm_reg_inv = (1.0 / (normalization + reg)).astype(cp.complex64)
+            if sync:
+                split_cuda(norm_reg_inv, inorm_split, translations, 0)
         # residuals (recon-side exact; step-size residuals[:,2] intentionally skipped)
         if cr:
             residuals[ii // residuals_interval, 1] = mse_acc
