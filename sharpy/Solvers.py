@@ -792,31 +792,78 @@ def Alternating_projections_c(
 
 
 
+_ZQQZ_CACHE = {}
+
+
+def _zqqz_kernel():
+    """Lazily build (once) the raw zQQz Gramian kernel for the host-streaming sync path."""
+    if "k" not in _ZQQZ_CACHE:
+        _ZQQZ_CACHE["k"] = cp.RawKernel(Operators.zQQz_raw_kernel, "dotp", jitify=True,
+                                        options=("--std=c++17",))
+    return _ZQQZ_CACHE["k"]
+
+
+def _gramian_host_chunked(F, frames_norm, translations, illumination, norm_reg_inv, plan,
+                          split_cuda, nx, pair_chunk):
+    """Assemble the sync Gramian H from a HOST-resident frame store F (numpy) by streaming
+    locality-ordered PAIR-CHUNKS to the device: gather only the frames each chunk touches
+    (peak ~ overlap-degree << nf), recompute inorm_split[U] via split_cuda (never O(nf) on
+    device), run the raw zQQz kernel per chunk, scatter into the original val slots. Bit-
+    identical to the single-shot Gramiam_calc_cuda (validated). Returns H."""
+    kern = _zqqz_kernel()
+    col = cp.asnumpy(plan["col"]).astype(np.int64)
+    row = cp.asnumpy(plan["row"]).astype(np.int64)
+    dx = plan["dx"]; dy = plan["dy"]; bw = int(plan["bw"]); nnz = col.size
+    val = cp.zeros((nnz, 1), dtype=cp.complex64)
+    fn = frames_norm.astype(cp.complex64)
+    order = np.argsort(col, kind="stable")                       # frame-locality order
+    for s in range(0, nnz, pair_chunk):
+        pidx = order[s:min(nnz, s + pair_chunk)]
+        c = col[pidx]; r = row[pidx]
+        U = np.unique(np.concatenate([c, r]))
+        pos = np.empty(int(U.max()) + 1, np.int64); pos[U] = np.arange(U.size)
+        Ud = cp.asarray(U)
+        F_sub = cp.asarray(F[U]).astype(cp.complex64)            # host -> device (<= 2*chunk frames)
+        inorm_sub = cp.zeros((U.size, nx, nx), dtype=cp.complex64)
+        split_cuda(norm_reg_inv, inorm_sub, translations[Ud], 0)
+        cl = cp.asarray(pos[c]).astype(int); rl = cp.asarray(pos[r]).astype(int)
+        pidxd = cp.asarray(pidx)
+        vch = cp.zeros((pidx.size, 1), dtype=cp.complex64)
+        kern((int(pidx.size),), (128,), (vch, F_sub, fn[Ud], illumination, inorm_sub,
+             cl, rl, dx[pidxd], dy[pidxd], bw, int(pidx.size), nx, nx))
+        val[pidxd] = vch
+    return plan["val2H"](val.ravel())
+
+
 def Alternating_projections_batched_c(
     sync, img, Gramiam, illumination, translations_x, translations_y,
     overlap_cuda, split_cuda, frames_data, refine_illumination, maxiter,
     normalization=None, img_truth=None, residuals_interval=1, sync_interval=1,
-    num_iter=5, frame_batch=1024,
+    num_iter=5, frame_batch=1024, frame_store="auto", pair_chunk=4096,
 ):
-    """Frame-batched GPU drop-in for Alternating_projections_c (device-resident F).
+    """Frame-batched GPU drop-in for Alternating_projections_c.
 
-    Same signature + a ``frame_batch`` (B) argument, same return
-    ``(img, frames, illumination, residuals)``. Processes the frames stack in batches
-    of B instead of materialising it whole:
-      PASS-A  split_cuda -> Project_data per batch -> DEVICE-resident F (+ per-frame norm)
-      SYNC    H = Gramiam_calc_cuda(F, ...) (single-shot, == production) -> Eigensolver
-      PASS-B  overlap_cuda(F * omega) per batch -> object
-    Drops the full-stack ``frames_old`` copy + FFT temporary + framesl/framesr, so peak
-    memory ~ data + F + inorm + O(B) (~5x data) vs Alternating_projections_c's ~10-12x
-    -> runs at frame counts that OOM the full stack, at ~production speed (A100:
-    271 ms/iter at 65536 frames, nx=128, where the full stack OOMs). Reconstruction is
-    bit-exact vs Alternating_projections_c (validated to ~1e-5, identical truth-NMSE).
+    Same signature + ``frame_batch`` (B), ``frame_store`` and ``pair_chunk``; same return
+    ``(img, frames, illumination, residuals)``. Processes the frames stack in batches of B
+    instead of materialising it whole (PASS-A split->Project per batch -> F; SYNC Gramian +
+    Eigensolver; PASS-B overlap(F*omega) per batch), dropping the full-stack ``frames_old``
+    copy + FFT temp + framesl/framesr.
 
-    ``residuals[:,2]`` (||frames - frames_old||, the ePIE step size) is NOT computed --
-    that copy is exactly what batching avoids -- and is left 0. GPU-only
-    (device-resident F); refine_illumination not supported yet.
+    TWO tiers, chosen by ``frame_store`` ("auto" | "device" | "host"):
+      * DEVICE (fast): F device-resident + single-shot Gramiam_calc_cuda. peak ~ data + F +
+        inorm + O(B) (~5x data vs Alternating_projections_c's ~10-12x) -> ~2x the frame cap
+        at ~production speed (A100: 271 ms/iter @65536 fr nx=128, where the full stack OOMs).
+      * HOST (fits any size): F on HOST, the Gramian assembled by streaming pair-chunks to
+        the device (_gramian_host_chunked), inorm recomputed per chunk. device peak ~ O(B) +
+        O(degree) -> unbounded frame count, but transfer-bound (~1 order slower).
+    "auto" uses DEVICE when free GPU memory comfortably holds ~2 frame stacks, else HOST.
+    Both are bit-exact vs Alternating_projections_c (validated ~1e-5, identical truth-NMSE).
+
+    ``residuals[:,2]`` (||frames-frames_old||, ePIE step) is NOT computed -- that copy is what
+    batching avoids -- left 0. In HOST mode the returned ``frames`` is a numpy array. GPU-only;
+    refine_illumination not supported yet.
     """
-    assert GPU, "batched solver is the GPU device-resident-F path"
+    assert GPU, "batched solver is a GPU path"
     assert not refine_illumination, "refine_illumination not supported in the batched path yet"
     reg0 = 1e-8
     nframes, nx, ny = frames_data.shape
@@ -824,15 +871,26 @@ def Alternating_projections_batched_c(
     illumination_start = illumination
     translations = (translations_x + 1j * translations_y).astype(cp.complex64)
 
-    # normalization + inorm (stack-free: overlap_cuda(.,0,.) / split_cuda(.,.,.,0))
+    # ── tier select: device-resident F (fast) vs host-streamed F (any size) ──
+    stack_bytes = nframes * nx * ny * 8                          # one complex64 frame stack
+    if frame_store == "auto":
+        free = int(cp.cuda.Device().mem_info[0])                # device tier ~ F + inorm (2 stacks)
+        use_host = free < 2.6 * stack_bytes
+    else:
+        use_host = (frame_store == "host")
+
+    # normalization + inorm image (stack-free)
     if normalization is None:
         normalization = cp.zeros(img.shape, dtype=cp.complex64)
         overlap_cuda(normalization, 0, translations, illumination_start + 0)
     reg = reg0 * float(xp.max(xp.abs(normalization)))
+    norm_reg_inv = (1.0 / (normalization + reg)).astype(cp.complex64)
+    inorm_split = None
     if sync:
-        inorm_split = cp.zeros(frames_data.shape, dtype=cp.complex64)
-        split_cuda(1.0 / (normalization + reg), inorm_split, translations, 0)
         Operators.eig_reset()
+        if not use_host:                                        # device tier keeps O(nf) inorm resident
+            inorm_split = cp.zeros(frames_data.shape, dtype=cp.complex64)
+            split_cuda(norm_reg_inv, inorm_split, translations, 0)
 
     # residual bookkeeping (matches Alternating_projections_c)
     nresiduals = int(np.ceil(maxiter / residuals_interval))
@@ -842,13 +900,14 @@ def Alternating_projections_batched_c(
     if img_truth is not None:
         nrm_truth = xp.linalg.norm(img_truth)
 
-    F = cp.zeros(frames_data.shape, dtype=cp.complex64)          # DEVICE-resident frames
+    F = (np.empty(frames_data.shape, dtype=np.complex64) if use_host
+         else cp.zeros(frames_data.shape, dtype=cp.complex64))
     frames_norm = cp.zeros(nframes, dtype=cp.complex64)
 
     for ii in tqdm(range(maxiter)):
         cr = (ii % residuals_interval == 0)
         mse_acc = 0.0
-        # PASS A: split + data-project per batch -> F (+ per-frame norm for sync)
+        # PASS A: split + data-project per batch -> F (device or host) + per-frame norm
         for s in range(0, nframes, B):
             e = min(nframes, s + B)
             fb = cp.zeros((e - s, nx, ny), dtype=cp.complex64)
@@ -856,19 +915,25 @@ def Alternating_projections_batched_c(
             fb, mse = Project_data(fb, frames_data[s:e], compute_residuals=cr)
             if cr and mse is not None:
                 mse_acc += float(mse)
-            F[s:e] = fb
+            F[s:e] = cp.asnumpy(fb) if use_host else fb
             if sync:
                 frames_norm[s:e] = Precondition_calc(fb, bw=Gramiam["bw"])
-        # SYNC: single-shot Gramian (== production Gramiam_calc_cuda) -> omega
+        # SYNC: host-streamed chunked Gramian OR device single-shot -> omega
         omega = None
         if sync and (ii % sync_interval == 0):
-            H = Operators.Gramiam_calc_cuda(F, Gramiam, illumination_start, inorm_split, frames_norm)
+            if use_host:
+                H = _gramian_host_chunked(F, frames_norm, translations, illumination_start,
+                                          norm_reg_inv, Gramiam, split_cuda, nx, pair_chunk)
+            else:
+                H = Operators.Gramiam_calc_cuda(F, Gramiam, illumination_start, inorm_split, frames_norm)
             omega = Operators.Eigensolver(H, num_iter).reshape(nframes, 1, 1)
         # PASS B: (apply omega) + overlap per batch -> object
         img0 = cp.zeros(img.shape, dtype=cp.complex64)
         for s in range(0, nframes, B):
             e = min(nframes, s + B)
-            fb = F[s:e] if omega is None else F[s:e] * omega[s:e]
+            fb = cp.asarray(F[s:e]) if use_host else F[s:e]
+            if omega is not None:
+                fb = fb * omega[s:e]
             overlap_cuda(img0, fb, translations[s:e], illumination_start)
         img = img0 / (normalization + reg)
         # residuals (recon-side exact; step-size residuals[:,2] intentionally skipped)
