@@ -70,6 +70,25 @@ def register_translation(A, B, upsample=20):
     return p[0] + m[0] / usf, p[1] + m[1] / usf
 
 
+def register_translation_masked(A, B, wA, wB, overlap_ratio=0.3):
+    """Masked/weighted sub-pixel translation (sy,sx) to shift B onto A when each frame is only valid
+    where its weight w is significant (e.g. w = probe amplitude x detector mask). Padfield, "Masked
+    Object Registration in the Fourier Domain," IEEE TIP 2012: the weighted cross-correlation is
+    normalized by the mask/weight OVERLAP, so partial-overlap regions aren't over/under-counted (a plain
+    FFT cross-correlation is biased by the finite/apodized support). Works on complex fields (exit
+    waves). NB: for two frames sharing a common object, the object cancels and this returns the PROBE's
+    relative shift -- the position-error signal. Parabolic sub-pixel; sufficient overlap required."""
+    H, W = A.shape
+    N = np.fft.ifft2(np.fft.fft2(wA * A) * np.conj(np.fft.fft2(wB * B)))    # weighted cross-correlation
+    D = np.real(np.fft.ifft2(np.fft.fft2(wA) * np.conj(np.fft.fft2(wB))))   # weight/mask OVERLAP
+    D = np.maximum(D, 0.0)
+    S = np.where(D > overlap_ratio * D.max(), np.abs(N) / (D + 1e-12), 0.0)  # overlap-normalized peak
+    py, px = np.unravel_index(np.argmax(S), S.shape)
+    dy = _parpk(S[:, px], py, H); dx = _parpk(S[py, :], px, W)              # parabolic sub-pixel
+    dy = dy - H if dy > H / 2 else dy; dx = dx - W if dx > W / 2 else dx     # unwrap
+    return dy, dx
+
+
 def _apply_shift(B, sy, sx):
     H, W = B.shape
     ky = np.fft.fftfreq(H)[:, None]; kx = np.fft.fftfreq(W)[None, :]

@@ -29,6 +29,21 @@ def test_translation_subpixel():
     assert abs(ry - sy) < 0.05 and abs(rx - sx) < 0.05
 
 
+def test_masked_translation_partial_overlap_and_gap():
+    """probe-weighted, gap-masked frames at OFFSET footprints (partial overlap) -> masked registration
+    recovers the shift where a plain FFT cross-correlation is biased by the finite/apodized support."""
+    A = _field(); H, W = A.shape
+    sy, sx = 4.3, -2.7
+    B = ga._apply_shift(A, -sy, -sx)
+    yy, xx = np.mgrid[0:H, 0:W]
+    g = lambda cy, cx, s: np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * s * s))
+    wA = g(H / 2 - 25, W / 2, 45); wB = g(H / 2 + 25, W / 2, 45)   # offset probe footprints
+    gap = np.ones((H, W)); gap[H // 2 - 4:H // 2 + 4, :] = 0.0     # detector-gap-like mask
+    wA = wA * gap; wB = wB * gap
+    ry, rx = ga.register_translation_masked(A, B, wA, wB)
+    assert abs(ry - sy) < 0.5 and abs(rx - sx) < 0.5
+
+
 def test_ramp_removed():
     A = _field(); H, W = A.shape; yy, xx = np.mgrid[0:H, 0:W]
     B = A * np.exp(-2j * np.pi * (-6.0 * xx / W + 4.0 * yy / H))
