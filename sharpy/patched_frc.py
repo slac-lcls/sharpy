@@ -50,9 +50,25 @@ def _res(freq, f, thr):
     return freq[-1]
 
 
+def lowband_frc(A, B, frac=0.1, taper_frac=0.25):
+    """LONG-RANGE fidelity = mean FRC over the lowest `frac` of the spatial-frequency range. In
+    ptychography the low-q (long-range) phase is the LEAST-constrained quantity -- the transfer
+    function is suppressed at low q (Ophus, arXiv:2309.05250) = the connection-Laplacian low-q modes
+    (the Gramian/sync regime). So this low-band FRC, NOT the high-q resolution cutoff, is where sync /
+    probe recovery lifts quality; report it alongside patched_frc's resolution. A,B must be gauge-
+    aligned with the MINIMAL gauge only (global phase + shift + linear ramp = align_gauge poly_order=1);
+    removing higher-order (defocus/astigmatism) phase would erase the very low-q signal this measures."""
+    taper = int(min(A.shape) * taper_frac)
+    freq, f, thr = _frc1(A, B, taper)
+    m = (freq > 0) & (freq < frac * freq[-1])              # lowest decile, skip DC
+    return float(f[m].mean())
+
+
 def patched_frc(A, B, patch=96, stride=48, thr="2sig", taper_frac=0.25):
     """A=recon, B=GT (already globally gauge-aligned). Returns dict(median, std, p16, p84, res[], n).
-    thr='2sig' (per-ring curve) or a float (e.g. 0.5). Resolution reported in cyc/px (higher=better)."""
+    thr='2sig' (per-ring curve) or a float (e.g. 0.5). Resolution reported in cyc/px (higher=better).
+    NB: report lowband_frc() TOO -- the low-q (long-range) fidelity is the sync-relevant quantity that
+    the high-q resolution cutoff misses."""
     H, W = A.shape; taper = int(patch * taper_frac); out = []
     for y in range(0, H - patch + 1, stride):
         for x in range(0, W - patch + 1, stride):

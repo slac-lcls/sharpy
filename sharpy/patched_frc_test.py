@@ -44,6 +44,18 @@ def test_stats_shape_and_positive_errorbar():
     assert r["p16"] <= r["median"] <= r["p84"]
 
 
+def test_lowband_frc_drops_when_lowq_degraded():
+    """lowband_frc = long-range fidelity: high when low-q agrees, low when the low-q is decorrelated."""
+    rng = np.random.default_rng(5); H = W = 256
+    fy, fx = np.meshgrid(np.fft.fftfreq(H), np.fft.fftfreq(W), indexing="ij"); q = np.hypot(fy, fx)
+    F = np.fft.fft2(rng.standard_normal((H, W)) + 1j * rng.standard_normal((H, W)))
+    A = np.fft.ifft2(F * (q < 0.45)); FA = np.fft.fft2(A)
+    Nz = np.fft.fft2(rng.standard_normal((H, W)) + 1j * rng.standard_normal((H, W)))
+    good = A + 0.2 * np.std(A) * (rng.standard_normal((H, W)) + 1j * rng.standard_normal((H, W)))
+    lowbad = np.fft.ifft2(np.where(q < 0.05, Nz * np.std(FA), FA))   # low-q replaced by noise
+    assert pf.lowband_frc(A, good) > pf.lowband_frc(A, lowbad) + 0.1
+
+
 def test_erratic_field_has_larger_errorbar():
     """a field degraded NON-uniformly (half the subregions band-limited low) has a bigger error bar
     than a uniformly-degraded one -- the error bar is a spatial-uniformity diagnostic."""

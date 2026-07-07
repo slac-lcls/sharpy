@@ -23,9 +23,16 @@ defocus_dz()). Refs: Guizar-Sicairos/Thurman/Fienup Opt.Lett. 33,156 (2008); Mar
 et al., "Phase Aberrations in Diffraction Microscopy," arXiv:physics/0510033 (2005).
 
 Shift<->ramp COUPLE (each corrupts the other's naive estimate) -> estimate ramp COARSE from |FFT|
-registration (shift-immune) to break the deadlock, then translation (ramp-immune), then FINE ramp via
-|A||B|-weighted phase-slope fit of A*conj(B), iterate. Reusable & standalone; numpy host arrays.
+registration (shift-immune) to break the deadlock, then translation (ramp-immune), then the FINE
+polynomial via WRAP-FREE amplitude-weighted phase GRADIENTS (angle(conj(r_i)*r_{i+1}) never wraps and
+drops the global-phase constant automatically), iterate. Reusable & standalone; numpy host arrays.
 align_gauge(A, B) -> (B_aligned ~ A, params). Self-test plants a known gauge & recovers to ~1e-15.
+
+MINIMAL-GAUGE RULE for FRC / resolution evaluation: use poly_order=1 (global phase + shift + linear
+ramp = the true translation/phase gauge) ONLY. Do NOT pre-remove defocus/astigmatism (poly_order>=2)
+before an FRC -- in ptychography the low-q phase is genuinely under-determined (Ophus CTF suppression /
+Gramian low-q modes), so higher-order removal would ERASE the real long-range signal you want to
+measure (see patched_frc.lowband_frc). poly_order>=2 is for CHARACTERIZING aberrations, not pre-FRC.
 
   python -u gauge_align.py         # runs the self-test
 """
