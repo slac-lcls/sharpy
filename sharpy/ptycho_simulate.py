@@ -53,8 +53,8 @@ Ny = nny * Dy
 
 # make the illumination (astigmatic i.e. fx, fy different from 0)
 #illumination = make_probe(nx, ny, r1=0.03, r2=0.06, fx=+20, fy=-20)
-illumination,lens_mask = make_probe(nx, ny, r1=0.025*3, r2=0.085*3, fx=+20, fy=-20) #old
-#illumination,lens_mask = make_probe(nx, ny, r1=0.02*3, r2=0.06*3, fx=+20, fy=-20) #refine_illum #complex128
+#illumination,lens_mask = make_probe(nx, ny, r1=0.025*3, r2=0.085*3, fx=+20, fy=-20) #old
+illumination,lens_mask = make_probe(nx, ny, r1=0.02*3, r2=0.06*3, fx=+20, fy=-20) #refine_illum #complex128
 #illumination += illumination
 
 # Set a random seed for reproducibility

@@ -21,8 +21,19 @@ import os
 import numpy as np
 import h5py
 
+import config
+if config.GPU:
+    import cupy as cp
+    _xp = cp
+    def _tonp(a): return cp.asnumpy(a) if isinstance(a, cp.ndarray) else np.asarray(a)
+    def _toxp(a): return cp.asarray(a)
+else:
+    _xp = np
+    def _tonp(a): return np.asarray(a)
+    def _toxp(a): return np.asarray(a)
+
 from Operators import make_probe, map_frames, Splitc, cropmat
-from position_retrieval import shift_probe_fourier, apodize_probe
+from position_retrieval import shift_probe_fourier, taylor_shift_probe, apodize_probe, probe_derivatives
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -37,21 +48,36 @@ def transmission_object(Nx, Ny, contrast=0.69, phase_frac=0.5, gold_png=None):
     from PIL import Image
     density = np.array(Image.open(path), np.float32) / 63.0          # [0,1]
     obj = np.exp(contrast * (-1.0 + phase_frac * 1j) * density)      # ~1
-    return cropmat(np.asarray(obj, dtype=np.complex64), [Nx, Ny])
+    obj = np.asarray(obj, dtype=np.complex64)
+    r0 = (obj.shape[0] - Nx) // 2
+    r1 = (obj.shape[1] - Ny) // 2
+    return obj[r0:r0 + Nx, r1:r1 + Ny]
 
 
 def simulate_to_h5(fname, xi_x, xi_y, nx=32, nnx=16, step=3.5,
                    r1=0.075, r2=0.255, contrast=0.69, apodize=True,
-                   wavelength=0.1, detector_pixel_size=100.0, resolution=1.0):
+                   wavelength=0.1, detector_pixel_size=100.0, resolution=1.0,
+                   int_jitter_px=0, int_jitter_rng=None,
+                   shift_model="fourier"):
     """Write a dataset (transmission object + baked-in position errors) to
     `fname` in the ptycho_simulate.py schema, plus the true xi.
 
-    xi_x, xi_y : (nframes,) the per-frame sub-pixel position errors to bake in
-                 and later recover (nframes = nnx*nnx).
-    contrast   : Beer-Lambert exponent; ~0.69 is realistic weak contrast
-                 (|obj|~0.5-1), larger -> stronger contrast (easier position
-                 retrieval). NOTE: position retrieval needs adequate contrast
-                 AND small shift errors; weak contrast makes it much harder.
+    xi_x, xi_y      : (nframes,) unknown per-frame sub-pixel position errors to
+                      bake in and later recover (nframes = nnx*nnx).
+    contrast        : Beer-Lambert exponent; ~0.69 is realistic weak contrast
+                      (|obj|~0.5-1), larger -> stronger contrast (easier position
+                      retrieval). NOTE: position retrieval needs adequate contrast
+                      AND small shift errors; weak contrast makes it much harder.
+    int_jitter_px   : if > 0, add known integer noise uniform in
+                      [-int_jitter_px, int_jitter_px] to tx, ty (baked into the
+                      stored translations so the solver sees the correct integer
+                      map, matching the paper's "known ±1 px perturbations").
+    int_jitter_rng  : numpy RNG for the integer jitter (default: fixed seed 42).
+    shift_model     : "fourier" (default) — exact band-limited shift via FFT phase
+                      ramp; honest test since the solver inverts a Taylor model.
+                      "taylor" — 2nd-order Taylor shift matching the MATLAB
+                      Poverlap_branch2 convention; model-consistent with the solver
+                      → machine-precision convergence, replicates the paper exactly.
     """
     ny = nx
     nny = nnx
@@ -62,10 +88,9 @@ def simulate_to_h5(fname, xi_x, xi_y, nx=32, nnx=16, step=3.5,
     probe = make_probe(nx, ny, r1=r1, r2=r2)
     if isinstance(probe, tuple):
         probe = probe[0]
-    probe = np.asarray(probe / np.abs(probe).max(), dtype=np.complex64)
+    probe = _toxp(probe)
+    probe = (probe / _xp.abs(probe).max()).astype(_xp.complex64)
     if apodize:
-        # zero the probe at the borders so the exit wave fills <= 1/2 the frame
-        # -> |FT|^2 is not aliased (oversampling), and the probe shifts cleanly.
         probe = apodize_probe(probe)
 
     # hexagonal periodic scan; integer base positions (sub-pixel goes in xi)
@@ -77,24 +102,36 @@ def simulate_to_h5(fname, xi_x, xi_y, nx=32, nnx=16, step=3.5,
     ty = np.round(iy).ravel().astype(np.float64)
     nframes = tx.size
 
+    if int_jitter_px > 0:
+        jrng = int_jitter_rng if int_jitter_rng is not None else np.random.default_rng(42)
+        tx = tx + jrng.integers(-int_jitter_px, int_jitter_px + 1, nframes).astype(float)
+        ty = ty + jrng.integers(-int_jitter_px, int_jitter_px + 1, nframes).astype(float)
+
     xi_x = np.asarray(xi_x, dtype=np.float64)
     xi_y = np.asarray(xi_y, dtype=np.float64)
 
-    # bake the position errors into the data via the TRUE band-limited shift
-    # (Fourier phase ramp) -- not the Taylor model the solver inverts, so the
-    # test is honest (true shift in, Taylor model out).
-    probe_shifted = shift_probe_fourier(probe, xi_x, xi_y)
-    mapid = map_frames(tx, ty, nx, ny, Nx, Ny)
-    frames = Splitc(truth, mapid) * probe_shifted
-    data = np.abs(np.fft.fft2(frames)) ** 2          # measured intensity
+    truth_xp = _toxp(truth)
+    mapid = map_frames(_toxp(tx), _toxp(ty), nx, ny, Nx, Ny)
+    if shift_model == "taylor":
+        # Model-consistent with the solver (matches MATLAB Poverlap_branch2):
+        # data generated with the same 2nd-order Taylor shift the solver inverts,
+        # so the residual can reach machine precision at convergence.
+        dp = probe_derivatives(probe)
+        probe_shifted = taylor_shift_probe(dp, _toxp(xi_x), _toxp(xi_y))["O"]
+    else:
+        # Exact band-limited shift via FFT phase ramp — honest test since the
+        # solver inverts only a Taylor/linearized model.
+        probe_shifted = shift_probe_fourier(probe, _toxp(xi_x), _toxp(xi_y))
+    frames = Splitc(truth_xp, mapid) * probe_shifted
+    data = _tonp(_xp.abs(_xp.fft.fft2(frames)) ** 2)   # measured intensity
 
     detector_distance = nx * detector_pixel_size * resolution / wavelength
     translations = (tx + 1j * ty) * resolution        # physical-unit, like sim
 
     with h5py.File(fname, "w") as f:
         f["data"] = data.astype(np.float32)
-        f["probe"] = probe
-        f["truth"] = truth
+        f["probe"] = _tonp(probe)
+        f["truth"] = _tonp(truth_xp)
         f["translations"] = translations
         f["translations_x"] = tx
         f["translations_y"] = ty

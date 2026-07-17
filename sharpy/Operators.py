@@ -1795,20 +1795,11 @@ def refine_illumination_pairwise(
 
 
 def mse_calc(img0, img1):
-    # calculate the MSE between two images after global phase correction
-    
-    nnz = xp.size(img0)
-    # compute the best phase
-    phase = xp.dot(xp.reshape(xp.conj(img1), (1, nnz)), xp.reshape(img0, (nnz, 1)))[
-        0, 0
-    ]
-    phase = phase / xp.abs(phase)
-    # compute norm after correcting the phase
-    mse = xp.linalg.norm(img0 - img1 * phase)
-    #compute the best phase and scalar
-    #phase = xp.conj(phase) / xp.linalg.norm(img0)**2
-    #mse = xp.linalg.norm(img0 - img1 / phase)
-    return mse
+    # MSE after optimal complex scalar alignment: s = <img1, img0> / <img1, img1>
+    r = img1.ravel()
+    t = img0.ravel()
+    s = xp.dot(xp.conj(r), t) / (xp.dot(xp.conj(r), r) + 1e-30)
+    return xp.linalg.norm(t - s * r)
 
 def common_scale(img0,img1):
     scale = xp.dot(img0.ravel(),img1.ravel()) / xp.dot(img0.ravel(),img0.ravel())   

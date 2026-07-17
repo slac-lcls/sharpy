@@ -85,7 +85,7 @@ def build(seed=1, sigma_pix=0.8, probe_radii=None):
     )
 
 
-def run_method(name, p, niter):
+def run_method(name, p, niter, lam=0.0):
     hx = xp.zeros(p["nframes"])
     hy = xp.zeros(p["nframes"])
     dr0 = shift_rmse(p["xi_x"], p["xi_y"], hx, hy)
@@ -98,7 +98,7 @@ def run_method(name, p, niter):
         elif name == "coupled":
             hx, hy = position_solve_coupled(
                 p["frames_clean"], p["dp"], p["truth"], p["mapid"],
-                p["Nx"], p["Ny"], hx, hy, p["plan"], max_step=0.5)
+                p["Nx"], p["Ny"], hx, hy, p["plan"], max_step=0.5, lam=lam)
         elif name == "gradient":
             hx, hy = position_solve_gradient(
                 p["frames_data"], p["truth"], p["dp"], p["mapid"],
@@ -110,14 +110,29 @@ def run_method(name, p, niter):
 
 if __name__ == "__main__":
     # within-regime perturbation (< trust region / Taylor validity)
+    # for plabel, radii in (("smooth probe", None),
+    #                       ("zone-plate probe", (0.075, 0.255))): #I changed it to 0.195, 0.195 *4 <1
     for plabel, radii in (("smooth probe", None),
-                          ("zone-plate probe", (0.075, 0.255))):
+                           ("zone-plate probe", (0.075, 0.20))):
         p = build(seed=2, sigma_pix=0.35, probe_radii=radii)
         dr_init = shift_rmse(p["xi_x"], p["xi_y"], 0 * p["xi_x"], 0 * p["xi_y"])
         print(f"\n### {plabel}: frames={p['nframes']}, true shift RMS ~ {dr_init:.3f} px")
-        print(f"{'method':>9} | {'Delta_r start':>13} -> {'Delta_r end':>11} | {'time(s)':>8} | {'iters':>5}")
-        print("-" * 62)
-        # Gauss-Newton methods need few iters; steepest descent needs many.
-        for name, niter in (("diag", 15), ("coupled", 15), ("gradient", 200)):
+
+        is_zp = radii is not None
+
+        # --- baseline methods (diag and gradient, no lam) ---
+        print(f"\n{'method':>16} | {'Delta_r start':>13} -> {'Delta_r end':>11} | {'time(s)':>8} | {'iters':>5}")
+        print("-" * 70)
+        for name, niter in (("diag", 15), ("gradient", 200)):
             dr0, dr, dt = run_method(name, p, niter)
-            print(f"{name:>9} | {dr0:>13.3e} -> {dr:>11.3e} | {dt:>8.2f} | {niter:>5}")
+            print(f"{name:>16} | {dr0:>13.3e} -> {dr:>11.3e} | {dt:>8.2f} | {niter:>5}")
+
+        # --- coupled solver: sweep lambda (extra sweep only for zone-plate) ---
+        lam_values = [0.0, 1e-3, 1e-2, 1e-1, 0.5, 1.0] if is_zp else [0.0]
+        print(f"\ncoupled solver lambda sweep ({'zone-plate' if is_zp else 'smooth probe'}):")
+        print(f"{'coupled lam':>16} | {'Delta_r start':>13} -> {'Delta_r end':>11} | {'time(s)':>8} | {'iters':>5}")
+        print("-" * 70)
+        for lam in lam_values:
+            dr0, dr, dt = run_method("coupled", p, 15, lam=lam)
+            label = f"coupled lam={lam:.0e}" if lam > 0 else "coupled lam=0 (base)"
+            print(f"{label:>16} | {dr0:>13.3e} -> {dr:>11.3e} | {dt:>8.2f} | {'15':>5}")

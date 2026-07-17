@@ -241,8 +241,7 @@ def Alternating_projections(
         inormalization_split = Split(1/(normalization))
         #inormalization_split = Split(1/(normalization+1e-8))
         #frames_norm = Precondition_calc(frames, bw=Gramiam['bw'])
-        frames_norm = Precondition_calc(frames_data, bw=Gramiam['bw'])
-
+        ##frames_norm = Precondition_calc(frames_data, bw=Gramiam['bw'])
         #print('!!!frames_norm_shape',frames_norm.dtype,frames_norm.shape)
   
     timers["solver_init"] = timer() - t00
@@ -304,7 +303,8 @@ def Alternating_projections(
         # here goes the synchronization
         if sync==True:
             t0 = timer()
-            frames_norm = Precondition_calc(frames_data, bw=Gramiam['bw']) ###????
+            #frames_norm = Precondition_calc(frames_data, bw=Gramiam['bw']) ###????
+            frames_norm = Precondition_calc(frames, bw=Gramiam['bw']) ###????
             omega=synchronize_frames_c(frames, illumination, frames_norm, inormalization_split, Gramiam)
             frames=frames*omega
             timers["Sync"] += timer() - t0
@@ -1208,6 +1208,7 @@ def Alternating_projections_position(
     from position_retrieval import (
         probe_derivatives,
         taylor_shift_probe,
+        shift_probe_fourier,
         position_solve_diag,
         position_solve_coupled,
         position_plan,
@@ -1256,7 +1257,10 @@ def Alternating_projections_position(
             plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
 
     def probe_and_norm(xi_x, xi_y):
-        probe_stack = taylor_shift_probe(dp, xi_x, xi_y)["O"]  # (nframes, nx, ny)
+        if diag_method == "exact":
+            probe_stack = shift_probe_fourier(dp["O"], xi_x, xi_y)
+        else:
+            probe_stack = taylor_shift_probe(dp, xi_x, xi_y)["O"]
         normalization = Overlapc(xp.abs(probe_stack) ** 2, Nx, Ny, mapid)
         return probe_stack, normalization
 
@@ -1386,3 +1390,380 @@ def Alternating_projections_position(
     xi_x_total = xi_x + (translations_y0 - translations_y)
     xi_y_total = xi_y + (translations_x0 - translations_x)
     return img, frames, xi_x_total, xi_y_total, residuals
+
+
+def RAAR_position(
+    img,
+    illumination,
+    frames_data,
+    translations_x,
+    translations_y,
+    nx,
+    ny,
+    Nx,
+    Ny,
+    maxiter,
+    position_start=100,
+    position_every=1,
+    max_step=0.5,
+    beta=0.75,
+    reg=1e-10,
+    method="diag",
+    diag_method="taylor",
+    backend=None,
+    xi_x_init=None,
+    xi_y_init=None,
+    img_truth=None,
+    xi_x_truth=None,
+    xi_y_truth=None,
+    residuals_interval=1,
+):
+    """RAAR (Relaxed Averaged Alternating Reflections) with position retrieval.
+
+    Mirrors `Alternating_projections_position` but uses the RAAR outer loop
+    (Luke 2005) instead of AP -- matching the MATLAB `doraar0_shift.m`:
+
+        x      = xo + xno
+        xm     = Pf(x)            [Fourier magnitude projection]
+        xo_new = Po(xm)           [overlap projection]
+        xno_new= (1-2β)(xm-xo_new) + β·xno
+
+    β=0.75 (MATLAB default) adds momentum that makes RAAR converge much
+    faster than AP and stabilizes the coupled position solver.
+
+    Parameters
+    ----------
+    beta : float
+        RAAR feedback parameter (Luke 2005). 0.75 = MATLAB default.
+        β→0 is pure data projection; β→1 approaches HIO (Fienup).
+    All other parameters: same as `Alternating_projections_position`.
+    """
+    from Operators import Splitc, Overlapc, map_frames
+    from position_retrieval import (
+        probe_derivatives,
+        taylor_shift_probe,
+        shift_probe_fourier,
+        position_solve_diag,
+        position_solve_coupled,
+        position_plan,
+    )
+
+    nframes = frames_data.shape[0]
+    mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+    dp = probe_derivatives(illumination)
+
+    plan = None
+    if method == "coupled":
+        plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
+
+    xi_x = xp.zeros(nframes)
+    xi_y = xp.zeros(nframes)
+    translations_x0 = translations_x + 0.0
+    translations_y0 = translations_y + 0.0
+
+    if xi_x_init is not None:
+        xi_x = xi_x_init + 0.0
+        xi_y = xi_y_init + 0.0
+        n_x = xp.round(xi_x)
+        n_y = xp.round(xi_y)
+        translations_y = translations_y - n_x
+        translations_x = translations_x - n_y
+        xi_x = xi_x - n_x
+        xi_y = xi_y - n_y
+        mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+        if method == "coupled":
+            plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
+
+    def probe_and_norm(xi_x, xi_y):
+        if diag_method == "exact":
+            probe_stack = shift_probe_fourier(dp["O"], xi_x, xi_y)
+        else:
+            probe_stack = taylor_shift_probe(dp, xi_x, xi_y)["O"]
+        normalization = Overlapc(xp.abs(probe_stack) ** 2, Nx, Ny, mapid)
+        return probe_stack, normalization
+
+    probe_stack, normalization = probe_and_norm(xi_x, xi_y)
+
+    # RAAR state: xo = overlap part, xno = non-overlap part.
+    # Initialize with the overlap projection of the initial frames.
+    xo = Splitc(img, mapid) * probe_stack
+    xno = xp.zeros_like(xo)
+
+    nres = int(np.ceil(maxiter / residuals_interval))
+    residuals = xp.zeros((nres, 4), dtype=xp.float64)
+
+    if img_truth is not None:
+        nrm_truth = xp.linalg.norm(img_truth)
+    track_xi = xi_x_truth is not None and xi_y_truth is not None
+    if track_xi:
+        den_xi = xp.sum(xi_x_truth ** 2 + xi_y_truth ** 2)
+
+    for ii in range(int(maxiter)):
+        compute_residuals = (residuals_interval < np.inf) and (
+            np.mod(ii, residuals_interval) == 0
+        )
+
+        # Full iterate = overlap + non-overlap parts.
+        frames = xo + xno
+
+        # Fourier-magnitude projection xm = Pf(x).
+        frames_old = frames + 0.0
+        frames, mse_data = Project_data(
+            frames, frames_data, compute_residuals=compute_residuals
+        )
+        xm = frames  # alias for clarity
+
+        # Position update on cadence, after warmup.
+        if (
+            ii >= position_start
+            and position_every
+            and np.mod(ii, position_every) == 0
+        ):
+            # Fine sub-pixel refinement (Taylor linearisation).
+            if method == "coupled":
+                xi_x, xi_y = position_solve_coupled(
+                    xm, dp, img, mapid, Nx, Ny, xi_x, xi_y, plan,
+                    reg=reg, max_step=max_step, backend=backend,
+                )
+            else:
+                xi_x, xi_y = position_solve_diag(
+                    xm, dp, img, mapid, Nx, Ny, xi_x, xi_y,
+                    reg=reg, max_step=max_step, method=diag_method,
+                )
+            probe_stack, normalization = probe_and_norm(xi_x, xi_y)
+
+        # Overlap projection xo_new = Po(xm): update image, then split back.
+        nrm = xp.where(
+            xp.abs(normalization) < 1e-6 * float(xp.max(xp.abs(normalization))),
+            1.0, normalization,
+        )
+        img = Overlapc(xm * xp.conj(probe_stack), Nx, Ny, mapid) / nrm
+        xo_new = Splitc(img, mapid) * probe_stack
+
+        # RAAR non-overlap update (doraar0_shift.m line 192).
+        xno = (1.0 - 2.0 * beta) * (xm - xo_new) + beta * xno
+        xo = xo_new
+
+        if compute_residuals:
+            k = ii // residuals_interval
+            residuals[k, 1] = mse_data
+            residuals[k, 2] = xp.linalg.norm(xm - frames_old)
+            if img_truth is not None:
+                residuals[k, 0] = mse_calc(img_truth, img)
+            if track_xi:
+                tot_x = xi_x + (translations_y0 - translations_y)
+                tot_y = xi_y + (translations_x0 - translations_x)
+                residuals[k, 3] = xp.sqrt(
+                    xp.sum((tot_x - xi_x_truth) ** 2 + (tot_y - xi_y_truth) ** 2)
+                    / den_xi
+                )
+
+    if img_truth is not None and nrm_truth != 0:
+        residuals[:, 0] /= nrm_truth
+
+    xi_x_total = xi_x + (translations_y0 - translations_y)
+    xi_y_total = xi_y + (translations_x0 - translations_x)
+    # Return the full RAAR iterate xo + xno (not the intermediate xm).
+    frames = xo + xno
+    return img, frames, xi_x_total, xi_y_total, residuals
+
+
+def ADMM_position(
+    img,
+    illumination,
+    frames_data,
+    translations_x,
+    translations_y,
+    nx,
+    ny,
+    Nx,
+    Ny,
+    maxiter,
+    position_start=100,
+    position_every=1,
+    max_step=0.5,
+    rho=1.0,
+    dual_step=0.1,
+    reg=1e-10,
+    method="diag",
+    diag_method="taylor",
+    backend=None,
+    xi_x_init=None,
+    xi_y_init=None,
+    img_truth=None,
+    xi_x_truth=None,
+    xi_y_truth=None,
+    residuals_interval=1,
+):
+    """ADMM ptychography solver with position retrieval.
+
+    Splits the ptychography problem into a per-frame Fourier-magnitude
+    proximal step (z-update) and a global overlap consensus step (ψ-update),
+    coupled by dual variables u:
+
+        z_i  = prox_{||sqrt(d)-|F·||} ( S_i(ψ)·P - u_i )   [Fourier prox]
+        ψ    = ∑_i S_i†( (z_i + u_i) · conj(P) ) / ∑_i |P|²  [consensus]
+        u_i += z_i - S_i(ψ)·P                                 [dual update]
+
+    The Fourier proximal step: for each frame, the minimizer of
+        ρ/2 ||z - v||² + ||sqrt(d) - |Fz|||²
+    has closed form in Fourier space:
+        Z_k = F(v)_k · max(sqrt(d_k), 0) / max(|F(v)_k|, ε)   when ρ→0
+    For finite ρ the magnitude is blended toward the data:
+        |Z_k| = (ρ·|Fv_k| + sqrt(d_k)) / (ρ + 1)
+        Z_k   = F(v)_k · |Z_k| / max(|Fv_k|, ε)
+
+    Parameters
+    ----------
+    rho : float
+        ADMM penalty parameter (default 1.0). Controls blend in z-update:
+        ρ→0: pure Fourier magnitude projection (≈AP); ρ=2: balanced data/consensus.
+    dual_step : float
+        Step size on the dual variable update U += dual_step*(Aψ-Z).
+        Standard ADMM uses dual_step=1, but the non-convex Fourier magnitude
+        constraint causes U to diverge. dual_step=0.1 (default) damps this.
+        dual_step=0 → no dual memory → pure proximal AP.
+    All other parameters: same as RAAR_position / Alternating_projections_position.
+    """
+    from Operators import Splitc, Overlapc, map_frames
+    from position_retrieval import (
+        probe_derivatives,
+        taylor_shift_probe,
+        shift_probe_fourier,
+        position_solve_diag,
+        position_solve_coupled,
+        position_plan,
+    )
+
+    nframes = frames_data.shape[0]
+    mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+    dp = probe_derivatives(illumination)
+
+    plan = None
+    if method == "coupled":
+        plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
+
+    xi_x = xp.zeros(nframes)
+    xi_y = xp.zeros(nframes)
+    translations_x0 = translations_x + 0.0
+    translations_y0 = translations_y + 0.0
+
+    if xi_x_init is not None:
+        xi_x = xi_x_init + 0.0
+        xi_y = xi_y_init + 0.0
+        n_x = xp.round(xi_x)
+        n_y = xp.round(xi_y)
+        translations_y = translations_y - n_x
+        translations_x = translations_x - n_y
+        xi_x = xi_x - n_x
+        xi_y = xi_y - n_y
+        mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
+        if method == "coupled":
+            plan = position_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny)
+
+    def probe_and_norm(xi_x, xi_y):
+        if diag_method == "exact":
+            probe_stack = shift_probe_fourier(dp["O"], xi_x, xi_y)
+        else:
+            probe_stack = taylor_shift_probe(dp, xi_x, xi_y)["O"]
+        normalization = Overlapc(xp.abs(probe_stack) ** 2, Nx, Ny, mapid)
+        return probe_stack, normalization
+
+    probe_stack, normalization = probe_and_norm(xi_x, xi_y)
+
+    # ADMM variables in FOURIER SPACE (avoids Parseval scaling on rho):
+    #   Z : per-frame Fourier-domain consensus variable (diffraction patterns)
+    #   U : per-frame Fourier-domain dual (scaled: U = lambda/rho)
+    # Steady state: Z ≈ FFT(S_i(ψ)·P), U ≈ 0.
+    Z = xp.fft.fft2(Splitc(img, mapid) * probe_stack)
+    U = xp.zeros_like(Z)
+
+    # sqrt of the measured intensities (target Fourier magnitudes)
+    sqrt_data = xp.sqrt(xp.asarray(frames_data, dtype=xp.float32))
+
+    nres = int(np.ceil(maxiter / residuals_interval))
+    residuals = xp.zeros((nres, 4), dtype=xp.float64)
+
+    if img_truth is not None:
+        nrm_truth = xp.linalg.norm(img_truth)
+    track_xi = xi_x_truth is not None and xi_y_truth is not None
+    if track_xi:
+        den_xi = xp.sum(xi_x_truth ** 2 + xi_y_truth ** 2)
+
+    for ii in range(int(maxiter)):
+        compute_residuals = (residuals_interval < np.inf) and (
+            np.mod(ii, residuals_interval) == 0
+        )
+
+        # ---- Z-update: Fourier magnitude proximal (all in Fourier space) ------
+        # V_i = FFT(S_i(ψ)·P) - U_i  (Fourier-domain "target" for Z)
+        frames_F = xp.fft.fft2(Splitc(img, mapid) * probe_stack)
+        V = frames_F - U
+        Vmag = xp.abs(V)
+        # Proximal of ||sqrt(d)-|Z|||² + ρ/2||Z-V||² in Fourier space (no Parseval):
+        # |Z| = (2·sqrt(d) + ρ·|V|) / (2 + ρ),  phase(Z) = phase(V)
+        Z_mag = (2.0 * sqrt_data + rho * Vmag) / (2.0 + rho)
+        safe_mag = xp.where(Vmag < 1e-12, xp.ones_like(Vmag), Vmag)
+        Z = V * (Z_mag / safe_mag)
+
+        # Real-space z for position update and monitoring
+        z_real = xp.fft.ifft2(Z)
+
+        # data residual for monitoring ||sqrt(d) - |Z|||
+        if compute_residuals:
+            mse_data = float(xp.linalg.norm(sqrt_data - Z_mag))
+
+        # ---- position update: use real-space z as current frames ------------
+        if (
+            ii >= position_start
+            and position_every
+            and np.mod(ii, position_every) == 0
+        ):
+            if method == "coupled":
+                xi_x, xi_y = position_solve_coupled(
+                    z_real, dp, img, mapid, Nx, Ny, xi_x, xi_y, plan,
+                    reg=reg, max_step=max_step, backend=backend,
+                )
+            else:
+                xi_x, xi_y = position_solve_diag(
+                    z_real, dp, img, mapid, Nx, Ny, xi_x, xi_y,
+                    reg=reg, max_step=max_step, method=diag_method,
+                )
+            probe_stack, normalization = probe_and_norm(xi_x, xi_y)
+
+        # ---- ψ-update: overlap consensus from IFFT(Z + U) -------------------
+        # ψ = ∑_i S_i†(IFFT(Z_i + U_i)·conj(P)) / ∑_i |P|²
+        ZpU_real = xp.fft.ifft2(Z + U)
+        nrm = xp.where(
+            xp.abs(normalization) < 1e-6 * float(xp.max(xp.abs(normalization))),
+            1.0, normalization,
+        )
+        img = Overlapc(ZpU_real * xp.conj(probe_stack), Nx, Ny, mapid) / nrm
+
+        # ---- dual update (Fourier domain, damped) ---------------------------
+        # Standard ADMM: U += Aψ - Z.  For non-convex Fourier magnitude
+        # constraint, full step causes U→∞.  dual_step<1 prevents divergence.
+        frames_F_new = xp.fft.fft2(Splitc(img, mapid) * probe_stack)
+        U = U + dual_step * (frames_F_new - Z)
+
+        if compute_residuals:
+            k = ii // residuals_interval
+            residuals[k, 1] = mse_data
+            # primal residual ||Z - FFT(S(ψ)·P)||_F in Fourier
+            residuals[k, 2] = float(xp.linalg.norm(Z - frames_F_new))
+            if img_truth is not None:
+                residuals[k, 0] = mse_calc(img_truth, img)
+            if track_xi:
+                tot_x = xi_x + (translations_y0 - translations_y)
+                tot_y = xi_y + (translations_x0 - translations_x)
+                residuals[k, 3] = xp.sqrt(
+                    xp.sum((tot_x - xi_x_truth) ** 2 + (tot_y - xi_y_truth) ** 2)
+                    / den_xi
+                )
+
+    if img_truth is not None and nrm_truth != 0:
+        residuals[:, 0] /= nrm_truth
+
+    xi_x_total = xi_x + (translations_y0 - translations_y)
+    xi_y_total = xi_y + (translations_x0 - translations_x)
+    return img, z_real, xi_x_total, xi_y_total, residuals

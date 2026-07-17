@@ -42,6 +42,10 @@ if config.GPU:
     xp = cp
     import cupyx.scipy.sparse as _sparse
     import cupyx.scipy.sparse.linalg as _splinalg
+
+    # load zQQz2.cu once at import time
+    _zQQz2_src = open(os.path.join(os.path.dirname(__file__), "src/zQQz2.cu")).read()
+    _dotp2_kernel = cp.RawKernel(_zQQz2_src, "dotp2", jitify=True, options=("--std=c++17",))
 else:
     xp = np
     import scipy.sparse as _sparse
@@ -480,15 +484,64 @@ if _HAVE_NUMBA:
             ba[ii] = sba
 
 
+def _braket_coupled_cuda(frames, pL, pR, qq, col, row, dx, dy, bw):
+    """GPU braket using the zQQz2.cu fused kernel (dotp2).
+
+    Replaces the Python for-loop with two fused CUDA launches:
+      ab[ii] = sum_overlap conj(frames_a * conj(pL_a)) * (frames_b * conj(pR_b) * qq_b)
+      ba[ii] = same formula with a<->b, displacement negated.
+
+    All inputs must be CuPy arrays. frames/pL/pR/qq shape: (nframes, h, w).
+    col/row: pair indices (size_t); dx/dy: displacements (int64); bw: int border.
+    """
+    nthreads = 128
+    nnz = int(len(col))
+    nframes, fh, fw = frames.shape
+
+    frames = frames.astype(cp.complex64, copy=False)
+    pL     = pL.astype(cp.complex64, copy=False)
+    pR     = pR.astype(cp.complex64, copy=False)
+    qq     = qq.astype(cp.complex64, copy=False)
+
+    # frames_norm=ones → no in-kernel preconditioning; we precondition in Python
+    frames_norm = cp.ones(nframes, dtype=cp.complex64)
+
+    col_gpu = cp.asarray(col).astype(cp.uint64)
+    row_gpu = cp.asarray(row).astype(cp.uint64)
+    dx_gpu  = cp.asarray(dx).astype(cp.int64)
+    dy_gpu  = cp.asarray(dy).astype(cp.int64)
+
+    ab = cp.empty(nnz, dtype=cp.complex64)
+    ba = cp.empty(nnz, dtype=cp.complex64)
+
+    # ab: left=col frame, right=row frame, displacement (dx, dy)
+    _dotp2_kernel(
+        (nnz,), (nthreads,),
+        (ab, frames, frames_norm, pL, pR, qq,
+         col_gpu, row_gpu, dx_gpu, dy_gpu,
+         cp.int32(bw), cp.int32(nnz), cp.int32(fh), cp.int32(fw))
+    )
+
+    # ba: left=row frame, right=col frame, displacement (-dx, -dy)
+    _dotp2_kernel(
+        (nnz,), (nthreads,),
+        (ba, frames, frames_norm, pL, pR, qq,
+         row_gpu, col_gpu, -dx_gpu, -dy_gpu,
+         cp.int32(bw), cp.int32(nnz), cp.int32(fh), cp.int32(fw))
+    )
+
+    return ab, ba
+
+
 def _braket_coupled(frames, pL, pR, qq, col, row, dx, dy, bw, backend=None):
     """Coupled overlap inner products for both pair orientations.
 
     Dispatches on the selected backend (see set_kernel_backend / _resolve_backend):
-    "numba" (parallel), "omp" (OpenMP C), or "python" reference. On GPU the
-    array (CuPy) reference is always used (numba/omp are CPU-only).
+    "numba" (parallel), "omp" (OpenMP C), or "python" reference. On GPU uses
+    the fused zQQz2.cu kernel (dotp2) for both ab and ba in two CUDA launches.
     """
     if config.GPU:
-        return _braket_coupled_ref(frames, pL, pR, qq, col, row, dx, dy, bw)
+        return _braket_coupled_cuda(frames, pL, pR, qq, col, row, dx, dy, bw)
 
     name = _resolve_backend(backend)
 
@@ -616,6 +669,7 @@ def position_solve_coupled(
     xi_y,
     plan,
     reg=1e-10,
+    lam=0.0,
     max_step=0.5,
     backend=None,
 ):
@@ -684,11 +738,16 @@ def position_solve_coupled(
     D = _sparse.diags(d)
     HH = (D @ H @ D).tocsr()
     HH = (HH + HH.T) * 0.5
+    if lam > 0:
+        HH = HH + lam * _sparse.eye(HH.shape[0])
 
-    try:
-        y = _splinalg.spsolve(HH, D @ rhs)
-    except Exception:
-        y, _ = _splinalg.cg(HH, D @ rhs, maxiter=200)
+    if config.GPU:
+        y, _ = _splinalg.cg(HH, D @ rhs, maxiter=500)
+    else:
+        try:
+            y = _splinalg.spsolve(HH, D @ rhs)
+        except Exception:
+            y, _ = _splinalg.cg(HH, D @ rhs, maxiter=500)
     sol = d * y
 
     dxi_x = sol[:nframes]
@@ -710,6 +769,7 @@ def position_solve_coupled(
 # This is the basin-free coarse stage of a coarse-to-fine pipeline
 # (multiplex comb -> exact re-linearization); see position_multiplex_capture_test.py.
 # ---------------------------------------------------------------------------
+
 def multiplex_prelocalize(frames_data, img, dp, mapid, radius=4):
     """Coarse integer per-frame shift from a multiplex comb on the intensity data.
 
