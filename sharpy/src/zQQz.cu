@@ -125,3 +125,89 @@ dotp(
         }
 
 
+
+/* dotp_fetch: SM's fetch-normalization variant (2026-07-18). Identical math and reduction order to dotp,
+   with ONE change: the normalization is read from the OBJECT-SIZED canvas `nu` at the absolute pixel
+   (per-frame origins ax0/ay0, decoded from the same map_frames convention Splitc uses) instead of from a
+   frame-sized Splitc stack -- eliminating the ~overlap-factor redundant copy (e.g. 537 MB -> 19 MB at
+   4096 x 128^2). The toroidal wrap uses compare-subtract, not %, because 64-bit integer division is the
+   expensive op on GPU (measured: % costs 1.5x total kernel time; cond-sub costs ~1.1x). Bit-exact vs
+   dotp: same complex64 values loaded, same flat-pos loop order (validated in sync_fetch_test.py). */
+extern "C" __global__ void
+dotp_fetch(
+    thrust::complex< float > * value,
+    thrust::complex< float> * frames,
+    thrust::complex< float> * frames_norm,
+    thrust::complex< float> * illumination,
+    const thrust::complex< float> * nu,     /* object-sized canvas, row stride canW */
+    const long long * ax0,                  /* per-frame fast-axis (x) origin in canvas */
+    const long long * ay0,                  /* per-frame slow-axis (y) origin in canvas */
+    size_t * col,
+    size_t * row,
+    long long int * dx,
+    long long int * dy,
+    int bw,
+    int nnz,
+    int frame_height, int frame_width,
+    int canH, int canW) {
+
+        typedef cub::BlockReduce< float , 128> BlockReduce;
+        __shared__ typename BlockReduce::TempStorage temp_storage;
+
+        int ii = blockIdx.x ;
+        if (ii >= nnz) return;
+
+        int col00 = col[ii];
+        int row00 = row[ii];
+        int shiftl = col00 * frame_height * frame_width;
+        int shiftr = row00 * frame_height * frame_width;
+
+        thrust::complex< float> dd1 = frames_norm[col[ii]];
+        thrust::complex< float> dd2 = frames_norm[row[ii]];
+
+        long long int Dx = frame_width - abs(dx[ii]) - 2*bw;
+        long long int Dy = frame_height - abs(dy[ii]) - 2*bw;
+
+        /* overlap-window corner in frame col00's local coords (same decomposition as DD in dotp) */
+        long long int lx0 = (-dx[ii] + abs(dx[ii])) / 2 + bw;
+        long long int ly0 = (-dy[ii] + abs(dy[ii])) / 2 + bw;
+        long long int Dij = dx[ii] + dy[ii] * frame_width + (row00 - col00) * frame_height * frame_width;
+
+        long long int fx0 = ax0[col00];
+        long long int fy0 = ay0[col00];
+
+        thrust::complex<float> Sum0 = 0;
+        size_t ii1, ii2, ii3, ii4, iin;
+
+        for (size_t pos = threadIdx.x; pos < (size_t)(Dx * Dy); pos += blockDim.x){
+                long long int ly = ly0 + (long long int)(pos / Dx);
+                long long int lx = lx0 + (long long int)(pos % Dx);
+                ii3 = (size_t)(ly * frame_width + lx);
+                ii1 = ii3 + shiftl;
+                ii2 = ii1 + Dij;
+                ii4 = ii2 - shiftr;
+                /* absolute canvas pixel; origins < can, locals < frame <= can => at most one wrap */
+                long long int ay = fy0 + ly; if (ay >= canH) ay -= canH;
+                long long int ax = fx0 + lx; if (ax >= canW) ax -= canW;
+                iin = (size_t)(ay * canW + ax);
+
+                if(illumination){
+                    Sum0 += thrust::conj(frames[ii1]) * illumination[ii3] * frames[ii2] * thrust::conj(illumination[ii4]) * nu[iin]; }
+                else{
+                    Sum0 += thrust::conj(frames[ii1])  * frames[ii2] * nu[iin];
+                }
+
+                }
+
+        float Sum_r = BlockReduce(temp_storage).Sum(Sum0.real());
+        __syncthreads();
+        float Sum_i = BlockReduce(temp_storage).Sum(Sum0.imag());
+        thrust::complex< float >  Sum1(Sum_r, Sum_i);
+
+        /*we know it is hermitian*/
+        if (col00 == row00)
+           Sum1.imag(0.0f);
+
+        if (threadIdx.x == 0)
+            value[ii] = Sum1/(dd1 * dd2);
+        }
