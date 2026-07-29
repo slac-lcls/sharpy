@@ -28,10 +28,11 @@ except Exception:                       # no mpi4py -> single process, still run
 
 try:
     import cupy as cp                   # optional; the smoke test stays on CPU
-    # Pin each rank to its own GPU (devmanager pattern).
-    # On Perlmutter: 4 GPUs/node, one rank per GPU → rank % 4 gives the right device.
-    # Enable CUDA-aware MPI with: export MPICH_GPU_SUPPORT_ENABLED=1
-    cp.cuda.Device(RANK % 4).use()
+    # On Perlmutter with --gpus-per-task=1, SLURM sets CUDA_VISIBLE_DEVICES so
+    # each task sees only its own GPU as device 0.  Always use Device(0).
+    # The old RANK % 4 pattern fails at N>1 because device 1+ don't exist in
+    # that task's CUDA_VISIBLE_DEVICES view → cp = None → _xp = np.
+    cp.cuda.Device(0).use()
 except Exception:
     cp = None
 
@@ -75,6 +76,18 @@ def mpi_allSum(buf, cuda=False):
 
 def mpi_bcast(obj, root=0):
     return obj if (_COMM is None or SIZE == 1) else _COMM.bcast(obj, root=root)
+
+
+def mpi_bcast_array(arr, root=0):
+    """Broadcast a numpy array using the MPI buffer protocol (avoids pickle size limits)."""
+    if _COMM is None or SIZE == 1:
+        return arr
+    meta = (arr.shape, arr.dtype.str) if RANK == root else None
+    shape, dtype_str = _COMM.bcast(meta, root=root)
+    if RANK != root:
+        arr = np.empty(shape, dtype=np.dtype(dtype_str))
+    _COMM.Bcast(arr, root=root)
+    return arr
 
 
 def mpi_barrier():
@@ -377,7 +390,8 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
                 nx, ny, Nx, Ny, normalization,
                 F_local, frames_norm, decomp,
                 sync=True, sync_this=True,
-                num_iter=5, frame_batch=1024, reg=1e-8):
+                num_iter=5, frame_batch=1024, reg=1e-8,
+                object_halo=None):
     """
     One distributed AP iteration with optional Gramian phase sync.
 
@@ -403,6 +417,14 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
     decomp      : dict from get_2d_decomposition (frame_to_rank, counts, global_to_local)
     sync        : enable Gramian sync at all (False keeps pure AP behaviour)
     sync_this   : whether to sync THIS iteration (caller computes ii%sync_interval==0)
+    object_halo : dict from mpi_object_halo.setup_object_halo(...), or None.
+                  When given, PASS B sums only the overlap strips between
+                  ranks (O(halo), independent of rank count) instead of
+                  mpi_allSum-ing the whole Nx x Ny canvas -- see
+                  mpi_object_halo.py / validate_object_halo.py. The returned
+                  img is then only correct inside object_halo['bbox_own'] on
+                  each rank (the object is no longer replicated); callers
+                  that need a full replicated canvas must keep object_halo=None.
     """
     local_nframes = local_data.shape[0]
 
@@ -422,16 +444,22 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
                                  nx, ny, Nx, Ny, num_iter=num_iter)
         F_local *= omega.reshape(-1, 1, 1)
 
-    # PASS B: batched overlap accumulation → AllSum → image update
+    # PASS B: batched overlap accumulation → AllSum (or halo exchange) → image update
     img0 = _xp.zeros((Nx, Ny), dtype=_xp.complex64)
     for s in range(0, local_nframes, frame_batch):
         e = min(local_nframes, s + frame_batch)
         overlap_cuda(img0, F_local[s:e], local_translations[s:e], illumination)
 
-    is_gpu = cp is not None and isinstance(img0, cp.ndarray)
-    img0_cpu = img0.get() if is_gpu else img0
-    img_global_cpu = mpi_allSum(img0_cpu)
-    img_global = _xp.asarray(img_global_cpu) if is_gpu else img_global_cpu
+    if object_halo is not None:
+        from mpi_object_halo import exchange_object_halo
+        exchange_object_halo(img0, object_halo)     # <-- replaces mpi_allSum(img0)
+        img_global = img0
+    else:
+        is_gpu = cp is not None and isinstance(img0, cp.ndarray)
+        img0_cpu = img0.get() if is_gpu else img0
+        img_global_cpu = mpi_allSum(img0_cpu)
+        img_global = _xp.asarray(img_global_cpu) if is_gpu else img_global_cpu
+
     eps = reg * float(_xp.max(_xp.abs(normalization)).real)
     return img_global / (normalization + eps)
 
@@ -876,6 +904,267 @@ def validate_coarse_gauge(n_out=14, k_loc=10):
         assert ok, f"coarse gauge NMSE={nmse:.4f} >= 0.5 — inter-rank sync not helping"
 
 
+# ===========================================================================
+# Scaling benchmarks — Workstream B/C2 deliverables
+# ===========================================================================
+import time as _time
+
+
+def _cuda_sync():
+    if cp is not None:
+        cp.cuda.runtime.deviceSynchronize()
+
+
+def mpi_AP_step_timed(img, local_data, illumination, local_translations,
+                      nx, ny, Nx, Ny, normalization, F_local, frames_norm,
+                      frame_batch=1024, reg=1e-8, object_halo=None):
+    """
+    One distributed AP iteration (no Gramian sync).
+    Returns (img_updated, t_compute, t_sync) where:
+      t_compute = PASS A + PASS B GPU wall time (local per-rank work)
+      t_sync    = GPU->CPU staging + MPI AllReduce/halo-exchange + CPU->GPU staging
+    CUDA-syncs before each timing boundary for accurate GPU measurements.
+
+    object_halo : dict from mpi_object_halo.setup_object_halo(...), or None.
+                  When given, PASS B sums only the overlap strips between
+                  ranks instead of mpi_allSum-ing the whole Nx x Ny canvas --
+                  see mpi_object_halo.py. img is then only correct inside
+                  object_halo['tiles_own'] on each rank.
+    """
+    local_nframes = local_data.shape[0]
+
+    _cuda_sync()
+    t0 = _time.perf_counter()
+
+    # PASS A: split + FFT projection
+    for s in range(0, local_nframes, frame_batch):
+        e = min(local_nframes, s + frame_batch)
+        fb = _xp.zeros((e - s, nx, ny), dtype=_xp.complex64)
+        split_cuda(img, fb, local_translations[s:e], illumination)
+        fb, _ = Project_data(fb, local_data[s:e], compute_residuals=False)
+        F_local[s:e] = fb
+        frames_norm[s:e] = _xp.linalg.norm(fb, axis=(1, 2)).astype(_xp.complex64)
+
+    # PASS B: overlap accumulation
+    img0 = _xp.zeros((Nx, Ny), dtype=_xp.complex64)
+    for s in range(0, local_nframes, frame_batch):
+        e = min(local_nframes, s + frame_batch)
+        overlap_cuda(img0, F_local[s:e], local_translations[s:e], illumination)
+
+    _cuda_sync()
+    t_compute = _time.perf_counter() - t0
+
+    # Sync: GPU->CPU + AllReduce/halo-exchange collective + CPU->GPU
+    t0 = _time.perf_counter()
+    if object_halo is not None:
+        from mpi_object_halo import exchange_object_halo
+        exchange_object_halo(img0, object_halo)
+        img_global = img0
+    else:
+        is_gpu = cp is not None and isinstance(img0, cp.ndarray)
+        img0_cpu = img0.get() if is_gpu else img0
+        img_global_cpu = mpi_allSum(img0_cpu)
+        img_global = _xp.asarray(img_global_cpu) if is_gpu else img_global_cpu
+    t_sync = _time.perf_counter() - t0
+
+    eps = reg * float(_xp.max(_xp.abs(normalization)).real)
+    return img_global / (normalization + eps), t_compute, t_sync
+
+
+_STRONG_NNX = 64    # 4096 frames — Stefano guide §3
+
+_WEAK_NNX = {       # growing-object ladder — Stefano guide §4
+    1:  45,         # 2025 frames
+    2:  64,         # 4096 frames  (~2048/rank)
+    4:  90,         # 8100 frames  (~2025/rank)
+    8: 128,         # 16384 frames (~2048/rank)
+}
+
+
+def _run_ap_benchmark(NNX, nwarmup=5, ntimed=20, tag=""):
+    """Simulate NNX*NNX frames, 2D decomp, run AP with compute/sync timing."""
+    if not _SHARPY:
+        if RANK == 0:
+            print(f"[bench{tag}] sharpy not available — run on GPU node")
+        return None
+
+    from poster_simulate import simulate
+
+    if RANK == 0:
+        print(f"[bench{tag}] ranks={SIZE}  NNX={NNX}  nframes={NNX*NNX}", flush=True)
+
+    data, illumination, truth, tx, ty, nframes, nx, ny, Nx, Ny = simulate(NNX)
+
+    tx_np   = tx.get()   if (cp is not None and isinstance(tx,   cp.ndarray)) else np.array(tx)
+    ty_np   = ty.get()   if (cp is not None and isinstance(ty,   cp.ndarray)) else np.array(ty)
+    data_np = data.get() if (cp is not None and isinstance(data, cp.ndarray)) else np.array(data)
+
+    decomp        = get_2d_decomposition(tx_np, ty_np)
+    mf            = decomp['my_frames']
+    local_data_xp = _xp.asarray(data_np[mf])
+    local_trans   = (_xp.asarray(tx_np[mf]) + 1j * _xp.asarray(ty_np[mf])).astype(_xp.complex64)
+
+    normalization = _compute_normalization(illumination, local_trans, Nx, Ny)
+
+    # SHARPY_NO_HALO=1 forces the old full-canvas AllReduce path, for
+    # apples-to-apples before/after scaling comparisons.
+    object_halo = None
+    if _os.environ.get("SHARPY_NO_HALO", "0") != "1":
+        from mpi_object_halo import setup_object_halo
+        object_halo = setup_object_halo(local_trans, nx, ny, Nx, Ny)
+
+    local_nframes = local_data_xp.shape[0]
+    F_local     = _xp.zeros((local_nframes, nx, ny), dtype=_xp.complex64)
+    frames_norm = _xp.zeros(local_nframes, dtype=_xp.complex64)
+    img         = _xp.ones((Nx, Ny), dtype=_xp.complex64)
+
+    # Warmup
+    for _ in range(nwarmup):
+        img, _, _ = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
+                                      nx, ny, Nx, Ny, normalization, F_local, frames_norm,
+                                      object_halo=object_halo)
+    mpi_barrier()
+
+    # Timed iterations — barrier before each so all ranks start together
+    times_compute = []
+    times_sync    = []
+    for _ in range(ntimed):
+        mpi_barrier()
+        img, tc, ts = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
+                                        nx, ny, Nx, Ny, normalization, F_local, frames_norm,
+                                        object_halo=object_halo)
+        times_compute.append(tc)
+        times_sync.append(ts)
+    mpi_barrier()
+
+    if RANK == 0:
+        tc = float(np.median(times_compute))
+        ts = float(np.median(times_sync))
+        print(f"  frames/rank={local_nframes}  Nx={Nx}  Ny={Ny}")
+        print(f"  compute={tc*1000:.1f}ms  sync={ts*1000:.1f}ms  "
+              f"total={(tc+ts)*1000:.1f}ms/iter", flush=True)
+        return dict(ranks=SIZE, NNX=NNX, nframes=NNX*NNX, Nx=Nx, Ny=Ny,
+                    local_nframes=local_nframes, tc=tc, ts=ts, total=tc+ts)
+    return None
+
+
+def _run_ap_benchmark_h5(h5path, nwarmup=5, ntimed=20, tag=""):
+    """Like _run_ap_benchmark but loads real data from an H5 file."""
+    if not _SHARPY:
+        if RANK == 0:
+            print(f"[bench{tag}] sharpy not available — run on GPU node")
+        return None
+
+    # ONLY rank 0 touches the filesystem — avoids Lustre MDS stalls on other nodes.
+    # A bcast of a found-flag syncs everyone before any MPI collective is attempted.
+    data_np = illum_np = tx_np = ty_np = None
+    if RANK == 0:
+        import h5py, os
+        if os.path.exists(h5path):
+            with h5py.File(h5path, "r") as fid:
+                data_np  = np.array(fid["data"],           dtype=np.float32)
+                illum_np = np.array(fid["probe"],          dtype=np.complex64)
+                tx_np    = np.array(fid["translations_x"], dtype=np.float32).reshape(-1)
+                ty_np    = np.array(fid["translations_y"], dtype=np.float32).reshape(-1)
+        else:
+            print(f"[bench{tag}] {h5path} not found — falling back to simulate", flush=True)
+
+    found = mpi_bcast(data_np is not None)   # small bool, pickle fine
+    if not found:
+        return None
+
+    data_np  = mpi_bcast_array(data_np)
+    illum_np = mpi_bcast_array(illum_np)
+    tx_np    = mpi_bcast_array(tx_np)
+    ty_np    = mpi_bcast_array(ty_np)
+
+    nframes, nx, ny = data_np.shape
+    Nx = int(tx_np.max() - tx_np.min()) + nx
+    Ny = int(ty_np.max() - ty_np.min()) + ny
+
+    if RANK == 0:
+        print(f"[bench{tag}] ranks={SIZE}  nframes={nframes}  Nx={Nx}  Ny={Ny}", flush=True)
+
+    illumination  = _xp.asarray(illum_np)
+    decomp        = get_2d_decomposition(tx_np, ty_np)
+    mf            = decomp['my_frames']
+    local_data_xp = _xp.asarray(data_np[mf])
+    local_trans   = (_xp.asarray(tx_np[mf]) + 1j * _xp.asarray(ty_np[mf])).astype(_xp.complex64)
+
+    normalization = _compute_normalization(illumination, local_trans, Nx, Ny)
+
+    # SHARPY_NO_HALO=1 forces the old full-canvas AllReduce path, for
+    # apples-to-apples before/after scaling comparisons.
+    object_halo = None
+    if _os.environ.get("SHARPY_NO_HALO", "0") != "1":
+        from mpi_object_halo import setup_object_halo
+        object_halo = setup_object_halo(local_trans, nx, ny, Nx, Ny)
+
+    local_nframes = local_data_xp.shape[0]
+    F_local     = _xp.zeros((local_nframes, nx, ny), dtype=_xp.complex64)
+    frames_norm = _xp.zeros(local_nframes, dtype=_xp.complex64)
+    img         = _xp.ones((Nx, Ny), dtype=_xp.complex64)
+
+    for _ in range(nwarmup):
+        img, _, _ = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
+                                      nx, ny, Nx, Ny, normalization, F_local, frames_norm,
+                                      object_halo=object_halo)
+    mpi_barrier()
+
+    times_compute = []
+    times_sync    = []
+    for _ in range(ntimed):
+        mpi_barrier()
+        img, tc, ts = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
+                                        nx, ny, Nx, Ny, normalization, F_local, frames_norm,
+                                        object_halo=object_halo)
+        times_compute.append(tc)
+        times_sync.append(ts)
+    mpi_barrier()
+
+    if RANK == 0:
+        tc = float(np.median(times_compute))
+        ts = float(np.median(times_sync))
+        print(f"  frames/rank={local_nframes}")
+        print(f"  compute={tc*1000:.1f}ms  sync={ts*1000:.1f}ms  "
+              f"total={(tc+ts)*1000:.1f}ms/iter", flush=True)
+        return dict(ranks=SIZE, nframes=nframes, Nx=Nx, Ny=Ny,
+                    local_nframes=local_nframes, tc=tc, ts=ts, total=tc+ts)
+    return {}   # non-None: signals H5 benchmark completed (non-rank-0 sentinel)
+
+
+_STRONG_H5 = "/sdf/home/d/dnyanhet/sharpy_fresh/sharpy/refine_illum_large.h5"
+
+
+def benchmark_mpi_strong(nwarmup=5, ntimed=50):
+    """Strong scaling: fixed real dataset, vary ranks."""
+    result = _run_ap_benchmark_h5(_STRONG_H5, nwarmup=nwarmup, ntimed=ntimed, tag="-strong")
+    if result is None:
+        # H5 unavailable — fall back to synthetic 4096-frame data
+        _run_ap_benchmark(_STRONG_NNX, nwarmup=nwarmup, ntimed=ntimed, tag="-strong")
+
+
+_WEAK_H5 = {    # growing-object ladder — guide §4, generated with NX=128 DX=40
+    1: "/sdf/home/d/dnyanhet/refine_45.h5",   # 2025 frames, 1908x1908
+    2: "/sdf/home/d/dnyanhet/refine_64.h5",   # 4096 frames, 2668x2668
+    4: "/sdf/home/d/dnyanhet/refine_90.h5",   # 8100 frames, 3708x3708
+    8: "/sdf/home/d/dnyanhet/refine_128.h5",  # 16384 frames, 5228x5228
+}
+
+
+def benchmark_mpi_weak(nwarmup=5, ntimed=50):
+    """Weak scaling: growing-object H5 ladder per Stefano guide §4."""
+    h5path = _WEAK_H5.get(SIZE)
+    if h5path is None:
+        if RANK == 0:
+            print(f"[bench-weak] no H5 entry for SIZE={SIZE}")
+        return
+    result = _run_ap_benchmark_h5(h5path, nwarmup=nwarmup, ntimed=ntimed, tag="-weak")
+    if result is None:
+        NNX = _WEAK_NNX.get(SIZE, _STRONG_NNX)
+        _run_ap_benchmark(NNX, nwarmup=nwarmup, ntimed=ntimed, tag="-weak")
+
+
 if __name__ == "__main__":
     import sys
     if "--validate-ap" in sys.argv:
@@ -886,6 +1175,10 @@ if __name__ == "__main__":
         validate_distributed_gather()
     elif "--validate-coarse" in sys.argv:
         validate_coarse_gauge()
+    elif "--benchmark-strong" in sys.argv:
+        benchmark_mpi_strong()
+    elif "--benchmark-weak" in sys.argv:
+        benchmark_mpi_weak()
     else:
         smoke_test()
     mpi_barrier()
