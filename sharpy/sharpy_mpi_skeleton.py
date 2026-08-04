@@ -391,7 +391,7 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
                 F_local, frames_norm, decomp,
                 sync=True, sync_this=True,
                 num_iter=5, frame_batch=1024, reg=1e-8,
-                object_halo=None):
+                object_halo=None, eps=None, halo_geometry=None):
     """
     One distributed AP iteration with optional Gramian phase sync.
 
@@ -422,9 +422,17 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
                   ranks (O(halo), independent of rank count) instead of
                   mpi_allSum-ing the whole Nx x Ny canvas -- see
                   mpi_object_halo.py / validate_object_halo.py. The returned
-                  img is then only correct inside object_halo['bbox_own'] on
+                  img is then only correct inside object_halo['tiles_own'] on
                   each rank (the object is no longer replicated); callers
                   that need a full replicated canvas must keep object_halo=None.
+    eps         : pre-computed reg * max(abs(normalization)), or None to
+                  compute it here. normalization is static across iterations,
+                  so callers running a loop should compute this once outside
+                  it instead of forcing a full-canvas device sync every call.
+    halo_geometry : dict from mpi_halo.setup_halo_geometry(...), or None.
+                  Passed through to mpi_gramian_sync -- see its docstring.
+                  Build once (positions-only), reuse across every sync_this
+                  call while positions are frozen.
     """
     local_nframes = local_data.shape[0]
 
@@ -441,7 +449,8 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
     if sync and sync_this:
         omega = mpi_gramian_sync(F_local, illumination, normalization,
                                  local_translations, decomp,
-                                 nx, ny, Nx, Ny, num_iter=num_iter)
+                                 nx, ny, Nx, Ny, num_iter=num_iter,
+                                 halo_geometry=halo_geometry)
         F_local *= omega.reshape(-1, 1, 1)
 
     # PASS B: batched overlap accumulation → AllSum (or halo exchange) → image update
@@ -450,18 +459,23 @@ def mpi_AP_step(img, local_data, illumination, local_translations,
         e = min(local_nframes, s + frame_batch)
         overlap_cuda(img0, F_local[s:e], local_translations[s:e], illumination)
 
+    if eps is None:
+        eps = reg * float(_xp.max(_xp.abs(normalization)).real)
+
     if object_halo is not None:
         from mpi_object_halo import exchange_object_halo
         exchange_object_halo(img0, object_halo)     # <-- replaces mpi_allSum(img0)
-        img_global = img0
+        # Only tiles_own is meaningful after the exchange (see docstring) --
+        # dividing the full (Nx,Ny) canvas would touch pixels nobody reads.
+        for (x0, x1, y0, y1) in object_halo['tiles_own']:
+            img0[y0:y1, x0:x1] /= (normalization[y0:y1, x0:x1] + eps)
+        return img0
     else:
         is_gpu = cp is not None and isinstance(img0, cp.ndarray)
         img0_cpu = img0.get() if is_gpu else img0
         img_global_cpu = mpi_allSum(img0_cpu)
         img_global = _xp.asarray(img_global_cpu) if is_gpu else img_global_cpu
-
-    eps = reg * float(_xp.max(_xp.abs(normalization)).real)
-    return img_global / (normalization + eps)
+        return img_global / (normalization + eps)
 
 
 def validate_distributed_ap(maxiter=5):
@@ -532,11 +546,12 @@ def validate_distributed_ap(maxiter=5):
 # ===========================================================================
 # Distributed Gramian sync (TODO 2)
 # ===========================================================================
-from mpi_halo import setup_halo, exchange_v_halo
+from mpi_halo import setup_halo, exchange_v_halo, setup_halo_geometry, exchange_halo_frames
 
 
 def mpi_gramian_sync(local_frames, illumination, normalization,
-                     local_translations, decomp, nx, ny, Nx, Ny, num_iter=5):
+                     local_translations, decomp, nx, ny, Nx, Ny, num_iter=5,
+                     halo_geometry=None):
     """
     Distributed Gramian phase synchronization with halo exchange.
 
@@ -546,6 +561,16 @@ def mpi_gramian_sync(local_frames, illumination, normalization,
     3. Power iteration: exchange_v_halo() each step so the matvec
        (H_local @ v + H_cross @ v_halo) uses the full globally-consistent v.
        Gap-aware stop (SHARPY_SYNC_EIGTOL) via global Allreduce.
+
+    halo_geometry : dict from mpi_halo.setup_halo_geometry(...), or None.
+                    When given, only the content-dependent half of halo setup
+                    (exchange_halo_frames -- current frame data + H_cross)
+                    reruns; the positions-only half (3 Allgathervs + a global
+                    Gramiam_plan + XOR-filtering boundary pairs) is skipped
+                    and the cached geometry reused. Build once, before the AP
+                    loop, and rebuild only if positions move (e.g. inside
+                    position refinement). None recomputes geometry every call
+                    (old, always-correct-but-wasteful behaviour).
 
     Returns omega: (local_nframes,) complex64 phase-correction vector.
     """
@@ -569,8 +594,12 @@ def mpi_gramian_sync(local_frames, illumination, normalization,
     if hasattr(H_local, 'data'):
         H_local.data[:] = _xp.nan_to_num(H_local.data, nan=0.0, posinf=0.0, neginf=0.0)
 
-    halo = setup_halo(local_frames, local_tx, local_ty, frames_norm,
-                      illumination, norm_reg, decomp, nx, ny, Nx, Ny)
+    if halo_geometry is not None:
+        halo = exchange_halo_frames(local_frames, local_tx, local_ty, frames_norm,
+                                    illumination, norm_reg, halo_geometry, nx, ny, Nx, Ny)
+    else:
+        halo = setup_halo(local_frames, local_tx, local_ty, frames_norm,
+                          illumination, norm_reg, decomp, nx, ny, Nx, Ny)
     H_cross = halo["H_cross"]
 
     v = _xp.ones((local_nframes, 1), dtype=_xp.complex64)
@@ -641,19 +670,31 @@ def validate_distributed_sync(maxiter=3, num_iter=5):
                           local_trans, nx, ny, Nx, Ny, normalization,
                           F_local, frames_norm, decomp, sync=False)
 
-    # Distributed sync — F_local already has the projected frames from the last PASS A
+    # Distributed sync — F_local already has the projected frames from the last PASS A.
+    # Compare the cached-geometry path (halo_geometry built once, like a real
+    # caller syncing repeatedly with frozen positions would) against the old
+    # always-rebuild path, to confirm the mpi_halo.py split is a pure
+    # optimization with no behaviour change.
+    halo_geometry = setup_halo_geometry(local_trans.real, local_trans.imag,
+                                        decomp, nx, ny, Nx, Ny)
     omega = mpi_gramian_sync(F_local, illumination, normalization,
-                             local_trans, decomp, nx, ny, Nx, Ny, num_iter=num_iter)
+                             local_trans, decomp, nx, ny, Nx, Ny, num_iter=num_iter,
+                             halo_geometry=halo_geometry)
+    omega_old = mpi_gramian_sync(F_local, illumination, normalization,
+                                 local_trans, decomp, nx, ny, Nx, Ny, num_iter=num_iter)
 
     assert omega.shape == (local_nframes,), f"wrong shape: {omega.shape}"
     omega_np = omega.get() if (cp is not None and isinstance(omega, cp.ndarray)) else np.array(omega)
-    ok = bool(np.all(np.isfinite(omega_np))) and float(np.max(np.abs(omega_np))) > 1e-12
+    omega_old_np = omega_old.get() if (cp is not None and isinstance(omega_old, cp.ndarray)) else np.array(omega_old)
+    geometry_ok = bool(np.allclose(omega_np, omega_old_np, atol=1e-4))
+    ok = bool(np.all(np.isfinite(omega_np))) and float(np.max(np.abs(omega_np))) > 1e-12 and geometry_ok
 
     if RANK == 0:
         amp = np.abs(omega_np)
-        print(f"[validate-sync] ranks={SIZE}  ok={ok}  "
+        print(f"[validate-sync] ranks={SIZE}  ok={ok}  geometry_ok={geometry_ok}  "
               f"|omega| in [{float(amp.min()):.3f}, {float(amp.max()):.3f}]")
-    assert ok, "mpi_gramian_sync returned invalid omega (NaN, Inf, or all-zero)"
+    assert ok, ("mpi_gramian_sync returned invalid omega (NaN, Inf, all-zero), "
+               "or cached-geometry path diverged from the always-rebuild path")
 
 
 # ===========================================================================
@@ -905,6 +946,170 @@ def validate_coarse_gauge(n_out=14, k_loc=10):
 
 
 # ===========================================================================
+# Cadence sync: cheap coarse gauge every iteration, real pixel halo every
+# object_sync_interval iterations (mentor's item 3 -- wires two functions
+# that already existed, mpi_object_halo's exchange and mpi_coarse_gauge_sync,
+# instead of paying a per-iteration pixel-level sync every time).
+# ===========================================================================
+
+def mpi_AP_step_cadence(img, local_data, illumination, local_translations,
+                        nx, ny, Nx, Ny, normalization, local_coverage,
+                        F_local, frames_norm, object_halo, iteration,
+                        object_sync_interval=10, frame_batch=1024, reg=1e-8,
+                        eps=None):
+    """
+    PASS A/B with a CADENCE-based object sync, instead of mpi_AP_step's
+    unconditional every-iteration reduction. Mirrors validate_coarse_gauge's
+    PROVEN structure (NMSE ~0.02-0.03): object_sync_interval-1 purely local
+    iterations -- no cross-rank communication AT ALL -- then one iteration
+    where the coarse-gauge phase correction and a real merge happen
+    TOGETHER. Gauge alone, applied every iteration with no merge in between,
+    measured at NMSE 0.4474 (matching NO sync) in an earlier version of this
+    function: a whole-tile phase rotation doesn't reconcile pixel VALUES
+    between tiles, so without a periodic merge the "cheap" iterations weren't
+    doing anything useful. validate_coarse_gauge's 0.02 result comes from
+    gauge and its coverage-weighted mpi_allSum blend happening together, at
+    the same cadence -- this reuses that exact pairing, just with
+    exchange_object_halo (cheap, O(halo)) standing in for the full blend,
+    since that's the actual thing being wired in here.
+
+    img is a PER-RANK LOCAL buffer at all times here (never replicated),
+    valid only inside object_halo['tiles_own'] after a sync iteration.
+
+    normalization  : (Nx, Ny) globally-summed coverage, used only on sync
+                     iterations (for the post-halo division).
+    local_coverage : (Nx, Ny) THIS RANK's own |P|^2 scatter-add (build once,
+                     same footprint/static assumptions as object_halo --
+                     see mpi_coarse_gauge_sync's obj_t/cov_t convention).
+    iteration      : caller's loop counter, 0-based. Syncs on
+                     iteration % object_sync_interval == object_sync_interval - 1
+                     (i.e. after object_sync_interval-1 purely local steps).
+    """
+    local_nframes = local_data.shape[0]
+    is_sync_iter = (iteration % object_sync_interval == object_sync_interval - 1)
+
+    for s in range(0, local_nframes, frame_batch):
+        e = min(local_nframes, s + frame_batch)
+        fb = _xp.zeros((e - s, nx, ny), dtype=_xp.complex64)
+        split_cuda(img, fb, local_translations[s:e], illumination)
+        fb, _ = Project_data(fb, local_data[s:e], compute_residuals=False)
+        F_local[s:e] = fb
+        frames_norm[s:e] = _xp.linalg.norm(fb, axis=(1, 2)).astype(_xp.complex64)
+
+    img0 = _xp.zeros((Nx, Ny), dtype=_xp.complex64)
+    for s in range(0, local_nframes, frame_batch):
+        e = min(local_nframes, s + frame_batch)
+        overlap_cuda(img0, F_local[s:e], local_translations[s:e], illumination)
+
+    local_eps = reg * float(_xp.max(_xp.abs(local_coverage)).real)
+
+    if not is_sync_iter:
+        # Purely local -- no cross-rank communication at all, matches
+        # validate_coarse_gauge's inner k_loc loop exactly.
+        return img0 / (local_coverage + local_eps)
+
+    # Sync boundary: gauge computed on the LOCALLY-normalized object (matching
+    # validate_coarse_gauge, which calls mpi_coarse_gauge_sync on obj_t
+    # *after* dividing by local coverage, not on the raw accumulation).
+    obj_local = img0 / (local_coverage + local_eps)
+    phase = mpi_coarse_gauge_sync(obj_local, local_coverage)
+
+    # Apply phase to the RAW (pre-division) accumulation -- multiplying by a
+    # constant phase commutes with the later division, but the cross-rank
+    # SUM (via halo exchange, next) needs phase-consistent inputs, which only
+    # the raw accumulation form supports (dividing first, by DIFFERENT
+    # per-rank coverage, then summing != summing then dividing).
+    img0 = img0 * complex(phase)
+
+    if eps is None:
+        eps = reg * float(_xp.max(_xp.abs(normalization)).real)
+    from mpi_object_halo import exchange_object_halo
+    exchange_object_halo(img0, object_halo)
+    for (x0, x1, y0, y1) in object_halo['tiles_own']:
+        img0[y0:y1, x0:x1] /= (normalization[y0:y1, x0:x1] + eps)
+    return img0
+
+
+def validate_cadence_sync(n_iter=60, object_sync_interval=10, nnx=16):
+    """
+    Correctness/quality gate for mpi_AP_step_cadence -- NOT just a
+    performance check. Compares final NMSE against the two baselines the
+    mentor cited from od2p_coarse_only_test: coarse-gauge-only reaches
+    ~0.02-0.032, no inter-tile sync at all sits at ~0.42-0.53. This cadence
+    scheme should land closer to the coarse-gauge number than to full
+    per-iteration pixel sync would, while doing far less communication.
+
+    Run: srun -n 4 <python> sharpy_mpi_skeleton.py --validate-cadence
+    """
+    if not _SHARPY:
+        if RANK == 0:
+            print("[validate-cadence] sharpy not importable — run on a GPU node")
+        return
+
+    from poster_simulate import simulate
+    data, illumination, truth, tx, ty, nframes, nx, ny, Nx, Ny = simulate(nnx)
+
+    tx_np   = tx.get()   if (cp is not None and isinstance(tx,   cp.ndarray)) else np.array(tx)
+    ty_np   = ty.get()   if (cp is not None and isinstance(ty,   cp.ndarray)) else np.array(ty)
+    data_np = data.get() if (cp is not None and isinstance(data, cp.ndarray)) else np.array(data)
+    truth_np = truth.get() if (cp is not None and isinstance(truth, cp.ndarray)) else np.array(truth)
+
+    decomp        = get_2d_decomposition(tx_np, ty_np)
+    mf            = decomp['my_frames']
+    local_data_xp = _xp.asarray(data_np[mf])
+    local_trans   = (_xp.asarray(tx_np[mf]) + 1j * _xp.asarray(ty_np[mf])).astype(_xp.complex64)
+    normalization = _compute_normalization(illumination, local_trans, Nx, Ny)
+
+    local_coverage = _xp.zeros((Nx, Ny), dtype=_xp.complex64)
+    overlap_cuda(local_coverage, 0, local_trans, illumination)
+
+    from mpi_object_halo import setup_object_halo
+    object_halo = setup_object_halo(local_trans, nx, ny, Nx, Ny)
+
+    local_nframes = local_data_xp.shape[0]
+    F_local     = _xp.zeros((local_nframes, nx, ny), dtype=_xp.complex64)
+    frames_norm = _xp.zeros(local_nframes, dtype=_xp.complex64)
+    img         = _xp.ones((Nx, Ny), dtype=_xp.complex64)
+
+    def _nmse_checkpoint(img_now, tag):
+        is_gpu = cp is not None and isinstance(img_now, cp.ndarray)
+        img_cpu = img_now.get() if is_gpu else np.asarray(img_now)
+        tile_mask = np.zeros((Nx, Ny), dtype=bool)
+        for (x0, x1, y0, y1) in object_halo['tiles_own']:
+            tile_mask[y0:y1, x0:x1] = True
+        local_tile_cpu = np.where(tile_mask, img_cpu, 0).astype(np.complex64)
+        gobj = mpi_allSum(local_tile_cpu)
+        if RANK == 0:
+            scale = (np.dot(gobj.ravel().conj(), truth_np.ravel())
+                    / (np.dot(gobj.ravel().conj(), gobj.ravel()).real + 1e-30))
+            aligned = gobj * scale
+            nmse = float(np.linalg.norm(aligned - truth_np) / (np.linalg.norm(truth_np) + 1e-30))
+            print(f"  [cadence checkpoint] {tag}  NMSE={nmse:.4f}", flush=True)
+        return gobj
+
+    for ii in range(n_iter):
+        img = mpi_AP_step_cadence(img, local_data_xp, illumination, local_trans,
+                                  nx, ny, Nx, Ny, normalization, local_coverage,
+                                  F_local, frames_norm, object_halo, ii,
+                                  object_sync_interval=object_sync_interval)
+        if ii % object_sync_interval == object_sync_interval - 1:
+            _nmse_checkpoint(img, f"iter={ii+1}")
+
+    gobj = _nmse_checkpoint(img, "final")
+
+    if RANK == 0:
+        scale = (np.dot(gobj.ravel().conj(), truth_np.ravel())
+                / (np.dot(gobj.ravel().conj(), gobj.ravel()).real + 1e-30))
+        aligned = gobj * scale
+        nmse = float(np.linalg.norm(aligned - truth_np) / (np.linalg.norm(truth_np) + 1e-30))
+        ok = np.isfinite(nmse) and nmse < 0.15
+        print(f"[validate-cadence] ranks={SIZE}  object_sync_interval={object_sync_interval}  "
+              f"n_iter={n_iter}  ok={ok}  NMSE={nmse:.4f}  "
+              f"(coarse-gauge-only ref ~0.02-0.03, no-sync ref ~0.42-0.53)")
+        assert ok, f"cadence sync NMSE={nmse:.4f} — not close to the coarse-gauge baseline"
+
+
+# ===========================================================================
 # Scaling benchmarks — Workstream B/C2 deliverables
 # ===========================================================================
 import time as _time
@@ -917,7 +1122,7 @@ def _cuda_sync():
 
 def mpi_AP_step_timed(img, local_data, illumination, local_translations,
                       nx, ny, Nx, Ny, normalization, F_local, frames_norm,
-                      frame_batch=1024, reg=1e-8, object_halo=None):
+                      frame_batch=1024, reg=1e-8, object_halo=None, eps=None):
     """
     One distributed AP iteration (no Gramian sync).
     Returns (img_updated, t_compute, t_sync) where:
@@ -930,6 +1135,13 @@ def mpi_AP_step_timed(img, local_data, illumination, local_translations,
                   ranks instead of mpi_allSum-ing the whole Nx x Ny canvas --
                   see mpi_object_halo.py. img is then only correct inside
                   object_halo['tiles_own'] on each rank.
+    eps         : pre-computed reg * max(abs(normalization)), or None to
+                  compute it here. normalization is static across iterations,
+                  so callers running a loop should compute this once outside
+                  it instead of forcing a full-canvas device sync every call
+                  (previously this ran after t_sync stopped, so it wasn't
+                  even part of either timed bucket -- still real wasted
+                  wall-clock time between iterations, just unattributed).
     """
     local_nframes = local_data.shape[0]
 
@@ -967,7 +1179,15 @@ def mpi_AP_step_timed(img, local_data, illumination, local_translations,
         img_global = _xp.asarray(img_global_cpu) if is_gpu else img_global_cpu
     t_sync = _time.perf_counter() - t0
 
-    eps = reg * float(_xp.max(_xp.abs(normalization)).real)
+    if eps is None:
+        eps = reg * float(_xp.max(_xp.abs(normalization)).real)
+
+    if object_halo is not None:
+        # Only tiles_own is meaningful after the exchange -- dividing the
+        # full (Nx,Ny) canvas would touch pixels nobody reads.
+        for (x0, x1, y0, y1) in object_halo['tiles_own']:
+            img_global[y0:y1, x0:x1] /= (normalization[y0:y1, x0:x1] + eps)
+        return img_global, t_compute, t_sync
     return img_global / (normalization + eps), t_compute, t_sync
 
 
@@ -1005,6 +1225,8 @@ def _run_ap_benchmark(NNX, nwarmup=5, ntimed=20, tag=""):
     local_trans   = (_xp.asarray(tx_np[mf]) + 1j * _xp.asarray(ty_np[mf])).astype(_xp.complex64)
 
     normalization = _compute_normalization(illumination, local_trans, Nx, Ny)
+    # Static across iterations -- compute once instead of every call.
+    eps = 1e-8 * float(_xp.max(_xp.abs(normalization)).real)
 
     # SHARPY_NO_HALO=1 forces the old full-canvas AllReduce path, for
     # apples-to-apples before/after scaling comparisons.
@@ -1022,7 +1244,7 @@ def _run_ap_benchmark(NNX, nwarmup=5, ntimed=20, tag=""):
     for _ in range(nwarmup):
         img, _, _ = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
                                       nx, ny, Nx, Ny, normalization, F_local, frames_norm,
-                                      object_halo=object_halo)
+                                      object_halo=object_halo, eps=eps)
     mpi_barrier()
 
     # Timed iterations — barrier before each so all ranks start together
@@ -1032,7 +1254,7 @@ def _run_ap_benchmark(NNX, nwarmup=5, ntimed=20, tag=""):
         mpi_barrier()
         img, tc, ts = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
                                         nx, ny, Nx, Ny, normalization, F_local, frames_norm,
-                                        object_halo=object_halo)
+                                        object_halo=object_halo, eps=eps)
         times_compute.append(tc)
         times_sync.append(ts)
     mpi_barrier()
@@ -1092,6 +1314,8 @@ def _run_ap_benchmark_h5(h5path, nwarmup=5, ntimed=20, tag=""):
     local_trans   = (_xp.asarray(tx_np[mf]) + 1j * _xp.asarray(ty_np[mf])).astype(_xp.complex64)
 
     normalization = _compute_normalization(illumination, local_trans, Nx, Ny)
+    # Static across iterations -- compute once instead of every call.
+    eps = 1e-8 * float(_xp.max(_xp.abs(normalization)).real)
 
     # SHARPY_NO_HALO=1 forces the old full-canvas AllReduce path, for
     # apples-to-apples before/after scaling comparisons.
@@ -1108,7 +1332,7 @@ def _run_ap_benchmark_h5(h5path, nwarmup=5, ntimed=20, tag=""):
     for _ in range(nwarmup):
         img, _, _ = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
                                       nx, ny, Nx, Ny, normalization, F_local, frames_norm,
-                                      object_halo=object_halo)
+                                      object_halo=object_halo, eps=eps)
     mpi_barrier()
 
     times_compute = []
@@ -1117,7 +1341,7 @@ def _run_ap_benchmark_h5(h5path, nwarmup=5, ntimed=20, tag=""):
         mpi_barrier()
         img, tc, ts = mpi_AP_step_timed(img, local_data_xp, illumination, local_trans,
                                         nx, ny, Nx, Ny, normalization, F_local, frames_norm,
-                                        object_halo=object_halo)
+                                        object_halo=object_halo, eps=eps)
         times_compute.append(tc)
         times_sync.append(ts)
     mpi_barrier()
@@ -1175,6 +1399,8 @@ if __name__ == "__main__":
         validate_distributed_gather()
     elif "--validate-coarse" in sys.argv:
         validate_coarse_gauge()
+    elif "--validate-cadence" in sys.argv:
+        validate_cadence_sync()
     elif "--benchmark-strong" in sys.argv:
         benchmark_mpi_strong()
     elif "--benchmark-weak" in sys.argv:
