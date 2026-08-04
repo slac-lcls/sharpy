@@ -1,0 +1,5 @@
+nx,max_nnx,max_nframes,peak_mb,image_Nx,oom_nnx,oom_nframes,failed_at
+32,512,262144,2077.801984,4092,,,none (hit MAX_NNX)
+64,256,65536,1525.734912,4088,512,262144,reconstruct
+128,128,16384,1386.629632,4080,256,65536,reconstruct
+256,64,4096,1350.265344,4064,128,16384,reconstruct

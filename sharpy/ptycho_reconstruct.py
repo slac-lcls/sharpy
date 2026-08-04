@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 import numpy as np
-import cupy as cp
 import copy
 import h5py
 import matplotlib.pyplot as plt
@@ -10,52 +9,65 @@ from Operators import Split_Overlap_plan
 import Solvers
 from Operators import get_times, reset_times, normalize_times
 import config
+from Operators import Gramiam_plan, Replicate_frame
+from wrap_ops import overlap_cuda,split_cuda
 
-Alternating_projections = Solvers.Alternating_projections
 reset_times()
-GPU = False#config.GPU
-
+GPU = config.GPU #False
+sync = True 
+debug = True
 if GPU:
+    import cupy as cp
     xp = cp
     print("using GPU")
 else:
     xp = np
     print("using CPU")
 
-
+if GPU:
+    Alternating_projections = Solvers.Alternating_projections_c
+else:
+    Alternating_projections = Solvers.Alternating_projections
 ##################################################
 # input data
-fname_in = "simulation.h5"
+#fname_in = "simulation_small.h5"
+
+import sys
+# Retrieve the value of 'fname' from the command-line arguments
+#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
+
 fid = h5py.File(fname_in, "r")
 
 data = xp.array(fid["data"], dtype=xp.float32)
 illumination = xp.array(fid["probe"], dtype=xp.complex64)
 
+    
 translations = xp.array(fid["translations"])
-
+#print('translations1', type(translations),translations.dtype) #float128 dtype
 nframes, nx, ny = data.shape
+
 resolution = (
     xp.float32(fid["wavelength"])
     * xp.float32(fid["detector_distance"])
     / (nx * xp.float32(fid["detector_pixel_size"]))
 )
-
 translations = translations / resolution
-
 truth = xp.array(fid["truth"], dtype=xp.complex64)
+
+translations_x = xp.array(fid["translations_x"]) #load the real and imag of dtype int64
+translations_y = xp.array(fid["translations_y"])
 fid.close()
 
 #################################################
 
-translations_x = xp.real(translations)
-translations_y = xp.imag(translations)
+#translations_x = xp.real(translations)
+#translations_y = xp.imag(translations)
 
 # get the image extent (with wrap-around)
-Nx = xp.int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
+Nx = int(xp.ceil(xp.max(translations_x) - xp.min(translations_x)))
 Ny = Nx
 
-
-#%%
+#
 if GPU:
     mempool = cp.get_default_memory_pool()
     print(
@@ -72,7 +84,7 @@ if GPU:
     print("----")
 
 
-Split, Overlap = Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
+#Split, Overlap = Split_Overlap_plan(translations_x, translations_y, nx, ny, Nx, Ny)
 
 if GPU:
     mempool = cp.get_default_memory_pool()
@@ -89,32 +101,75 @@ if GPU:
     print("data size", data.nbytes)
     print("----")
 
-img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
+if sync == True:
+    if GPU:
+       #calculate the preconditioner here
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        #print('plan',Gplan['col'],Gplan['row'],Gplan['dx'],Gplan['dy'],Gplan['val'])
+    else:
+        Gplan = Gramiam_plan(translations_x,translations_y,nframes,nx,ny,Nx,Ny, bw = 0)
+        
+    if Gplan['col'].size == 0:
+        sync = False
+else: 
+    Gplan = None
+
+
+
+img_initial = xp.ones((Nx, Ny), dtype=xp.complex64) 
+#img_initial = xp.random.rand(Nx, Ny , dtype=xp.float32) + 0* 1j * xp.random.rand(Nx, Ny, dtype=xp.float32)#Need to match datatype in operators fft Plan2D
+#img_initial = truth + 0
 ############################
 # reconstruct
+#refine_illumination = False
+refine_illumination = True
+maxiter = 3000
+# residuals_interval = np.inf
+residuals_interval = 1
 
-maxiter = 100
 t0 = timer()
 print("geometry: img size:", (Nx, Ny), "frames:", (nx, ny, nframes))
 print(
     "not refining illumination, starting with good one, maxiter:",
     maxiter,
 )
-# residuals_interval = np.inf
-residuals_interval = 10
 
-
+'''
 img4, frames, illum, residuals_AP = Alternating_projections(
+    sync,
     img_initial,
+    Gplan,
     illumination,
     Overlap,
     Split,
     data,
-    refine_illumination=False,
-    maxiter=maxiter,
-    img_truth=truth,
-    residuals_interval=residuals_interval,
+    refine_illumination,
+    maxiter,
+    normalization=None,
+    img_truth =truth,
+    residuals_interval = residuals_interval
 )
+'''
+
+img4, frames, illum, residuals_AP = Alternating_projections(
+    sync,
+    img_initial+0,
+    Gplan,
+    illumination+0,
+    translations_x,
+    translations_y,
+    overlap_cuda,
+    split_cuda,
+    data,
+    refine_illumination,
+    maxiter,
+    normalization=None,
+    img_truth =truth,
+    residuals_interval = residuals_interval,
+    sync_interval = 1,
+    num_iter = 100,
+)
+
 print("total time:", timer() - t0)
 
 ############################
@@ -135,7 +190,24 @@ print("total time operators benchmarked:", tots)
 
 print("after normalization")
 timersn = get_times()
-print(timersn)
+
+labels = [key for key,value in timersn.items() if value!=0]
+sizes = [100 * value for value in timersn.values() if value!=0]
+
+
+patches, texts = plt.pie(sizes,startangle=90, radius=1.2)
+labels = ['{0} - {1:1.2f} %'.format(i,j) for i,j in zip(labels, sizes)]
+
+sort_legend = True
+if sort_legend:
+    patches, labels, dummy =  zip(*sorted(zip(patches, labels, sizes),
+                                          key=lambda labels: labels[2],
+                                          reverse=True))
+
+plt.legend(patches, labels, loc='center left', bbox_to_anchor=(-0.1, 1.),
+           fontsize=8)
+
+plt.show()
 
 tt = Solvers.get_times()
 print("solver timers:\n", tt)
@@ -184,19 +256,20 @@ if GPU:
 else:
     img = img4
 
-fig = plt.figure(figsize=(10, 10))
+fig = plt.figure(figsize=(30, 30))
 plt.subplot(1, 3, 1)
-plt.title("Ground truth", fontsize=10)
+plt.title("Ground truth", fontsize=20)
 plt.imshow(abs(truth), cmap="gray")
-plt.colorbar()
+plt.colorbar(fraction=0.046, pad=0.04)
 plt.subplot(1, 3, 2)
-plt.title("Alternating Projections\n no Sync:%2.2g" % (nmse4), fontsize=10)
-plt.imshow(abs(img), cmap="gray")
-plt.colorbar()
+sync_status = "with synchronization" if sync else "without synchronization"
+plt.title(f"Alternating Projections\n Sync: {sync_status}, NMSE: {nmse4:.2g}", fontsize=20)
+plt.imshow(abs(img),cmap="gray")
+plt.colorbar(fraction=0.046, pad=0.04)
 plt.subplot(1, 3, 3)
-plt.title("Difference")
+plt.title("Difference",fontsize=20)
 plt.imshow(abs(truth) - abs(img), cmap="jet")
-plt.colorbar()
+plt.colorbar(fraction=0.046, pad=0.04)
 plt.show()
 
 ##

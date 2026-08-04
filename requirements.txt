@@ -1,6 +1,5 @@
 numpy
 scipy
-numpy_groupies
-cupy-cuda11x
+cupy
 h5py
 matplotlib

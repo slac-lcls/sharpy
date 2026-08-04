@@ -1,0 +1,591 @@
+/global/u2/d/dnyanhet/sharpy-1/sharpy/Operators.py:922: SyntaxWarning: invalid escape sequence '\p'
+  #so = xp.sign(omega1)[0] #substract the common phase for eigsh. The angle tends to jump between theta and -theta. so force the angle between [0,\pi]
+
+══ nx=32  Dx=8  (GPU total: 42405 MB) ══
+  nnx=   4  nframes=    16  frame_stack≈0 MB ... start AP memory used, and total: 146432 230912
+normalized by data.nbytes memory used and total normalized: 2.234375 3.5234375
+data size 65536
+----
+after Prox_data, memory used, and total: 147968 361984
+normalized by data.nbytes memory used and total normalized: 2.2578125 5.5234375
+----
+!!!inorm False
+after frames initial, memory used, and total: 425472 755200
+normalized by data.nbytes memory used and total normalized: 6.4921875 11.5234375
+----
+start loop, memory used, and total: 427008 755200
+normalized by data.nbytes memory used and total normalized: 6.515625 11.5234375
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 50.55it/s]
+end of loop, memory used, and total/1e9: 0.000572416 0.000886272
+normalized by data.nbytes memory used and total normalized: 8.734375 13.5234375
+----
+1
+OK  peak=0 MB  Nx=28
+  nnx=   8  nframes=    64  frame_stack≈1 MB ... start AP memory used, and total: 547328 653312
+normalized by data.nbytes memory used and total normalized: 2.087890625 2.4921875
+data size 262144
+----
+after Prox_data, memory used, and total: 548864 1195520
+normalized by data.nbytes memory used and total normalized: 2.09375 4.560546875
+----
+!!!inorm False
+after frames initial, memory used, and total: 1635328 2768384
+normalized by data.nbytes memory used and total normalized: 6.23828125 10.560546875
+----
+start loop, memory used, and total: 1636864 2768384
+normalized by data.nbytes memory used and total normalized: 6.244140625 10.560546875
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 413.79it/s]
+end of loop, memory used, and total/1e9: 0.002220544 0.003292672
+normalized by data.nbytes memory used and total normalized: 8.470703125 12.560546875
+----
+1
+OK  peak=1 MB  Nx=60
+  nnx=  16  nframes=   256  frame_stack≈2 MB ... start AP memory used, and total: 2093568 2320384
+normalized by data.nbytes memory used and total normalized: 1.99658203125 2.212890625
+data size 1048576
+----
+after Prox_data, memory used, and total: 2096640 4417536
+normalized by data.nbytes memory used and total normalized: 1.99951171875 4.212890625
+----
+!!!inorm False
+after frames initial, memory used, and total: 6423040 10708992
+normalized by data.nbytes memory used and total normalized: 6.12548828125 10.212890625
+----
+start loop, memory used, and total: 6426112 10708992
+normalized by data.nbytes memory used and total normalized: 6.12841796875 10.212890625
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 420.68it/s]
+end of loop, memory used, and total/1e9: 0.008772608 0.012806144
+normalized by data.nbytes memory used and total normalized: 8.3662109375 12.212890625
+----
+1
+OK  peak=2 MB  Nx=124
+  nnx=  32  nframes=  1024  frame_stack≈8 MB ... start AP memory used, and total: 8226304 8996864
+normalized by data.nbytes memory used and total normalized: 1.9613037109375 2.14501953125
+data size 4194304
+----
+after Prox_data, memory used, and total: 8235520 17385472
+normalized by data.nbytes memory used and total normalized: 1.9635009765625 4.14501953125
+----
+!!!inorm False
+after frames initial, memory used, and total: 25529856 42551296
+normalized by data.nbytes memory used and total normalized: 6.0867919921875 10.14501953125
+----
+start loop, memory used, and total: 25539072 42551296
+normalized by data.nbytes memory used and total normalized: 6.0889892578125 10.14501953125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 400.12it/s]
+end of loop, memory used, and total/1e9: 0.034953216 0.050939904
+normalized by data.nbytes memory used and total normalized: 8.33349609375 12.14501953125
+----
+1
+OK  peak=8 MB  Nx=252
+  nnx=  64  nframes=  4096  frame_stack≈34 MB ... start AP memory used, and total: 32656896 35983360
+normalized by data.nbytes memory used and total normalized: 1.946502685546875 2.144775390625
+data size 16777216
+----
+after Prox_data, memory used, and total: 32690688 69537792
+normalized by data.nbytes memory used and total normalized: 1.948516845703125 4.144775390625
+----
+!!!inorm False
+after frames initial, memory used, and total: 101873152 170201088
+normalized by data.nbytes memory used and total normalized: 6.072113037109375 10.144775390625
+----
+start loop, memory used, and total: 101906944 170201088
+normalized by data.nbytes memory used and total normalized: 6.074127197265625 10.144775390625
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 392.75it/s]
+end of loop, memory used, and total/1e9: 0.139624448 0.20375552
+normalized by data.nbytes memory used and total normalized: 8.322265625 12.144775390625
+----
+1
+OK  peak=33 MB  Nx=508
+  nnx= 128  nframes= 16384  frame_stack≈134 MB ... start AP memory used, and total: 130178560 143593472
+normalized by data.nbytes memory used and total normalized: 1.9398117065429688 2.13970947265625
+data size 67108864
+----
+after Prox_data, memory used, and total: 130310656 277811200
+normalized by data.nbytes memory used and total normalized: 1.9417800903320312 4.13970947265625
+----
+!!!inorm False
+after frames initial, memory used, and total: 407078400 680464384
+normalized by data.nbytes memory used and total normalized: 6.065940856933594 10.13970947265625
+----
+start loop, memory used, and total: 407210496 680464384
+normalized by data.nbytes memory used and total normalized: 6.067909240722656 10.13970947265625
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 296.25it/s]
+end of loop, memory used, and total/1e9: 0.558206976 0.814682112
+normalized by data.nbytes memory used and total normalized: 8.31793212890625 12.13970947265625
+----
+1
+OK  peak=130 MB  Nx=1020
+  nnx= 256  nframes= 65536  frame_stack≈537 MB ... start AP memory used, and total: 519863808 574099456
+normalized by data.nbytes memory used and total normalized: 1.9366436004638672 2.1386871337890625
+data size 268435456
+----
+after Prox_data, memory used, and total: 520389120 1110970368
+normalized by data.nbytes memory used and total normalized: 1.9386005401611328 4.1386871337890625
+----
+!!!inorm False
+after frames initial, memory used, and total: 1627563520 2721583104
+normalized by data.nbytes memory used and total normalized: 6.063146591186523 10.138687133789062
+----
+start loop, memory used, and total: 1628088832 2721583104
+normalized by data.nbytes memory used and total normalized: 6.065103530883789 10.138687133789062
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 128.63it/s]
+end of loop, memory used, and total/1e9: 2.232332288 3.258454016
+normalized by data.nbytes memory used and total normalized: 8.316085815429688 12.138687133789062
+----
+1
+OK  peak=520 MB  Nx=2044
+  nnx= 512  nframes=262144  frame_stack≈2147 MB ... start AP memory used, and total: 2077801984 2296254464
+normalized by data.nbytes memory used and total normalized: 1.9351038932800293 2.1385536193847656
+data size 1073741824
+----
+after Prox_data, memory used, and total: 2079900160 4443738112
+normalized by data.nbytes memory used and total normalized: 1.9370579719543457 4.138553619384766
+----
+!!!inorm False
+after frames initial, memory used, and total: 6508832256 10886189056
+normalized by data.nbytes memory used and total normalized: 6.061822414398193 10.138553619384766
+----
+start loop, memory used, and total: 6510930432 10886189056
+normalized by data.nbytes memory used and total normalized: 6.06377649307251 10.138553619384766
+----
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:00,  7.73it/s]100%|██████████| 5/5 [00:00<00:00, 35.99it/s]
+end of loop, memory used, and total/1e9: 8.928423936 13.033672704
+normalized by data.nbytes memory used and total normalized: 8.315242767333984 12.138553619384766
+----
+1
+OK  peak=2078 MB  Nx=4092
+
+══ nx=64  Dx=16  (GPU total: 42405 MB) ══
+  nnx=   4  nframes=    16  frame_stack≈1 MB ... start AP memory used, and total: 404480 919040
+normalized by data.nbytes memory used and total normalized: 1.54296875 3.505859375
+data size 262144
+----
+after Prox_data, memory used, and total: 406016 1181184
+normalized by data.nbytes memory used and total normalized: 1.548828125 4.505859375
+----
+!!!inorm False
+after frames initial, memory used, and total: 1512960 2754048
+normalized by data.nbytes memory used and total normalized: 5.771484375 10.505859375
+----
+start loop, memory used, and total: 1514496 2754048
+normalized by data.nbytes memory used and total normalized: 5.77734375 10.505859375
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 387.48it/s]
+end of loop, memory used, and total/1e9: 0.002089984 0.003278336
+normalized by data.nbytes memory used and total normalized: 7.97265625 12.505859375
+----
+1
+OK  peak=0 MB  Nx=56
+  nnx=   8  nframes=    64  frame_stack≈2 MB ... start AP memory used, and total: 1530368 2607104
+normalized by data.nbytes memory used and total normalized: 1.45947265625 2.486328125
+data size 1048576
+----
+after Prox_data, memory used, and total: 1531904 4704256
+normalized by data.nbytes memory used and total normalized: 1.4609375 4.486328125
+----
+!!!inorm False
+after frames initial, memory used, and total: 5874688 10995712
+normalized by data.nbytes memory used and total normalized: 5.6025390625 10.486328125
+----
+start loop, memory used, and total: 5876224 10995712
+normalized by data.nbytes memory used and total normalized: 5.60400390625 10.486328125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 317.55it/s]
+end of loop, memory used, and total/1e9: 0.0082048 0.013092864
+normalized by data.nbytes memory used and total normalized: 7.82470703125 12.486328125
+----
+1
+OK  peak=2 MB  Nx=120
+  nnx=  16  nframes=   256  frame_stack≈8 MB ... start AP memory used, and total: 6001152 9275392
+normalized by data.nbytes memory used and total normalized: 1.4307861328125 2.21142578125
+data size 4194304
+----
+after Prox_data, memory used, and total: 6004224 17664000
+normalized by data.nbytes memory used and total normalized: 1.4315185546875 4.21142578125
+----
+!!!inorm False
+after frames initial, memory used, and total: 23306752 42829824
+normalized by data.nbytes memory used and total normalized: 5.5567626953125 10.21142578125
+----
+start loop, memory used, and total: 23309824 42829824
+normalized by data.nbytes memory used and total normalized: 5.5574951171875 10.21142578125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 418.39it/s]
+end of loop, memory used, and total/1e9: 0.032685056 0.051218432
+normalized by data.nbytes memory used and total normalized: 7.792724609375 12.21142578125
+----
+1
+OK  peak=6 MB  Nx=248
+  nnx=  32  nframes=  1024  frame_stack≈34 MB ... start AP memory used, and total: 23881216 35981312
+normalized by data.nbytes memory used and total normalized: 1.423431396484375 2.1446533203125
+data size 16777216
+----
+after Prox_data, memory used, and total: 23890432 69535744
+normalized by data.nbytes memory used and total normalized: 1.423980712890625 4.1446533203125
+----
+!!!inorm False
+after frames initial, memory used, and total: 93064704 170199040
+normalized by data.nbytes memory used and total normalized: 5.547088623046875 10.1446533203125
+----
+start loop, memory used, and total: 93073920 170199040
+normalized by data.nbytes memory used and total normalized: 5.547637939453125 10.1446533203125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 399.92it/s]
+end of loop, memory used, and total/1e9: 0.130701312 0.203753472
+normalized by data.nbytes memory used and total normalized: 7.7904052734375 12.1446533203125
+----
+1
+OK  peak=24 MB  Nx=504
+  nnx=  64  nframes=  4096  frame_stack≈134 MB ... start AP memory used, and total: 95399424 142870528
+normalized by data.nbytes memory used and total normalized: 1.4215621948242188 2.128936767578125
+data size 67108864
+----
+after Prox_data, memory used, and total: 95433216 277088256
+normalized by data.nbytes memory used and total normalized: 1.4220657348632812 4.128936767578125
+----
+!!!inorm False
+after frames initial, memory used, and total: 372160000 679741440
+normalized by data.nbytes memory used and total normalized: 5.545616149902344 10.128936767578125
+----
+start loop, memory used, and total: 372193792 679741440
+normalized by data.nbytes memory used and total normalized: 5.546119689941406 10.128936767578125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 307.33it/s]
+end of loop, memory used, and total/1e9: 0.522960896 0.813959168
+normalized by data.nbytes memory used and total normalized: 7.792724609375 12.128936767578125
+----
+1
+OK  peak=95 MB  Nx=1016
+  nnx= 128  nframes= 16384  frame_stack≈537 MB ... start AP memory used, and total: 381468160 571475968
+normalized by data.nbytes memory used and total normalized: 1.4210796356201172 2.1289138793945312
+data size 268435456
+----
+after Prox_data, memory used, and total: 381600256 1108346880
+normalized by data.nbytes memory used and total normalized: 1.4215717315673828 4.128913879394531
+----
+!!!inorm False
+after frames initial, memory used, and total: 1488668160 2718959616
+normalized by data.nbytes memory used and total normalized: 5.545721054077148 10.128913879394531
+----
+start loop, memory used, and total: 1488800256 2718959616
+normalized by data.nbytes memory used and total normalized: 5.546213150024414 10.128913879394531
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 132.58it/s]
+end of loop, memory used, and total/1e9: 2.092388352 3.255830528
+normalized by data.nbytes memory used and total normalized: 7.7947540283203125 12.128913879394531
+----
+1
+OK  peak=381 MB  Nx=2040
+  nnx= 256  nframes= 65536  frame_stack≈2147 MB ... start AP memory used, and total: 1525734912 2285242368
+normalized by data.nbytes memory used and total normalized: 1.4209513664245605 2.128297805786133
+data size 1073741824
+----
+after Prox_data, memory used, and total: 1526260224 4432726016
+normalized by data.nbytes memory used and total normalized: 1.421440601348877 4.128297805786133
+----
+!!!inorm False
+after frames initial, memory used, and total: 5954954752 10875176960
+normalized by data.nbytes memory used and total normalized: 5.545983791351318 10.128297805786133
+----
+start loop, memory used, and total: 5955480064 10875176960
+normalized by data.nbytes memory used and total normalized: 5.546473026275635 10.128297805786133
+----
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:00,  8.89it/s]100%|██████████| 5/5 [00:00<00:00, 41.01it/s]
+end of loop, memory used, and total/1e9: 8.370876416 13.022660608
+normalized by data.nbytes memory used and total normalized: 7.795986175537109 12.128297805786133
+----
+1
+OK  peak=1526 MB  Nx=4088
+  nnx= 512  nframes=262144  frame_stack≈8590 MB ... start AP memory used, and total: 6102785536 9140832256
+normalized by data.nbytes memory used and total normalized: 1.4209154844284058 2.128265857696533
+data size 4294967296
+----
+after Prox_data, memory used, and total: 6104883712 17730766848
+normalized by data.nbytes memory used and total normalized: 1.4214040040969849 4.128265857696533
+----
+!!!inorm False
+after frames initial, memory used, and total: 23820609024 34906179072
+normalized by data.nbytes memory used and total normalized: 5.546167731285095 8.127228140830994
+----
+start loop, memory used, and total: 23822707200 34906179072
+normalized by data.nbytes memory used and total normalized: 5.546656250953674 8.127228140830994
+----
+  0%|          | 0/5 [00:00<?, ?it/s]  0%|          | 0/5 [00:00<?, ?it/s]
+OOM at stage=reconstruct
+
+══ nx=128  Dx=32  (GPU total: 42405 MB) ══
+  nnx=   4  nframes=    16  frame_stack≈2 MB ... start AP memory used, and total: 1439744 3673088
+normalized by data.nbytes memory used and total normalized: 1.373046875 3.5029296875
+data size 1048576
+----
+after Prox_data, memory used, and total: 1441280 4721664
+normalized by data.nbytes memory used and total normalized: 1.37451171875 4.5029296875
+----
+!!!inorm False
+after frames initial, memory used, and total: 5867520 11013120
+normalized by data.nbytes memory used and total normalized: 5.595703125 10.5029296875
+----
+start loop, memory used, and total: 5869056 11013120
+normalized by data.nbytes memory used and total normalized: 5.59716796875 10.5029296875
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 343.65it/s]
+end of loop, memory used, and total/1e9: 0.008167936 0.013110272
+normalized by data.nbytes memory used and total normalized: 7.78955078125 12.5029296875
+----
+1
+OK  peak=1 MB  Nx=112
+  nnx=   8  nframes=    64  frame_stack≈8 MB ... start AP memory used, and total: 5465600 10425344
+normalized by data.nbytes memory used and total normalized: 1.3031005859375 2.485595703125
+data size 4194304
+----
+after Prox_data, memory used, and total: 5467136 18813952
+normalized by data.nbytes memory used and total normalized: 1.303466796875 4.485595703125
+----
+!!!inorm False
+after frames initial, memory used, and total: 22836736 43979776
+normalized by data.nbytes memory used and total normalized: 5.4447021484375 10.485595703125
+----
+start loop, memory used, and total: 22838272 43979776
+normalized by data.nbytes memory used and total normalized: 5.445068359375 10.485595703125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 343.85it/s]
+end of loop, memory used, and total/1e9: 0.032149504 0.052368384
+normalized by data.nbytes memory used and total normalized: 7.6650390625 12.485595703125
+----
+1
+OK  peak=5 MB  Nx=240
+  nnx=  16  nframes=   256  frame_stack≈34 MB ... start AP memory used, and total: 21634560 37098496
+normalized by data.nbytes memory used and total normalized: 1.289520263671875 2.21124267578125
+data size 16777216
+----
+after Prox_data, memory used, and total: 21637632 70652928
+normalized by data.nbytes memory used and total normalized: 1.289703369140625 4.21124267578125
+----
+!!!inorm False
+after frames initial, memory used, and total: 90846208 171316224
+normalized by data.nbytes memory used and total normalized: 5.41485595703125 10.21124267578125
+----
+start loop, memory used, and total: 90849280 171316224
+normalized by data.nbytes memory used and total normalized: 5.4150390625 10.21124267578125
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 404.79it/s]
+end of loop, memory used, and total/1e9: 0.128342528 0.204870656
+normalized by data.nbytes memory used and total normalized: 7.649810791015625 12.21124267578125
+----
+1
+OK  peak=22 MB  Nx=496
+  nnx=  32  nframes=  1024  frame_stack≈134 MB ... start AP memory used, and total: 86503936 143922176
+normalized by data.nbytes memory used and total normalized: 1.2890090942382812 2.1446075439453125
+data size 67108864
+----
+after Prox_data, memory used, and total: 86513152 278139904
+normalized by data.nbytes memory used and total normalized: 1.2891464233398438 4.1446075439453125
+----
+!!!inorm False
+after frames initial, memory used, and total: 363208704 680793088
+normalized by data.nbytes memory used and total normalized: 5.4122314453125 10.144607543945312
+----
+start loop, memory used, and total: 363217920 680793088
+normalized by data.nbytes memory used and total normalized: 5.4123687744140625 10.144607543945312
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 302.06it/s]
+end of loop, memory used, and total/1e9: 0.513701376 0.815010816
+normalized by data.nbytes memory used and total normalized: 7.654747009277344 12.144607543945312
+----
+1
+OK  peak=87 MB  Nx=1008
+  nnx=  64  nframes=  4096  frame_stack≈537 MB ... start AP memory used, and total: 346372608 571479040
+normalized by data.nbytes memory used and total normalized: 1.2903385162353516 2.128925323486328
+data size 268435456
+----
+after Prox_data, memory used, and total: 346406400 1108349952
+normalized by data.nbytes memory used and total normalized: 1.2904644012451172 4.128925323486328
+----
+!!!inorm False
+after frames initial, memory used, and total: 1453312000 2718962688
+normalized by data.nbytes memory used and total normalized: 5.414009094238281 10.128925323486328
+----
+start loop, memory used, and total: 1453345792 2718962688
+normalized by data.nbytes memory used and total normalized: 5.414134979248047 10.128925323486328
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 138.62it/s]
+end of loop, memory used, and total/1e9: 2.056314368 3.2558336
+normalized by data.nbytes memory used and total normalized: 7.660367965698242 12.128925323486328
+----
+1
+OK  peak=346 MB  Nx=2032
+  nnx= 128  nframes= 16384  frame_stack≈2147 MB ... start AP memory used, and total: 1386629632 2282230784
+normalized by data.nbytes memory used and total normalized: 1.2913994789123535 2.125493049621582
+data size 1073741824
+----
+after Prox_data, memory used, and total: 1386761728 4429714432
+normalized by data.nbytes memory used and total normalized: 1.29152250289917 4.125493049621582
+----
+!!!inorm False
+after frames initial, memory used, and total: 5815031808 10872165376
+normalized by data.nbytes memory used and total normalized: 5.415670394897461 10.125493049621582
+----
+start loop, memory used, and total: 5815163904 10872165376
+normalized by data.nbytes memory used and total normalized: 5.415793418884277 10.125493049621582
+----
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:00,  8.40it/s]100%|██████████| 5/5 [00:00<00:00, 38.86it/s]
+/global/u2/d/dnyanhet/sharpy-1/sharpy/Solvers.py:771: RuntimeWarning: More than 20 figures have been opened. Figures created through the pyplot interface (`matplotlib.pyplot.figure`) are retained until explicitly closed and may consume too much memory. (To control this warning, see the rcParam `figure.max_open_warning`). Consider using `matplotlib.pyplot.close()`.
+  fig, axs = plt.subplots(rows, cols, figsize=(15, rows * 3))
+end of loop, memory used, and total/1e9: 8.229121536 13.019649024
+normalized by data.nbytes memory used and total normalized: 7.663966655731201 12.125493049621582
+----
+1
+OK  peak=1387 MB  Nx=4080
+  nnx= 256  nframes= 65536  frame_stack≈8590 MB ... start AP memory used, and total: 5549222400 9129956352
+normalized by data.nbytes memory used and total normalized: 1.2920290231704712 2.1257336139678955
+data size 4294967296
+----
+after Prox_data, memory used, and total: 5549747712 17719890944
+normalized by data.nbytes memory used and total normalized: 1.2921513319015503 4.1257336139678955
+----
+!!!inorm False
+after frames initial, memory used, and total: 23264524288 34897399808
+normalized by data.nbytes memory used and total normalized: 5.416694164276123 8.125184059143066
+----
+start loop, memory used, and total: 23265049600 34897399808
+normalized by data.nbytes memory used and total normalized: 5.416816473007202 8.125184059143066
+----
+  0%|          | 0/5 [00:00<?, ?it/s]  0%|          | 0/5 [00:00<?, ?it/s]
+OOM at stage=reconstruct
+
+══ nx=256  Dx=64  (GPU total: 42405 MB) ══
+  nnx=   4  nframes=    16  frame_stack≈8 MB ... start AP memory used, and total: 5580800 14686208
+normalized by data.nbytes memory used and total normalized: 1.33056640625 3.50146484375
+data size 4194304
+----
+after Prox_data, memory used, and total: 5582336 18880512
+normalized by data.nbytes memory used and total normalized: 1.3309326171875 4.50146484375
+----
+!!!inorm False
+after frames initial, memory used, and total: 23285760 44046336
+normalized by data.nbytes memory used and total normalized: 5.5517578125 10.50146484375
+----
+start loop, memory used, and total: 23287296 44046336
+normalized by data.nbytes memory used and total normalized: 5.5521240234375 10.50146484375
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 368.55it/s]
+end of loop, memory used, and total/1e9: 0.032479744 0.052434944
+normalized by data.nbytes memory used and total normalized: 7.7437744140625 12.50146484375
+----
+1
+OK  peak=6 MB  Nx=224
+  nnx=   8  nframes=    64  frame_stack≈34 MB ... start AP memory used, and total: 21206528 41695232
+normalized by data.nbytes memory used and total normalized: 1.264007568359375 2.4852294921875
+data size 16777216
+----
+after Prox_data, memory used, and total: 21208064 75249664
+normalized by data.nbytes memory used and total normalized: 1.26409912109375 4.4852294921875
+----
+!!!inorm False
+after frames initial, memory used, and total: 90684928 175912960
+normalized by data.nbytes memory used and total normalized: 5.405242919921875 10.4852294921875
+----
+start loop, memory used, and total: 90686464 175912960
+normalized by data.nbytes memory used and total normalized: 5.40533447265625 10.4852294921875
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 400.82it/s]
+end of loop, memory used, and total/1e9: 0.12792832 0.209467392
+normalized by data.nbytes memory used and total normalized: 7.6251220703125 12.4852294921875
+----
+1
+OK  peak=21 MB  Nx=480
+  nnx=  16  nframes=   256  frame_stack≈134 MB ... start AP memory used, and total: 84168192 148387840
+normalized by data.nbytes memory used and total normalized: 1.2542037963867188 2.211151123046875
+data size 67108864
+----
+after Prox_data, memory used, and total: 84171264 282605568
+normalized by data.nbytes memory used and total normalized: 1.2542495727539062 4.211151123046875
+----
+!!!inorm False
+after frames initial, memory used, and total: 361004032 685258752
+normalized by data.nbytes memory used and total normalized: 5.3793792724609375 10.211151123046875
+----
+start loop, memory used, and total: 361007104 685258752
+normalized by data.nbytes memory used and total normalized: 5.379425048828125 10.211151123046875
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 294.00it/s]
+end of loop, memory used, and total/1e9: 0.510972416 0.81947648
+normalized by data.nbytes memory used and total normalized: 7.614082336425781 12.211151123046875
+----
+1
+OK  peak=84 MB  Nx=992
+  nnx=  32  nframes=  1024  frame_stack≈537 MB ... start AP memory used, and total: 336994816 575682560
+normalized by data.nbytes memory used and total normalized: 1.2554035186767578 2.1445846557617188
+data size 268435456
+----
+after Prox_data, memory used, and total: 337004032 1112553472
+normalized by data.nbytes memory used and total normalized: 1.2554378509521484 4.144584655761719
+----
+!!!inorm False
+after frames initial, memory used, and total: 1443784704 2723166208
+normalized by data.nbytes memory used and total normalized: 5.378517150878906 10.144584655761719
+----
+start loop, memory used, and total: 1443793920 2723166208
+normalized by data.nbytes memory used and total normalized: 5.378551483154297 10.144584655761719
+----
+  0%|          | 0/5 [00:00<?, ?it/s]100%|██████████| 5/5 [00:00<00:00, 127.83it/s]
+end of loop, memory used, and total/1e9: 2.045701632 3.26003712
+normalized by data.nbytes memory used and total normalized: 7.620832443237305 12.144584655761719
+----
+1
+OK  peak=337 MB  Nx=2016
+  nnx=  64  nframes=  4096  frame_stack≈2147 MB ... start AP memory used, and total: 1350265344 2285910016
+normalized by data.nbytes memory used and total normalized: 1.2575325965881348 2.1289196014404297
+data size 1073741824
+----
+after Prox_data, memory used, and total: 1350299136 4433393664
+normalized by data.nbytes memory used and total normalized: 1.2575640678405762 4.12891960144043
+----
+!!!inorm False
+after frames initial, memory used, and total: 5777920000 10875844608
+normalized by data.nbytes memory used and total normalized: 5.381107330322266 10.12891960144043
+----
+start loop, memory used, and total: 5777953792 10875844608
+normalized by data.nbytes memory used and total normalized: 5.381138801574707 10.12891960144043
+----
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:00<00:00,  7.81it/s]100%|██████████| 5/5 [00:00<00:00, 36.44it/s]
+end of loop, memory used, and total/1e9: 8.189728256 13.023328256
+normalized by data.nbytes memory used and total normalized: 7.627278804779053 12.12891960144043
+----
+1
+OK  peak=1350 MB  Nx=4064
+  nnx= 128  nframes= 16384  frame_stack≈8590 MB ... start AP memory used, and total: 5407275520 9128916992
+normalized by data.nbytes memory used and total normalized: 1.2589794397354126 2.1254916191101074
+data size 4294967296
+----
+after Prox_data, memory used, and total: 5407407616 17718851584
+normalized by data.nbytes memory used and total normalized: 1.2590101957321167 4.125491619110107
+----
+!!!inorm False
+after frames initial, memory used, and total: 23120486400 34894522368
+normalized by data.nbytes memory used and total normalized: 5.383157730102539 8.124514102935791
+----
+start loop, memory used, and total: 23120618496 34894522368
+normalized by data.nbytes memory used and total normalized: 5.383188486099243 8.124514102935791
+----
+  0%|          | 0/5 [00:00<?, ?it/s]  0%|          | 0/5 [00:00<?, ?it/s]
+OOM at stage=reconstruct
+
+══════════════════════════════════════════════════════════════════════
+    nx   max nnx   max nframes    peak MB  failed at
+──────────────────────────────────────────────────────────────────────
+    32       512        262144       2078  none (hit MAX_NNX)
+    64       256         65536       1526  reconstruct
+   128       128         16384       1387  reconstruct
+   256        64          4096       1350  reconstruct
+══════════════════════════════════════════════════════════════════════
+CSV written to memory_limit_results.csv
+Plot saved to memory_limit_harness.png
