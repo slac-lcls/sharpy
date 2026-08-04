@@ -56,3 +56,9 @@ cover/
 
 # Simulation files
 *.h5
+# editor / OS / notebook scratch (kept the gauge-align PR from being reviewable)
+.DS_Store
+*.swp
+.ipynb_checkpoints/
+*.npz
+*.mat
