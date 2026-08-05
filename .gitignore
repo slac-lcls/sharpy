@@ -62,6 +62,5 @@ cover/
 .ipynb_checkpoints/
 *.npz
 *.mat
-# ...but these two ARE fixtures the tests/figures depend on:
+# ...but this one IS a fixture the tests depend on:
 !sharpy/saveH.npz
-!sharpy/gold.mat
