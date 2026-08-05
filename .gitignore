@@ -62,3 +62,5 @@ cover/
 .ipynb_checkpoints/
 *.npz
 *.mat
+# ...but this one IS a fixture the tests depend on:
+!sharpy/saveH.npz

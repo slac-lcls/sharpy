@@ -10,7 +10,8 @@ data, and plot the position-error metric
 vs iteration.
 
 Geometry matches horse_shoe_x1.m:
-  * gold-balls test image (sharpy/gold.mat, var img0), cropped to Nx x Ny
+  * gold-balls test image (data/gold_balls.png via position_simulate.transmission_object),
+    cropped to Nx x Ny
   * zone-plate probe (make_probe radii matched to the MATLAB ones)
   * nx = ny = 32, step Dx = Dy = 3.5, 16 x 16 = 256 frames, hexagonal packing
   * Nx = Ny = 144
