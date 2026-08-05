@@ -1,5 +1,6 @@
 numpy
 scipy
-cupy
 h5py
 matplotlib
+tqdm
+numba
