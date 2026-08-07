@@ -38,14 +38,27 @@ import numpy as np
 from Operators import xp
 
 
-def data_misfit(W, a):
-    """Amplitude data misfit sum_q (|W_q| - a_q)^2 (W in Fourier, a=sqrt(I))."""
-    return float(xp.sum((xp.abs(W) - a) ** 2, dtype=xp.float64))
+def data_misfit(W, a, weights=None):
+    """Amplitude data misfit sum_q (|W_q| - a_q)^2 (W in Fourier, a=sqrt(I)).
+
+    weights: optional per-pixel detector weights in {0,1} (or [0,1]),
+    broadcastable against W (see Operators.Project_data) -- each term is
+    multiplied by its weight, so W=0 (dead / zero-padded) pixels never
+    contribute. weights=None reproduces the unweighted result exactly."""
+    r2 = (xp.abs(W) - a) ** 2
+    if weights is not None:
+        r2 = weights * r2
+    return float(xp.sum(r2, dtype=xp.float64))
 
 
-def line_search(Z, D, a, n_newton=2, alpha0=1.0):
+def line_search(Z, D, a, n_newton=2, alpha0=1.0, weights=None):
     """Newton line search for the step alpha minimizing the amplitude data misfit
     along direction D (all in Fourier space). Returns alpha. See module docstring.
+
+    weights: optional per-pixel detector weights (see Operators.Project_data),
+    broadcastable against Z -- the misfit terms (and hence J', J'') are masked
+    by the weights, so W=0 pixels (unmeasured: a holds padding there, not
+    data) cannot steer alpha. weights=None is exactly the unweighted search.
     """
     tiny = 1e-12
     Dabs2 = xp.abs(D) ** 2
@@ -55,14 +68,17 @@ def line_search(Z, D, a, n_newton=2, alpha0=1.0):
         Wabs = xp.abs(W) + tiny
         r = Wabs - a
         u = xp.real(xp.conj(W) * D) / Wabs
+        g = r * u
+        h = u ** 2 + r * (Dabs2 - u ** 2) / Wabs
+        if weights is not None:
+            g = weights * g
+            h = weights * h
         # accumulate in float64: on GPU these reductions run over ~1e6 float32
         # terms and float32 summation loses the curvature to cancellation,
         # making the Newton step (and the AP iteration) diverge. CPU numpy uses
         # pairwise summation and happens to survive; force float64 everywhere.
-        # float64 accumulation: GPU float32 reductions over ~1e6 terms lose the
-        # curvature to cancellation (numpy uses pairwise summation on CPU).
-        Jp = 2.0 * xp.sum(r * u, dtype=xp.float64)
-        Jpp = 2.0 * xp.sum(u ** 2 + r * (Dabs2 - u ** 2) / Wabs, dtype=xp.float64)
+        Jp = 2.0 * xp.sum(g, dtype=xp.float64)
+        Jpp = 2.0 * xp.sum(h, dtype=xp.float64)
         alpha = alpha - Jp / (Jpp + tiny)
     return float(alpha)
 

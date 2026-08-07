@@ -9,7 +9,13 @@ Project_data / _proxd_resid_apply):
       changes neither the projected frames nor the residual;
   (c) on a padded-detector synthetic (data zero outside the mask), the
       masked-region |F| does NOT collapse over AP iterations when weights are
-      passed, while the unweighted projection clamps it toward zero.
+      passed, while the unweighted projection clamps it toward zero;
+  (d) the SOLVER entry points (Solvers.Alternating_projections /
+      Alternating_projections_position) pass weights= through to every
+      Project_data call -- weights=ones stays bit-identical to weights=None,
+      the masked region survives at solver level too (with and without the
+      line_search acceleration, whose data misfit is masked by the same W),
+      and ap_accel.line_search never reads masked amplitude values.
 """
 
 import os
@@ -20,6 +26,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import Operators as Op
+import Solvers
+from ap_accel import line_search
 
 xp = Op.xp
 eps = Op.eps
@@ -123,7 +131,11 @@ def test_bool_mask_accepted_by_project_data():
 
 # ------- (c) masked |F| does not collapse on a padded-detector synthetic -------
 
-def test_masked_region_does_not_collapse_in_ap():
+def _padded_synthetic():
+    """Padded-detector synthetic shared by the operator- and solver-level tests:
+    the physical detector is a central low-frequency disk W; outside is
+    zero-PADDING, not a measurement (~27% of the diffraction energy sits in
+    the padding). The ground truth is a fixed point of the MASKED iteration."""
     nx, Nx = 32, 64
     tx, ty = Op.make_translations(8, 8, 8, 8, Nx, Nx)
     mapid = Op.map_frames(tx, ty, nx, nx, Nx, Nx)
@@ -139,8 +151,6 @@ def test_masked_region_does_not_collapse_in_ap():
     F_true = xp.fft.fft2(frames_true)
     data_full = (xp.abs(F_true) ** 2).astype(xp.float32)
 
-    # physical detector = central low-frequency disk; outside is zero-PADDING,
-    # not a measurement (~27% of the diffraction energy sits in the padding)
     xi = xp.fft.ifftshift(xp.arange(nx) - nx / 2).reshape(nx, 1)
     rr = xp.sqrt(xi ** 2 + (xi.T) ** 2)
     W = (rr <= 8).astype(xp.float32)
@@ -150,21 +160,152 @@ def test_masked_region_does_not_collapse_in_ap():
         Op.Replicate_frame(xp.abs(probe) ** 2, nframes), Nx, Nx, mapid
     ).real.astype(xp.float32) + 1e-8
 
-    def ap_masked_ratio(weights, niter=8):
-        frames = frames_true.copy()
-        for _ in range(niter):
-            frames, _ = Op.Project_data(frames, data, weights=weights)
-            im = Op.Overlapc(
-                Op.Illuminate_frames(frames, xp.conj(probe)), Nx, Nx, mapid
-            ) / normalization
-            frames = Op.Illuminate_frames(Op.Splitc(im, mapid), probe)
-        F = xp.fft.fft2(frames)
-        M = 1.0 - W
-        return float((xp.abs(F) * M).sum() / (xp.abs(F_true) * M).sum())
+    return dict(nx=nx, Nx=Nx, tx=tx, ty=ty, mapid=mapid, probe=probe,
+                nframes=nframes, img=img, frames_true=frames_true,
+                F_true=F_true, W=W, data=data, normalization=normalization)
 
-    r_weighted = ap_masked_ratio(W)
+
+def _masked_ratio(syn, frames):
+    """Fraction of the true masked-region (padding) |F| retained by `frames`."""
+    F = xp.fft.fft2(frames)
+    M = 1.0 - syn["W"]
+    return float((xp.abs(F) * M).sum() / (xp.abs(syn["F_true"]) * M).sum())
+
+
+def test_masked_region_does_not_collapse_in_ap():
+    syn = _padded_synthetic()
+
+    def ap_masked_ratio(weights, niter=8):
+        frames = syn["frames_true"].copy()
+        for _ in range(niter):
+            frames, _ = Op.Project_data(frames, syn["data"], weights=weights)
+            im = Op.Overlapc(
+                Op.Illuminate_frames(frames, xp.conj(syn["probe"])),
+                syn["Nx"], syn["Nx"], syn["mapid"],
+            ) / syn["normalization"]
+            frames = Op.Illuminate_frames(Op.Splitc(im, syn["mapid"]), syn["probe"])
+        return _masked_ratio(syn, frames)
+
+    r_weighted = ap_masked_ratio(syn["W"])
     r_unweighted = ap_masked_ratio(None)
     # ground truth is a fixed point of the MASKED iteration: padded |F| preserved
     assert r_weighted > 0.99
     # the unweighted prox reads the padding as |F|=0 and clamps it (measured ~0.07)
     assert r_unweighted < 0.3
+
+
+# --------------- (d) solver-level pass-through (Solvers.py) ---------------
+
+def _run_ap_solver(syn, weights, niter, line_search=False, residuals_interval=np.inf):
+    def Split(im):
+        return Op.Splitc(im, syn["mapid"])
+
+    def Overlap(fr):
+        return Op.Overlapc(fr, syn["Nx"], syn["Nx"], syn["mapid"])
+
+    return Solvers.Alternating_projections(
+        False,                  # sync
+        syn["img"] + 0.0,       # img (start at truth: fixed point of masked AP)
+        None,                   # Gramiam
+        syn["probe"],           # illumination
+        Overlap,
+        Split,
+        syn["data"],
+        False,                  # refine_illumination
+        niter,
+        syn["normalization"],
+        None,                   # img_truth
+        residuals_interval,
+        line_search=line_search,
+        weights=weights,
+    )
+
+
+def _rel(a, b):
+    return float(xp.linalg.norm(a - b) / (1.0 + xp.linalg.norm(a)))
+
+
+def test_ap_solver_weights_ones_matches_none():
+    # ones vs None through the FULL solver loop. The iterate path without
+    # line_search is elementwise + FFT + bincount -> bitwise identical.
+    # Anything downstream of a float32 SUM/NORM reduction (the residual rows,
+    # the line-search alpha) is only compared to a tolerance: on some numpy
+    # builds (observed: anaconda arm64) those reductions are allocation-
+    # alignment dependent and wobble ~1e-7 relative BETWEEN IDENTICAL CALLS,
+    # while a genuine weights leak would show up orders of magnitude larger.
+    syn = _padded_synthetic()
+    ones = xp.ones((syn["nx"], syn["nx"]), dtype=xp.float32)
+
+    img0, frames0, _, res0 = _run_ap_solver(syn, None, 3, residuals_interval=1)
+    img1, frames1, _, res1 = _run_ap_solver(syn, ones, 3, residuals_interval=1)
+    assert _eq(img0, img1)
+    assert _eq(frames0, frames1)
+    assert _rel(res0, res1) < 1e-5
+
+    img0, frames0, _, res0 = _run_ap_solver(syn, None, 3, line_search=True,
+                                            residuals_interval=1)
+    img1, frames1, _, res1 = _run_ap_solver(syn, ones, 3, line_search=True,
+                                            residuals_interval=1)
+    assert _rel(img0, img1) < 1e-5
+    assert _rel(frames0, frames1) < 1e-5
+    assert _rel(res0, res1) < 1e-5
+
+
+def test_ap_solver_masked_region_does_not_collapse():
+    # same criterion as the operator-level test, run through the solver loop
+    syn = _padded_synthetic()
+    _, frames_w, _, _ = _run_ap_solver(syn, syn["W"], 8)
+    _, frames_u, _, _ = _run_ap_solver(syn, None, 8)
+    assert _masked_ratio(syn, frames_w) > 0.99
+    assert _masked_ratio(syn, frames_u) < 0.3
+
+
+def test_ap_solver_line_search_is_weights_aware():
+    # with line_search=True the misfit driving alpha is masked by W: the
+    # padded region must still survive (an unweighted misfit would read the
+    # padding as sqrt(I)=0 and steer alpha toward collapsing it)
+    syn = _padded_synthetic()
+    _, frames_w, _, _ = _run_ap_solver(syn, syn["W"], 8, line_search=True)
+    assert _masked_ratio(syn, frames_w) > 0.99
+
+
+def test_line_search_masked_amp_values_are_ignored():
+    # ap_accel.line_search with weights: amplitudes at W=0 pixels are padding,
+    # not data -- perturbing them must not change alpha; weights=ones == None.
+    # isclose, not ==: alpha itself wobbles ~1e-7 relative between IDENTICAL
+    # calls on alignment-dependent-reduction numpy builds (see above); a leak
+    # of the +11.0 perturbation would move alpha at the percent level.
+    rng = np.random.default_rng(9)
+    shape = (4, 16, 16)
+    Z = xp.asarray((rng.standard_normal(shape)
+                    + 1j * rng.standard_normal(shape)).astype(np.complex64))
+    D = xp.asarray((rng.standard_normal(shape)
+                    + 1j * rng.standard_normal(shape)).astype(np.complex64))
+    a = xp.asarray((rng.random(shape) * 3.0).astype(np.float32))
+    W = _mask(seed=10)
+    a_perturbed = a + 11.0 * (1.0 - W)
+    assert np.isclose(line_search(Z, D, a, weights=W),
+                      line_search(Z, D, a_perturbed, weights=W), rtol=1e-5)
+    ones = xp.ones(shape[-2:], dtype=xp.float32)
+    assert np.isclose(line_search(Z, D, a),
+                      line_search(Z, D, a, weights=ones), rtol=1e-5)
+
+
+def test_position_solver_weights_ones_is_bit_identical():
+    # smoke the weights wiring of Alternating_projections_position (no
+    # position updates in 2 iters -- position_start defaults past them)
+    syn = _padded_synthetic()
+    ones = xp.ones((syn["nx"], syn["nx"]), dtype=xp.float32)
+
+    def run(weights):
+        return Solvers.Alternating_projections_position(
+            syn["img"] + 0.0, syn["probe"], syn["data"],
+            syn["tx"], syn["ty"], syn["nx"], syn["nx"], syn["Nx"], syn["Nx"],
+            maxiter=2, weights=weights,
+        )
+
+    img0, frames0, _, _, res0 = run(None)
+    img1, frames1, _, _, res1 = run(ones)
+    assert _eq(img0, img1)
+    assert _eq(frames0, frames1)
+    assert _rel(res0, res1) < 1e-5  # norm-reduction rows: see _rel note above

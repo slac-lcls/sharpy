@@ -20,6 +20,12 @@ Key solvers
 In operator terms each iteration is:
   Split -> Illuminate -> Propagate -> Project_data -> IPropagate
         -> [synchronize_frames_c] -> Overlap  (-> next iterate)
+
+Every solver entry point accepts an optional ``weights=`` per-pixel detector
+mask, forwarded to each Project_data call (W=1 pixels get the magnitude
+projection, W=0 dead/zero-padded pixels keep their Fourier value; see
+Operators.Project_data). The default None keeps the historical unweighted
+behaviour bit-for-bit.
 """
 
 import numpy as np
@@ -100,6 +106,16 @@ def normalize_times(tot=None):
     return tot
 
 
+def _as_weights(weights):
+    """Normalize an optional detector-weights argument ONCE per solve (bool/int
+    masks -> float32, host lists -> xp array) so the per-iteration Project_data
+    calls and the line search reuse the same array without re-converting."""
+    if weights is None:
+        return None
+    weights = xp.asarray(weights)
+    return weights if weights.dtype == xp.float32 else weights.astype(xp.float32)
+
+
 ############################################
 #old version that does not have the GPU calculations
 ############################################
@@ -118,6 +134,7 @@ def Alternating_projections(
     img_truth,
     residuals_interval,
     line_search=False,
+    weights=None,
 ):
     """
     Parameters
@@ -148,6 +165,12 @@ def Alternating_projections(
         Over-relax the AP step by the alpha that minimizes the Fourier data
         misfit (Newton line search, ap_accel.line_search; parameter-free,
         alpha~1.9). Default False (unchanged behaviour); ~1.8x fewer iterations.
+    weights : 2d matrix, optional
+        Per-pixel detector weights/mask forwarded to every Project_data call
+        (W=1 project magnitude, W=0 dead/zero-padded pixels keep their Fourier
+        value; see Operators.Project_data), broadcastable against the frames
+        (typically one (nx,ny) mask). The line_search data misfit is masked by
+        the same weights. Default None: historical unweighted behaviour.
 
     Returns
     -------
@@ -179,6 +202,8 @@ def Alternating_projections(
 
     t000 = timer()
     t00 = t000
+
+    weights = _as_weights(weights)
 
     # we need the frames norm to normalize
     frames_norm_sum = xp.linalg.norm(xp.sqrt(frames_data))
@@ -275,7 +300,8 @@ def Alternating_projections(
 
         # frames, mse_data = Prox_data(frames, compute_residuals )
         frames, mse_data = Project_data(
-            frames, frames_data, compute_residuals=compute_residuals
+            frames, frames_data, compute_residuals=compute_residuals,
+            weights=weights,
         )
         # if GPU and ii<2:
         #     print('in loop, after Prox data memory used, and total normalized:', mempool.used_bytes()/frames_data.nbytes,mempool.total_bytes()/frames_data.nbytes )
@@ -339,11 +365,15 @@ def Alternating_projections(
             # AP step Dz = P_Q P_a z0 - z0; over-relax by the alpha minimizing the
             # data misfit ||sqrt(I) - |Propagate(z0 + alpha Dz)|||^2 (Fourier,
             # 2 Newton steps from 1). Parameter-free; alpha~1.9 (over-relaxation).
+            # With weights the misfit terms are masked by the same W as the data
+            # projection (W=0 pixels hold padding, not sqrt(I): they must not
+            # steer alpha).
             Dz = frames - z0
             # Propagate overwrites its input in place on GPU (fft_plan owrite=True),
             # so pass copies -- otherwise z0 and Dz get clobbered with their own
             # FFTs before the update below (CPU scipy.fftpack does not overwrite).
-            alpha = _line_search(Propagate(z0 + 0.0), Propagate(Dz + 0.0), frames_amp)
+            alpha = _line_search(Propagate(z0 + 0.0), Propagate(Dz + 0.0), frames_amp,
+                                 weights=weights)
             frames = z0 + alpha * Dz
 
         # if GPU and ii<2:
@@ -417,7 +447,8 @@ def Alternating_projections_c(
     img_truth,
     residuals_interval,
     sync_interval=1,
-    num_iter = 5
+    num_iter = 5,
+    weights=None,
 ):
     """
     Parameters
@@ -445,7 +476,11 @@ def Alternating_projections_c(
     img_truth : TYPE, optional
         truth, used to compare . The default is None.
     eig_plan: dictionary for eigensolver, optional
-    
+    weights : 2d matrix, optional
+        Per-pixel detector weights/mask forwarded to every Project_data call
+        (W=1 project magnitude, W=0 keep the Fourier value; see
+        Operators.Project_data). Default None: unweighted behaviour.
+
     Returns
     -------
     img : TYPE
@@ -477,7 +512,9 @@ def Alternating_projections_c(
     t000 = timer()
     t00 = t000
     reg0 = 1e-08
-    
+
+    weights = _as_weights(weights)
+
     # we need the frames norm to normalize
     frames_norm_sum = xp.linalg.norm(xp.sqrt(frames_data))
 
@@ -553,7 +590,7 @@ def Alternating_projections_c(
         frames = Illuminate_frames(Split(img), illumination_start)
     
     frames, mse_data = Project_data(
-            frames, frames_data, compute_residuals=False
+            frames, frames_data, compute_residuals=False, weights=weights
         )
     if GPU:
         print(
@@ -623,9 +660,10 @@ def Alternating_projections_c(
         split_cuda(img,frames, translations,illumination_start + 0)
   
         timers["illuminate&split"] += timer() - t0
-        
+
         frames, mse_data = Project_data(
-            frames, frames_data, compute_residuals=compute_residuals
+            frames, frames_data, compute_residuals=compute_residuals,
+            weights=weights,
         )
         
         if refine_illumination and sync:
@@ -840,6 +878,7 @@ def Alternating_projections_batched_c(
     overlap_cuda, split_cuda, frames_data, refine_illumination, maxiter,
     normalization=None, img_truth=None, residuals_interval=1, sync_interval=1,
     num_iter=5, frame_batch=1024, frame_store="auto", pair_chunk=4096,
+    weights=None,
 ):
     """Frame-batched GPU drop-in for Alternating_projections_c.
 
@@ -863,9 +902,12 @@ def Alternating_projections_batched_c(
     batching avoids -- left 0. In HOST mode the returned ``frames`` is a numpy array. GPU-only.
     ``refine_illumination`` is supported and forces the DEVICE tier (the probe update sums over
     the whole frames stack, which must be device-resident).
+    ``weights``: optional per-pixel detector mask forwarded to Project_data; an (nx,ny)
+    mask broadcasts over all frames, a per-frame (nframes,nx,ny) stack is sliced per batch.
     """
     assert GPU, "batched solver is a GPU path"
     reg0 = 1e-8
+    weights = _as_weights(weights)
     nframes, nx, ny = frames_data.shape
     B = frame_batch if (frame_batch and frame_batch > 0) else nframes
     translations = (translations_x + 1j * translations_y).astype(cp.complex64)
@@ -924,7 +966,8 @@ def Alternating_projections_batched_c(
             e = min(nframes, s + B)
             fb = cp.zeros((e - s, nx, ny), dtype=cp.complex64)
             split_cuda(img, fb, translations[s:e], illumination_start)
-            fb, mse = Project_data(fb, frames_data[s:e], compute_residuals=cr)
+            wb = weights if (weights is None or weights.ndim < 3) else weights[s:e]
+            fb, mse = Project_data(fb, frames_data[s:e], compute_residuals=cr, weights=wb)
             if cr and mse is not None:
                 mse_acc += float(mse)
             F[s:e] = cp.asnumpy(fb) if use_host else fb
@@ -1016,6 +1059,7 @@ def plot_intermediate(images):
 def fit_drift_global(
     frames_data, illumination, translations_x, translations_y, nx, ny, Nx, Ny,
     model="linear", drift_max=5.0, ngrid=11, sweeps=3, ap_iters=10,
+    weights=None,
 ):
     """Global parametric drift fit (Section III.A / Eckert "rigid source projection").
 
@@ -1035,9 +1079,15 @@ def fit_drift_global(
 
     Returns per-frame (xi_x, xi_y). The constant (global translation) term is
     omitted -- it is the unobservable position gauge.
+
+    weights: optional per-pixel detector mask (see Operators.Project_data); it
+    both weights the AP inner loop and masks the misfit driving the fit, so
+    dead/padded pixels cannot bias the recovered drift.
     """
     from Operators import Splitc, Overlapc, map_frames
     from position_retrieval import shift_probe_fourier
+
+    weights = _as_weights(weights)
 
     mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
     sx = translations_x - xp.mean(translations_x)
@@ -1061,10 +1111,12 @@ def fit_drift_global(
         frames = Splitc(im, mapid) * ps
         mse = 0.0
         for _ in range(ap_iters):
-            frames, mse = Project_data(frames, frames_data, compute_residuals=True)
+            frames, mse = Project_data(frames, frames_data, compute_residuals=True,
+                                       weights=weights)
             im = Overlapc(frames * xp.conj(ps), Nx, Ny, mapid) / norm
             frames = Splitc(im, mapid) * ps
-        _, mse = Project_data(frames, frames_data, compute_residuals=True)
+        _, mse = Project_data(frames, frames_data, compute_residuals=True,
+                              weights=weights)
         return float(mse)
 
     C = xp.zeros(2 * k)
@@ -1115,6 +1167,7 @@ def Alternating_projections_position(
     xi_x_truth=None,
     xi_y_truth=None,
     residuals_interval=1,
+    weights=None,
 ):
     """Alternating projections with position (scan-error) retrieval.
 
@@ -1193,6 +1246,11 @@ def Alternating_projections_position(
         Ground-truth shifts, for the position error metric only.
     residuals_interval : int
         How often to record residuals.
+    weights : (nx, ny) or broadcastable, optional
+        Per-pixel detector weights/mask forwarded to every Project_data call
+        (and to fit_drift_global's misfit when drift_fit=True): W=1 project
+        magnitude, W=0 dead/zero-padded pixels keep their Fourier value. See
+        Operators.Project_data. Default None: unweighted behaviour.
 
     Returns
     -------
@@ -1215,6 +1273,7 @@ def Alternating_projections_position(
     )
 
     nframes = frames_data.shape[0]
+    weights = _as_weights(weights)
     mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
     dp = probe_derivatives(illumination)
 
@@ -1240,6 +1299,7 @@ def Alternating_projections_position(
         xi_x, xi_y = fit_drift_global(
             frames_data, illumination, translations_x, translations_y,
             nx, ny, Nx, Ny, model=drift_model, drift_max=drift_max,
+            weights=weights,
         )
     elif xi_x_init is not None:
         xi_x = xi_x_init + 0.0
@@ -1281,7 +1341,8 @@ def Alternating_projections_position(
 
         # Fourier-magnitude projection.
         frames, mse_data = Project_data(
-            frames, frames_data, compute_residuals=compute_residuals
+            frames, frames_data, compute_residuals=compute_residuals,
+            weights=weights,
         )
 
         frames_old = frames + 0.0
