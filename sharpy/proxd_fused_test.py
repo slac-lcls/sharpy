@@ -65,16 +65,23 @@ def validate_weighted(nframes, nx):
     ok_mse = bool(xp.allclose(msep, msef, rtol=1e-4))
     print(f"  validate wgt    : out match={ok_out}  mse match={ok_mse}  "
           f"(plain={float(msep):.6g}  fused={float(msef):.6g})")
+    # The ARRAYS must match bitwise; the mse SCALAR must not be compared bitwise
+    # across launches -- the kernel's atomicAdd(double) block reduction sums in
+    # nondeterministic order, so even the SAME call repeated on identical inputs
+    # differs by ~1e-15 relative (measured on A100; arrays stay bitwise). A real
+    # leak of masked-pixel data would show up in the arrays, not only the mse.
+    def _mse_close(a, b, tol=1e-12):
+        return abs(float(a) - float(b)) <= tol * abs(float(a))
     # masked-pixel data must be inert: perturb d at W=0, nothing may change
     d2 = d + 37.5 * (1.0 - W)
     outf2, msef2 = O._proxd_resid_apply(f.copy(), d2, True, weights=W)
-    ok_inert = bool(xp.all(outf == outf2)) and float(msef) == float(msef2)
-    # W=ones must reproduce the unweighted kernel bitwise
+    ok_inert = bool(xp.all(outf == outf2)) and _mse_close(msef, msef2)
+    # W=ones must reproduce the unweighted kernel bitwise (arrays)
     ones = xp.ones((nx, nx), dtype=xp.float32)
     out1, mse1 = O._proxd_resid_apply(f.copy(), d, True, weights=ones)
     out0, mse0 = O._proxd_resid_apply(f.copy(), d, True)
-    ok_ones = bool(xp.all(out0 == out1)) and float(mse0) == float(mse1)
-    print(f"  validate wgt    : W=0 inert={ok_inert}  W=ones==None bitwise={ok_ones}")
+    ok_ones = bool(xp.all(out0 == out1)) and _mse_close(mse0, mse1)
+    print(f"  validate wgt    : W=0 inert={ok_inert}  W=ones==None arrays-bitwise={ok_ones}")
     return ok_out and ok_mse and ok_inert and ok_ones
 
 
@@ -164,3 +171,5 @@ if __name__ == "__main__":
         print("CPU: fused path falls back to plain (no kernel). Run on Perlmutter for the A/B.")
         sys.exit(0 if okv else 1)
     bench(nframes, nx)
+    # gate the exit code on GPU too, so CI/batch wrappers catch validation failures
+    sys.exit(0 if okv else 1)
