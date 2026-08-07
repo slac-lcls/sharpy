@@ -19,7 +19,10 @@ from Operators import get_times, reset_times, normalize_times
 import config
 from Operators import Gramiam_plan, Replicate_frame
 
-Alternating_projections = Solvers.Alternating_projections
+# the call below passes translations + the cuda split/overlap kernels: that is
+# the Alternating_projections_c signature (the plain CPU solver takes the
+# Overlap/Split closures instead)
+Alternating_projections = Solvers.Alternating_projections_c
 reset_times()
 GPU = config.GPU #False
 
@@ -28,15 +31,18 @@ sync = True
 if GPU:
     import cupy as cp
     xp = cp
+    from wrap_ops import overlap_cuda, split_cuda
     print("using GPU")
 else:
     xp = np
+    overlap_cuda = split_cuda = None  # GPU-only kernels (wrap_ops imports cupy)
     print("using CPU")
 
 
 ##################################################
 # input data
-#fname_in = "simulation.h5"
+import sys
+fname_in = sys.argv[1] if len(sys.argv) > 1 else "simulation.h5"
 fid = h5py.File(fname_in, "r")
 
 #data = xp.array(fid["data"], dtype=xp.float32) 
@@ -152,7 +158,7 @@ for nl in range(-3,2):
     translations_y,
     overlap_cuda,
     split_cuda,
-    data,
+    data_in,
     refine_illumination,
     maxiter,
     normalization=None,
@@ -165,10 +171,11 @@ for nl in range(-3,2):
     if residuals_AP.size > 0:
         nmse4 = residuals_AP[-1, 0]
     else:
-        nmse4 = np.NaN
+        nmse4 = np.nan
 
     if GPU:
-        truth = truth.get()
+        # NB: truth stays on device for the whole sweep (the next iteration's
+        # solver call and SNR need it there); it is fetched once after the loop
         img = img4.get()
         residuals_AP = residuals_AP.get()
     else:
@@ -182,6 +189,9 @@ for nl in range(-3,2):
     test_result['nmse'].append(nmse4)
     
 ############################
+
+if GPU:
+    truth = truth.get()   # to host, once, for the plots below
 
 #make a reconstruction plot
 #fig = plt.figure(figsize=(30, 10),dpi=1200)

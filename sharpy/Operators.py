@@ -1231,9 +1231,9 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-7):
         #eigenvalues, eigenvectors = eigsh(H1 , k=2,ncv = 6, v0 = v0, maxiter = 10,which="LM", tol=1e-6,return_eigenvectors = True) # if dont specify starting point v0, converges to another eigenvector
         #eigenvalues,eigenvectors = np.linalg.eigh(H.get().todense()) #working
         #eigenvalues,eigenvectors = xp.linalg.eigh(H.todense()) #not working
-        
-         
-    '''    
+
+
+    r'''
     else:
         print(type(H))
         v0 = xp.ones((nframes, 1),xp.complex64)

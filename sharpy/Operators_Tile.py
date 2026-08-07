@@ -398,6 +398,11 @@ def Alternating_projections_tiles(
 
     """
  
+    # GPU-only: the loop drives the cuda split/overlap kernels (and .get())
+    # directly; the old CPU else-branches referenced Overlap/Split closures
+    # and a padded_Tile that this function never defines.
+    assert GPU, "Alternating_projections_tiles is GPU-only"
+
     compute_residuals = True
     # we need the frames norm to normalize
     frames_norm_sum = xp.linalg.norm(xp.sqrt(frames_data))
@@ -408,11 +413,8 @@ def Alternating_projections_tiles(
      
 
     # get the frames from the inital image
-    if GPU:
-        frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
-        split_cuda(img, frames, translations, illumination)
-    else:
-        frames = Illuminate_frames(Split(img), illumination)
+    frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
+    split_cuda(img, frames, translations, illumination)
 
     nresiduals = int(np.ceil(maxiter / residuals_interval))
 
@@ -538,18 +540,12 @@ def Alternating_projections_tiles(
         print(Gplan_Tiles)
         '''
             
-        if GPU:
-            if NTx* NTy == 1:
-                omega_tiles = 1
-            else:
-                #inormalization_split_overall is be the same for all tiles. But synchorinize_frames_c only takes 3D input
-                omega_tiles=synchronize_frames_c(Tile , 0, Tiles_norm, inormalization_split_overall, Gplan_Tiles,num_iter) 
-                #print('!!!!!!!!!!',omega_tiles)
-                  
+        if NTx* NTy == 1:
+            omega_tiles = 1
         else:
-            omega_tiles=synchronize_frames_c(padded_Tile, 1 + 0j, Tiles_norm, inormalization_split_overall, Gplan_Tiles,num_iter)
-              
-            #padded_Tile = padded_Tile * omega_tiles
+            #inormalization_split_overall is be the same for all tiles. But synchorinize_frames_c only takes 3D input
+            omega_tiles=synchronize_frames_c(Tile , 0, Tiles_norm, inormalization_split_overall, Gplan_Tiles,num_iter)
+            #print('!!!!!!!!!!',omega_tiles)
             
 
         #print('HELLOOO',omega_tiles)

@@ -509,6 +509,11 @@ def Alternating_projections_c(
         print("data size", frames_data.nbytes)
         print("----")
 
+    # GPU-only: the loop drives the cuda split/overlap kernels directly (the
+    # old CPU else-branches referenced the Overlap/Split closures this
+    # function never receives). Use Alternating_projections on CPU.
+    assert GPU, "Alternating_projections_c is GPU-only; use Alternating_projections on CPU"
+
     t000 = timer()
     t00 = t000
     reg0 = 1e-08
@@ -570,25 +575,16 @@ def Alternating_projections_c(
  
 
     if sync == True:
-
-        if GPU:
-            inormalization_split = xp.zeros(frames_data.shape,dtype = xp.complex64)
-            reg = reg0 * xp.max(xp.abs(normalization)) #for accuracy, choose reg0 = 1e-08
-            split_cuda(1/(normalization+reg),inormalization_split,translations, 0)
-            print('!!!inorm',np.isnan(inormalization_split).any())
-            #print(inormalization_split)
-        else:
-            #inormalization_split = Split(1/(normalization+1e-8))
-            inormalization_split = Split(1/(normalization))
+        inormalization_split = xp.zeros(frames_data.shape,dtype = xp.complex64)
+        reg = reg0 * xp.max(xp.abs(normalization)) #for accuracy, choose reg0 = 1e-08
+        split_cuda(1/(normalization+reg),inormalization_split,translations, 0)
+        print('!!!inorm',np.isnan(inormalization_split).any())
+        #print(inormalization_split)
         
     # get the frames from the inital image
-    if GPU:
-        frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
-        split_cuda(img, frames, translations, illumination_start)
-            
-    else:
-        frames = Illuminate_frames(Split(img), illumination_start)
-    
+    frames = xp.zeros(frames_data.shape,dtype = xp.complex64)
+    split_cuda(img, frames, translations, illumination_start)
+
     frames, mse_data = Project_data(
             frames, frames_data, compute_residuals=False, weights=weights
         )
@@ -704,20 +700,17 @@ def Alternating_projections_c(
         ##################
         # overlap projection
         t0 = timer()
-        if GPU == False:
-            img = Overlap(Illuminate_frames(frames, xp.conj(illumination_start))) / normalization
-        else: 
-            img0 = img * 0 
-            overlap_cuda(img0, frames,translations, illumination_start) 
-            if refine_illumination:
-                tic = timer()
-                reg_img = reg0 * xp.max(xp.abs(normalization))
-                img = (img0 + reg_img * img) / (normalization + reg_img * xp.eye(normalization.shape[0],normalization.shape[1], dtype = normalization.dtype))
-                #img = (img0 + reg_img * img) / (normalization + reg_img)
-                #img = img0 / (normalization+reg_img)
-            else:
-                reg = reg0 * xp.max(xp.abs(normalization))
-                img = img0/(normalization+reg)
+        img0 = img * 0
+        overlap_cuda(img0, frames,translations, illumination_start)
+        if refine_illumination:
+            tic = timer()
+            reg_img = reg0 * xp.max(xp.abs(normalization))
+            img = (img0 + reg_img * img) / (normalization + reg_img * xp.eye(normalization.shape[0],normalization.shape[1], dtype = normalization.dtype))
+            #img = (img0 + reg_img * img) / (normalization + reg_img)
+            #img = img0 / (normalization+reg_img)
+        else:
+            reg = reg0 * xp.max(xp.abs(normalization))
+            img = img0/(normalization+reg)
 
           
         timers["Overlap"] += timer() - t0
