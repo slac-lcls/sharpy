@@ -34,8 +34,7 @@ else:
 
 import sys
 # Retrieve the value of 'fname' from the command-line arguments
-#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
-#fname_in = "poster_64x64.h5"
+fname_in = sys.argv[1] if len(sys.argv) > 1 else "poster_64x64.h5"
 fid = h5py.File(fname_in, "r")
 
 data = xp.array(fid["data"], dtype=xp.float32)
@@ -217,7 +216,7 @@ if residuals_AP0.size > 0:
     nmse4_0 = residuals_AP0[-1, 0] #nmse for no sync
     nmse4_1 = residuals_AP1[-1, 0] #nmse for sync
 else:
-    nmse4 = np.NaN
+    nmse4 = np.nan
 
 
 if GPU:

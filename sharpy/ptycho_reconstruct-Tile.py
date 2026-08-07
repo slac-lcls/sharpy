@@ -32,7 +32,8 @@ else:
 
 import sys
 # Retrieve the value of 'fname' from the command-line arguments
-#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
+fname_in = sys.argv[1] if len(sys.argv) > 1 else sys.exit(
+    "usage: python ptycho_reconstruct-Tile.py <data.h5>")
 
 fid = h5py.File(fname_in, "r")
 
@@ -177,7 +178,7 @@ nrm0 = xp.linalg.norm(truth)
 if residuals_AP.size > 0:
     nmse4 = residuals_AP[-1, 0]
 else:
-    nmse4 = np.NaN
+    nmse4 = np.nan
 
 if GPU:
     truth = truth.get()

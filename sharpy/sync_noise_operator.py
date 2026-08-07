@@ -40,11 +40,14 @@ else:
 ##################################################
 import sys
 # Retrieve the value of 'fname' from the command-line arguments
-#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
+fname_in = sys.argv[1] if len(sys.argv) > 1 else "simulation.h5"
+
+sync = True
 
 fid = h5py.File(fname_in, "r")
 
 data = xp.array(fid["data"], dtype=xp.float32)
+data0 = copy.deepcopy(data) #make a copy of the noiseless data
 illumination = xp.array(fid["probe"], dtype=xp.complex64)
 
 translations = xp.array(fid["translations"])
@@ -95,8 +98,9 @@ def Simulate_Noise(opts,sync,data,truth, translations_x, translations_y, Nx, Ny,
     
     ###
     refine_illumination, maxiter, residuals_interval = opts['refine_illumination'], opts['maxiter'], opts['residuals_interval']
-    data,data0,illumination,translations, nframes, nx, ny, resolution, truth, translations_x, translations_y, Nx, Ny= processor.data, processor.data0, processor.illumination, processor.translations, processor.nframes, processor.nx, processor.ny, processor.resolution, processor.truth, processor.translations_x, processor.translations_y, processor.Nx, processor.Ny
-    
+    # (data0/illumination/translations/resolution come from module level -- the
+    # abandoned `processor` container refactor never defined one)
+
     ###
     
     print("geometry: img size:", (Nx, Ny), "frames:", (nx, ny, nframes))
@@ -106,7 +110,7 @@ def Simulate_Noise(opts,sync,data,truth, translations_x, translations_y, Nx, Ny,
     img_initial = xp.ones((Nx, Ny), dtype=xp.complex64)
     nrm0 = xp.linalg.norm(truth)
     test_result = {'SNR':[],'img':[],'frames':[],'illum':[],'residuals_AP':[],'nmse':[]}
-    Gplan = Get_Mappings(processor,sync)
+    # module-level Gplan (Gramiam_plan above) -- see the `processor` note
     ###
     print('HERE',xp.shape(data0))
     noise_list = noise_generator(opts['noise_low'], opts['noise_high'], xp.shape(data),opts['noise_type'])
@@ -115,7 +119,6 @@ def Simulate_Noise(opts,sync,data,truth, translations_x, translations_y, Nx, Ny,
         
         noise = noise_list[nl].astype(data.dtype)
         data_in = data + noise
-        Gplan = Get_Mappings(processor,sync)
         #data_in = (xp.sqrt(data0) + noise)**2 #gaussian noise
         img4, frames, illum, residuals_AP = Alternating_projections(
             sync,
@@ -138,7 +141,7 @@ def Simulate_Noise(opts,sync,data,truth, translations_x, translations_y, Nx, Ny,
         if residuals_AP.size > 0:
             nmse4 = residuals_AP[-1, 0]
         else:
-            nmse4 = np.NaN
+            nmse4 = np.nan
 
 
         test_result['SNR'].append(xp.linalg.norm(truth.ravel()) / xp.linalg.norm(noise.ravel()))
@@ -160,7 +163,6 @@ def noise_generator(noise_low,noise_high,length,noise_type):
             noise.append(10**nl * xp.random.randn(length))
     return noise
 
-def 
 ############################
 
 def plotter(test_result0, test_result1, img0, image1,processor):

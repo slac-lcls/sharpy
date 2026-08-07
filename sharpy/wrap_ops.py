@@ -71,7 +71,7 @@ def overlap_cuda(image, frames, translations, illumination):
     nthreads = 256 
     
     if type(image)== type(None):
-        image = xp.zeros((1)) #--?
+        image = cp.zeros((1)) #--?
     # we could verify that frames illumination and translations shapes are consistent
     
     if type(frames) == int:

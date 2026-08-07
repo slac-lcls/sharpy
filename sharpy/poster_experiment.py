@@ -34,7 +34,8 @@ else:
 
 import sys
 # Retrieve the value of 'fname' from the command-line arguments
-#fname_in = sys.argv[1] if len(sys.argv) > 1 else None
+fname_in = sys.argv[1] if len(sys.argv) > 1 else sys.exit(
+    "usage: python poster_experiment.py <data.h5>")
 
 fid = h5py.File(fname_in, "r")
 
@@ -189,7 +190,7 @@ if residuals_AP0.size > 0:
     nmse4_0 = residuals_AP0[-1, 0] #nmse for no sync
     nmse4_1 = residuals_AP1[-1, 0] #nmse for sync
 else:
-    nmse4 = np.NaN
+    nmse4 = np.nan
 
 if GPU:
     truth = truth.get()
@@ -197,8 +198,8 @@ if GPU:
     img1 = img1.get() #reconstruction for nyc
     residuals_AP0 = residuals_AP0.get() #convergence for no sync
     residuals_AP1 = residuals_AP1.get() #convergence for sync
-else:
-    img = img4
+# (on CPU the arrays are already numpy; the old `img = img4` here referenced a
+# variable this script never defines)
 
 ## Reconstruction plot
 fig = plt.figure(figsize=(10, 14))
