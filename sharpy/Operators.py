@@ -47,7 +47,11 @@ Propagation  (real space <-> detector / far field):
 
 Data constraint:
   Project_data(frames, data)     Fourier-magnitude projection: replace the
-        modeled magnitude with sqrt(data), keep the phase (ProxD inside)
+        modeled magnitude with sqrt(data), keep the phase (ProxD inside).
+        Optional weights= (per-pixel detector mask): W=1 pixels are projected,
+        W=0 pixels (dead / zero-padded detector) keep their Fourier value
+        unconstrained -- without it the AGM prox reads y=0 as "magnitude must
+        be 0" and clamps |F| at every unmeasured pixel.
 
 Gramian & phase synchronization:
   Gramiam_plan(...)              precompute overlap geometry + plan["val2H"]
@@ -159,7 +163,7 @@ eps = xp.float32(1e-16)
 if GPU:
 
     @cp.fuse(kernel_name="ProxD")
-    def ProxD(x, y, eps):
+    def _ProxD_hard(x, y, eps):
         # AGM (amplitude / sqrt-Gaussian) HARD magnitude projection: |z| <- sqrt(data),
         # phase kept. Single sqrt-of-ratio (was two sqrt + a divide). GPU-fast reciprocal
         # form: x * cpx.rsqrt((|x|^2+eps)/(y+eps)) (as in Prox_data_r) -- the
@@ -167,12 +171,40 @@ if GPU:
         # (KL/Anscombe): see ProxD_noise + the note above Project_data.
         return x * xp.sqrt((y + eps) / ((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
 
+    @cp.fuse(kernel_name="ProxDW")
+    def _ProxD_hard_w(x, y, w, eps):
+        # weighted hard projection: convex combination of the projected and the
+        # untouched value, x*(w*s + (1-w)). w=1 -> x*s bitwise (1*s+0 is exact),
+        # w=0 -> x untouched (masked/padded detector pixels stay unconstrained).
+        s = xp.sqrt((y + eps) / ((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
+        return x * (w * s + (1.0 - w))
+
 
 else:
 
-    def ProxD(x, y, eps):
+    def _ProxD_hard(x, y, eps):
         # AGM hard magnitude projection (numpy has no rsqrt ufunc -> sqrt-of-ratio).
         return x * xp.sqrt((y + eps) / ((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
+
+    def _ProxD_hard_w(x, y, w, eps):
+        # weighted variant: see the GPU twin above.
+        s = xp.sqrt((y + eps) / ((xp.real(x) ** 2 + xp.imag(x) ** 2) + eps))
+        return x * (w * s + (1.0 - w))
+
+
+def ProxD(x, y, eps, w=None):
+    """AGM hard magnitude projection |x| <- sqrt(y), phase kept.
+
+    w: optional per-pixel detector weights in {0,1} (or [0,1]), broadcastable
+    against x (e.g. one (N,N) detector mask for (V,N,N) frames). W=1 applies
+    the projection, W=0 keeps x unchanged -- dead / zero-padded pixels must NOT
+    be clamped to |x|=0 (y=0 there means "unmeasured", not "dark"); leaving
+    them free is what allows extrapolation beyond the physical detector.
+    w=None reproduces the unweighted result bit-for-bit. Masked-pixel y values
+    are never used (any finite garbage there is multiplied by w=0)."""
+    if w is None:
+        return _ProxD_hard(x, y, eps)
+    return _ProxD_hard_w(x, y, w, eps)
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +215,14 @@ else:
 # GAIN ("what 1 photon means" -- y must be COUNTS, not ADU). Formulas validated in
 # scratchpad/proxd_noise.py; memory bpr-survey-proxd (arXiv:2211.06619 eqs 14-16).
 # ---------------------------------------------------------------------------
-def ProxD_noise(x, y, tau=None, metric="amplitude", eps=eps):
+def ProxD_noise(x, y, tau=None, metric="amplitude", eps=eps, w=None):
     """Magnitude data prox. tau=None -> hard (== ProxD). metric='amplitude' (AGM /
-    sqrt-Gaussian) or 'poisson' (IPM / KL). y = intensity (COUNTS for poisson)."""
+    sqrt-Gaussian) or 'poisson' (IPM / KL). y = intensity (COUNTS for poisson).
+
+    w: optional per-pixel detector weights in {0,1} (or [0,1]), broadcastable
+    against x -- W=0 (dead/padded) pixels keep x unchanged, so their y values
+    never influence the result (must be finite; they are 0 for padded data).
+    w=None (default) is bit-identical to the historical unweighted path."""
     r = xp.sqrt(xp.real(x) ** 2 + xp.imag(x) ** 2 + eps)
     if tau is None:
         m = xp.sqrt(y + eps)                              # hard limit == ProxD
@@ -194,7 +231,9 @@ def ProxD_noise(x, y, tau=None, metric="amplitude", eps=eps):
     else:  # 'poisson'/KL (IPM): positive root of (2+1/tau) m^2 - (r/tau) m - 2y = 0
         A = 2.0 + 1.0 / tau
         m = (r / tau + xp.sqrt((r / tau) ** 2 + 8.0 * y * A)) / (2.0 * A)
-    return x * (m / r)
+    if w is None:
+        return x * (m / r)
+    return x * (w * (m / r) + (1.0 - w))                  # w=1 exact, w=0 keeps x
 
 
 # ---------------------------------------------------------------------------
@@ -253,25 +292,82 @@ if GPU:
     _proxd_resid = cp.RawKernel(_proxd_resid_src, "proxd_resid")
     _proxd_ssq = cp.zeros(1, dtype=cp.float64)        # persistent accumulator (zeroed per call)
 
+    # Weighted twin of proxd_resid: per-pixel detector weights w (typically one
+    # (N,N) mask broadcast over frames: index i % nw). Scale becomes
+    # w*s + (1-w)  (w=0 keeps z: dead/padded pixels unconstrained), residual
+    # becomes  sum w*(|z|-sqrt(data))^2  (only measured pixels counted).
+    # Separate kernel (not a flag in proxd_resid) so the default path stays
+    # byte-identical and pays neither the load nor the modulo.
+    _proxd_resid_w_src = r"""
+    extern "C" __global__ void proxd_resid_w(
+            float* z, const float* data, const float* wgt, double* g_ssq,
+            const float eps, const int do_resid,
+            const long long n, const long long nw) {
+        // n complex elements; wgt has nw entries, broadcast as wgt[i % nw].
+        __shared__ double sh[256];
+        double local = 0.0;
+        const long long gstride = (long long)gridDim.x * blockDim.x;
+        for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n; i += gstride) {
+            float re = z[2*i], im = z[2*i + 1];
+            float di = data[i];
+            float w  = wgt[i % nw];
+            float r2 = re*re + im*im;
+            float s  = rsqrtf((r2 + eps) / (di + eps));
+            float se = w * s + (1.0f - w);            // w=1 -> s exactly; w=0 -> 1
+            z[2*i] = re * se; z[2*i + 1] = im * se;
+            if (do_resid) {
+                float t = 1.0f - s;
+                local += (double)(w * (r2 * t * t));  // w * (|z|-sqrt(data))^2
+            }
+        }
+        if (do_resid) {
+            int tid = threadIdx.x;
+            sh[tid] = local; __syncthreads();
+            for (int wd = blockDim.x >> 1; wd > 0; wd >>= 1) {
+                if (tid < wd) sh[tid] += sh[tid + wd];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(g_ssq, sh[0]);
+        }
+    }
+    """
+    _proxd_resid_w = cp.RawKernel(_proxd_resid_w_src, "proxd_resid_w")
 
-def _proxd_resid_apply(frames, frames_data, compute_residuals):
+
+def _proxd_resid_apply(frames, frames_data, compute_residuals, weights=None):
     """Fused ProxD + residual on Fourier-space `frames`, in place. Returns (frames, mse).
-    Falls back to the plain cp.fuse path for any off-spec dtype/layout."""
-    if not (GPU and frames.dtype == xp.complex64 and frames_data.dtype == xp.float32
-            and frames.flags.c_contiguous and frames_data.flags.c_contiguous):
+    Falls back to the plain cp.fuse path for any off-spec dtype/layout.
+    weights: optional per-pixel detector weights (see Project_data); the fused
+    weighted kernel additionally requires float32 C-contiguous weights whose
+    shape matches the trailing dims of frames (broadcast over leading dims)."""
+    on_spec = (GPU and frames.dtype == xp.complex64 and frames_data.dtype == xp.float32
+               and frames.flags.c_contiguous and frames_data.flags.c_contiguous)
+    if weights is not None:
+        on_spec = (on_spec and weights.dtype == xp.float32 and weights.flags.c_contiguous
+                   and frames.shape[frames.ndim - weights.ndim:] == weights.shape)
+    if not on_spec:
         if compute_residuals:
-            mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+            if weights is None:
+                mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+            else:  # sqrt(w) keeps this an L2 norm; w=1 multiplies by exactly 1.0
+                mse = xp.linalg.norm(xp.sqrt(weights) * (xp.abs(frames) - xp.sqrt(frames_data)))
         else:
             mse = eps
-        return ProxD(frames, frames_data, eps), mse
+        return ProxD(frames, frames_data, eps, w=weights), mse
     n = frames.size
     threads = 256                                     # must match cub::BlockReduce<..,256>
     blocks = min(65535, (n + threads - 1) // threads) # grid-stride covers the rest
     do_resid = 1 if compute_residuals else 0
     if do_resid:
         _proxd_ssq.fill(0)
-    _proxd_resid((blocks,), (threads,),
-                 (frames, frames_data, _proxd_ssq, eps, np.int32(do_resid), np.int64(n)))
+    if weights is None:
+        _proxd_resid((blocks,), (threads,),
+                     (frames, frames_data, _proxd_ssq, eps, np.int32(do_resid), np.int64(n)))
+    else:
+        _proxd_resid_w((blocks,), (threads,),
+                       (frames, frames_data, weights, _proxd_ssq, eps,
+                        np.int32(do_resid), np.int64(n), np.int64(weights.size)))
     mse = xp.sqrt(_proxd_ssq[0]) if do_resid else eps
     return frames, mse
 
@@ -283,7 +379,23 @@ def _proxd_resid_apply(frames, frames_data, compute_residuals):
 # only the frames_old COPY is dropped (reference trick in Solvers, memory win).
 
 
-def Project_data(frames, frames_data, compute_residuals=False):
+def Project_data(frames, frames_data, compute_residuals=False, weights=None):
+    """Fourier-magnitude projection (+ optional data residual).
+
+    weights: optional per-pixel detector weights in {0,1} (or [0,1]),
+    broadcastable against the frames -- typically ONE (N,N) detector mask
+    shared by all (V,N,N) frames. W=1 pixels get the magnitude projection,
+    W=0 pixels (dead / zero-padded detector regions, where frames_data holds
+    0, not a measurement) keep their current Fourier value, so the iterate is
+    free to extrapolate |F| beyond the physical detector instead of having it
+    clamped to 0. The residual likewise counts only weighted pixels:
+    mse = sqrt(sum W*(|F|-sqrt(data))^2). weights=None (default) is
+    bit-identical to the historical unweighted behaviour."""
+    if weights is not None:
+        # accept bool/int masks and lists; float32 also satisfies the fused kernel
+        weights = xp.asarray(weights)
+        if weights.dtype != xp.float32:
+            weights = weights.astype(xp.float32)
     time00 = timer()
     time0 = time00
     # apply Fourier magnitude projections
@@ -293,19 +405,22 @@ def Project_data(frames, frames_data, compute_residuals=False):
     time0 = timer()
     if _FUSED_PROXD:
         # one kernel: ProxD in place + data residual, zero temporaries
-        frames, mse = _proxd_resid_apply(frames, frames_data, compute_residuals)
+        frames, mse = _proxd_resid_apply(frames, frames_data, compute_residuals, weights)
         timers["Prox_data"] += timer() - time0
     else:
         # compute mse
         if compute_residuals:
-            mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+            if weights is None:
+                mse = xp.linalg.norm(xp.abs(frames) - xp.sqrt(frames_data))
+            else:  # sum only weighted pixels; sqrt(w)=1.0 exactly where w=1
+                mse = xp.linalg.norm(xp.sqrt(weights) * (xp.abs(frames) - xp.sqrt(frames_data)))
         else:
             mse = eps
 
         timers["mse_data"] += timer() - time0
 
         time0 = timer()
-        frames = ProxD(frames, frames_data, eps)
+        frames = ProxD(frames, frames_data, eps, w=weights)
 
         timers["Prox_data"] += timer() - time0
 
