@@ -49,6 +49,35 @@ def plain_middle(f, d, resid):
     return out, mse
 
 
+def validate_weighted(nframes, nx):
+    """A/B the WEIGHTED fused kernel (proxd_resid_w) against the plain weighted
+    path (ProxD w= + masked norm), incl. the W=0 'data can't leak' invariant."""
+    f, d = make(nframes, nx, seed=1)
+    rng = np.random.default_rng(2)
+    W = (rng.random((nx, nx)) < 0.5).astype(np.float32)   # (N,N) mask, broadcast
+    if GPU:
+        W = xp.asarray(W)
+    mp_ = xp.sqrt(W) * (xp.abs(f) - xp.sqrt(d))
+    msep = xp.linalg.norm(mp_)
+    outp = O.ProxD(f.copy(), d, eps, w=W)
+    outf, msef = O._proxd_resid_apply(f.copy(), d, True, weights=W)
+    ok_out = bool(xp.allclose(outp, outf, rtol=1e-4, atol=1e-5))
+    ok_mse = bool(xp.allclose(msep, msef, rtol=1e-4))
+    print(f"  validate wgt    : out match={ok_out}  mse match={ok_mse}  "
+          f"(plain={float(msep):.6g}  fused={float(msef):.6g})")
+    # masked-pixel data must be inert: perturb d at W=0, nothing may change
+    d2 = d + 37.5 * (1.0 - W)
+    outf2, msef2 = O._proxd_resid_apply(f.copy(), d2, True, weights=W)
+    ok_inert = bool(xp.all(outf == outf2)) and float(msef) == float(msef2)
+    # W=ones must reproduce the unweighted kernel bitwise
+    ones = xp.ones((nx, nx), dtype=xp.float32)
+    out1, mse1 = O._proxd_resid_apply(f.copy(), d, True, weights=ones)
+    out0, mse0 = O._proxd_resid_apply(f.copy(), d, True)
+    ok_ones = bool(xp.all(out0 == out1)) and float(mse0) == float(mse1)
+    print(f"  validate wgt    : W=0 inert={ok_inert}  W=ones==None bitwise={ok_ones}")
+    return ok_out and ok_mse and ok_inert and ok_ones
+
+
 def validate(nframes, nx):
     f, d = make(nframes, nx)
     outp, msep = plain_middle(f.copy(), d, True)
@@ -129,6 +158,8 @@ if __name__ == "__main__":
     nx = int(sys.argv[2]) if len(sys.argv) > 2 else 256
     print(f"GPU={GPU}  size={nframes}x{nx}x{nx}  ({nframes*nx*nx/1e6:.1f}M elems)")
     okv = validate(nframes, nx)
+    okw = validate_weighted(nframes, nx)
+    okv = okv and okw
     if not GPU:
         print("CPU: fused path falls back to plain (no kernel). Run on Perlmutter for the A/B.")
         sys.exit(0 if okv else 1)
