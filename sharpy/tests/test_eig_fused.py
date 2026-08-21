@@ -239,3 +239,34 @@ def test_feed_is_scale_invariant():
         vp = v * s
         v = t * s
     assert ctl_a.it == ctl_b.it
+
+
+def test_feed_stops_on_nonfinite_rows():
+    # Review finding: `ssq <= 0.0` is False for NaN, so an overflowed or
+    # NaN iterate sailed through and the loop ran its full budget on
+    # garbage. Non-finite rows must stop immediately.
+    for bad in (float("nan"), float("inf")):
+        ctl = Operators._EigAdapt(1e-7, momentum=False)
+        ctl.feed([(1.0, 1.0, 0.5, 1.0), (bad, bad, bad, bad)])
+        assert ctl.stop, bad
+
+
+def test_momentum_stops_at_residual_floor():
+    # With honest (double-promoted) accumulators the f32 eigen-residual
+    # floors above tol*gap at small gap; the stagnation test must end the
+    # solve instead of letting it burn the whole budget. Feed a momentum-
+    # phase controller a plateaued residual and require a stop within a
+    # few adaptation windows.
+    ctl = Operators._EigAdapt(1e-7, momentum=True, warmup=2)
+    lam, ssq_v = 9.0, 1.0
+    fed = 0
+    for it in range(400):
+        res = max(1e-4, 1e-2 * (0.9 ** it))          # decays, then floors
+        ssq_y = lam * lam * ssq_v + res * res * ssq_v * ssq_v
+        dot = lam * ssq_v
+        ctl.feed([(ssq_y, ssq_y, dot, ssq_v)])
+        fed += 1
+        if ctl.stop:
+            break
+    assert ctl.stop, "never stopped on a floored residual"
+    assert fed < 300, f"took {fed} rows to detect stagnation"

@@ -112,13 +112,18 @@ for g in (16, 32, 64):
     # rounding jitter. Threshold is the measured floor with margin.
     ok = a_f0 > 1 - 6e-3
     FAIL += 0 if ok else 1
+    # floor-aware thresholds; a_sf (stock vs fused) stays informational:
+    # two independently floor-limited f32 iterates may differ by ~2x floor.
+    ok_sr = a_sr > 1 - 6e-3
+    ok_fr = a_fr > 1 - 6e-3
     okg = a_g > 1 - 6e-3
-    FAIL += 0 if okg else 1
+    FAIL += (0 if ok_sr else 1) + (0 if ok_fr else 1) + (0 if okg else 1)
     print(f"  n={g*g:>5}: stock/dense={a_sr:.7f} fused/dense={a_fr:.7f} "
           f"(iters={st['iters']}) graph/dense={a_g:.7f} "
           f"(iters={stg['iters']}, graph={stg.get('graph')}) "
           f"fused-tol0/dense={a_f0:.7f} (iters={st0['iters']}) "
-          f"{'ok' if ok else 'FAIL'}{'' if okg else ' GRAPH-FAIL'}")
+          f"{'ok' if (ok and ok_sr and ok_fr) else 'FAIL'}"
+          f"{'' if okg else ' GRAPH-FAIL'}")
 
 print("\n== (b) momentum correctness at small gap ==")
 for g in (32, 64):
@@ -136,13 +141,14 @@ for g in (32, 64):
     st0 = dict(Operators._eig_stats)
     a0 = align(o_m0, refp)
     ok = a0 > 1 - 2e-3          # f32 floor (see parity note); momentum
-    FAIL += 0 if ok else 1      # stalls DEEPER than plain at the same gap
+    ok_a = a > 1 - 2e-3         # ordinary adaptive-stop path counts too
     okg = a_mg > 1 - 2e-3
-    FAIL += 0 if okg else 1
+    FAIL += (0 if ok else 1) + (0 if ok_a else 1) + (0 if okg else 1)
     print(f"  n={g*g:>5}: mom/dense={a:.6f} (iters={st['iters']} beta={st['beta']:.3f}) "
           f"mom-graph/dense={a_mg:.6f} (iters={stg['iters']} graph={stg.get('graph')}) "
           f"mom-tol0/dense={a0:.6f} (iters={st0['iters']}) "
-          f"{'ok' if ok else 'FAIL'}{'' if okg else ' GRAPH-FAIL'}")
+          f"{'ok' if (ok and ok_a) else 'FAIL'}"
+          f"{'' if okg else ' GRAPH-FAIL'}")
 
 print("\n== (c) timing: cold (eig_reset each call) and warm, alternating ==")
 print(f"{'n':>6} {'mode':>16} {'cold ms':>9} {'warm ms':>9}")  # win = window-normalization
