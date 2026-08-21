@@ -1147,6 +1147,20 @@ _EIG_WARMUP = int(os.environ.get("SHARPY_EIG_WARMUP", "8"))  # plain its before 
 # (f32 component head-room on both sides); the first window and any
 # out-of-range window use per-iteration scaling.
 _EIG_WINDOWED = os.environ.get("SHARPY_EIG_WINDOWED", "1") == "1"
+# CUDA-graph capture of whole windows (opt-in). One graph replay replaces
+# K x (SpMV descriptor rebuild + kernel launches) of HOST work -- measured
+# ~92us/iter, dominated by the cupyx per-call cuSPARSE descriptor rebuild.
+# The captured graph prebuilds descriptors ONCE against pointer-stable
+# buffers (a 3-cycle rotation, so the capture length is a multiple of 3),
+# reads beta from a device scalar (kernel args are baked at capture), and is
+# CACHED across Eigensolver calls: sharpy's sync rebuilds H IN PLACE
+# (plan["val2H"] rewrites H.data on a persistent H), so the baked pointers
+# stay valid; the cache key still pins the data/indptr pointers to fail
+# closed if the assembly ever changes.
+_EIG_GRAPH = GPU and os.environ.get("SHARPY_EIG_GRAPH", "0") == "1"
+_EIG_GRAPH_K = 6                      # capture window; must be % 3 == 0
+_eig_graph_cache = {}                 # (id(H), ptrs, n) -> _EigGraph
+_eig_last_lam = None                  # lets warm calls enter graph mode at it=0
 
 if GPU:
     # Same conventions as _proxd_resid: complex64 as interleaved float pairs,
@@ -1155,7 +1169,10 @@ if GPU:
     _eig_step_src = r"""
     extern "C" __global__ void eig_step(
             float* y, const float* v, const float* vp, double* acc,
-            const float beta, const int n, const int it) {
+            const float* betap, const int n, const int it) {
+        // beta arrives via DEVICE memory (betap[0]), not a kernel argument:
+        // CUDA-graph replays bake argument values at capture time, and beta
+        // changes between windows (momentum engagement + adaptation).
         // y = H v (complex64, interleaved). If beta != 0 this REWRITES y in
         // place to t = y - beta*vp (momentum three-term recurrence). Rows of
         // acc (4 doubles per iteration it):
@@ -1170,6 +1187,7 @@ if GPU:
         //       ||v||^2 makes every formula use the TRUE cosine, for which
         //       Cauchy-Schwarz holds by construction.)
         __shared__ double sh[256];
+        const float beta = betap[0];
         double l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
         const int gs = gridDim.x * blockDim.x;
         for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gs) {
@@ -1239,6 +1257,39 @@ if GPU:
     }
     """
     _eig_rescale2 = cp.RawKernel(_eig_rescale2_src, "eig_rescale2")
+
+    _eig_spmv_src = r"""
+    extern "C" __global__ void eig_spmv(
+            const int* indptr, const int* indices, const float* data,
+            const float* x, float* y, const int n) {
+        // Row-per-thread complex64 CSR SpMV for the sync Gramian (tiny n,
+        // ~10 nnz/row, H resident in L2). Exists because cupy REFUSES
+        // cuSPARSE calls during stream capture (its spMV wrapper's
+        // setStream raises NotImplementedError while capturing), so the
+        // captured window needs a cusparse-free matvec. Bonus: no
+        // descriptor rebuild, no workspace query.
+        const int gs = gridDim.x * blockDim.x;
+        for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n;
+             row += gs) {
+            float accr = 0.0f, acci = 0.0f;
+            const int e = indptr[row + 1];
+            for (int k = indptr[row]; k < e; k++) {
+                const int c = indices[k];
+                const float ar = data[2*k],   ai = data[2*k+1];
+                const float xr = x[2*c],      xi = x[2*c+1];
+                accr += ar * xr - ai * xi;
+                acci += ar * xi + ai * xr;
+            }
+            y[2*row]     = accr;
+            y[2*row + 1] = acci;
+        }
+    }
+    """
+    _eig_spmv = cp.RawKernel(_eig_spmv_src, "eig_spmv")
+    # Module-global device scalar for beta: cached CUDA graphs bake this
+    # POINTER at capture, so every call (eager or replay) must write the
+    # same memory. Allocated once; updated at window edges only.
+    _eig_beta_dev = cp.zeros((1,), cp.float32)
 
 
 class _EigAdapt:
@@ -1336,14 +1387,74 @@ class _EigAdapt:
                         self.rho = min(lam2 / lam, 1.0 - 1e-12)
 
 
+class _EigGraph:
+    """A captured CUDA graph of _EIG_GRAPH_K fused power/momentum iterations.
+
+    Buffers B0/B1/B2 rotate roles (v, y, vp) with period 3; the capture
+    length is a multiple of 3 so every replay starts and ends with
+    v == B0, vp == B2. Each replay: zero the window accumulators, K x
+    (eig_spmv -> eig_step), then one eig_rescale2(B0, B2) -- the window-
+    normalization edge. The matvec is the RawKernel eig_spmv rather than
+    cuSPARSE: cupy raises NotImplementedError for cuSPARSE calls during
+    stream capture, and the RawKernel needs no descriptors or workspace
+    anyway. References to H's data/indices/indptr are held so the baked
+    device pointers cannot be pool-recycled while the graph lives."""
+
+    def __init__(self, H, n, blocks, threads, beta_dev):
+        K = _EIG_GRAPH_K
+        assert K % 3 == 0
+        self.K = K
+        self.B = [cp.zeros((n,), cp.complex64) for _ in range(3)]
+        self.accw = cp.zeros((K, 4), cp.float64)
+        self.Hp, self.Hi, self.Hd = H.indptr, H.indices, H.data
+        st = cp.cuda.Stream(non_blocking=True)
+        with st:
+            st.begin_capture()
+            self.accw.fill(0)
+            for j in range(K):
+                _eig_spmv((blocks,), (threads,),
+                          (self.Hp, self.Hi, self.Hd, self.B[j % 3],
+                           self.B[(j + 1) % 3], np.int32(n)))
+                _eig_step((blocks,), (threads,),
+                          (self.B[(j + 1) % 3], self.B[j % 3],
+                           self.B[(j + 2) % 3], self.accw, beta_dev,
+                           np.int32(n), np.int32(j)))
+            _eig_rescale2((blocks,), (threads,),
+                          (self.B[0], self.B[2], self.accw,
+                           np.int32(2 * n), np.int32(K - 1)))
+            self.graph = st.end_capture()
+
+    def replay(self):
+        self.graph.launch()          # current (null) stream
+        return self.accw.get()       # rows for _EigAdapt.feed
+
+
+def _eig_graph_get(H, n, blocks, threads, beta_dev):
+    """Cached _EigGraph keyed on H's identity AND buffer pointers (val2H
+    rewrites H.data in place on a persistent H, so hits are the norm; a
+    reassembled H misses and fails closed to a fresh capture)."""
+    key = (id(H), H.data.data.ptr, H.indices.data.ptr, H.indptr.data.ptr, n)
+    g = _eig_graph_cache.get(key)
+    if g is None:
+        while len(_eig_graph_cache) >= 4:      # tiny FIFO bound
+            _eig_graph_cache.pop(next(iter(_eig_graph_cache)))
+        g = _EigGraph(H, n, blocks, threads, beta_dev)
+        _eig_graph_cache[key] = g
+    return g
+
+
 _eig_stats = {}   # debug/observability: last fused-call state
 
 
 def _eig_power_fused(H, v, num_iter, tol):
-    """Sync-reduced fused power iteration (one host sync per _EIG_CHECK_EVERY
-    iterations) with optional adaptive-Chebyshev momentum. v: (nframes,1)
-    complex64 unit warm start. Returns the normalized dominant-eigenvector
-    iterate, same shape. Control decisions live in _EigAdapt."""
+    """Sync-reduced fused power iteration (one host sync per window) with
+    optional adaptive-Chebyshev momentum and optional CUDA-graph window
+    replay. v: (nframes,1) complex64 unit warm start. Returns the normalized
+    dominant-eigenvector iterate, same shape. Decisions live in _EigAdapt;
+    windows run unnormalized when the |lam|^K guard allows (window-
+    normalization), and graph mode additionally replays a captured window
+    (K=_EIG_GRAPH_K) as ONE launch with prebuilt cuSPARSE descriptors."""
+    global _eig_last_lam
     n = int(v.shape[0])
     v = xp.ascontiguousarray(v.ravel(), dtype=xp.complex64)
     vp = xp.zeros_like(v)
@@ -1353,34 +1464,76 @@ def _eig_power_fused(H, v, num_iter, tol):
     ctl = _EigAdapt(tol, _EIG_MOMENTUM)
     checked = 0                      # acc rows [0, checked) already fed
     K = max(1, _EIG_CHECK_EVERY)
-    win = False                      # first window: per-iteration scaling
-    for it in range(num_iter):
-        y = H @ v                    # cuSPARSE CSR SpMV (canonical H)
-        _eig_step((blocks,), (threads,),
-                  (y, v, vp, acc, np.float32(ctl.beta), np.int32(n),
-                   np.int32(it)))
-        if win:
-            vp, v = v, y             # unnormalized in-window: pointer swap
+    Kg = _EIG_GRAPH_K
+
+    def _win_ok(lam, k):
+        return (lam is not None and lam != 0.0
+                and -12.0 < k * math.log10(abs(lam)) < 25.0)
+
+    beta_last = 0.0
+    _eig_beta_dev[0] = np.float32(0.0)
+    # warm calls may enter graph mode at it=0 using the previous call's lam
+    win = _EIG_WINDOWED and _win_ok(_eig_last_lam, max(K, Kg))
+    gexec = None
+    graph_ok = (_EIG_GRAPH and getattr(H, "format", None) == "csr"
+                and H.indices.dtype == xp.int32 and H.indptr.dtype == xp.int32)
+    it = 0
+    while it < num_iter and not ctl.stop:
+        use_graph = graph_ok and win and (it + Kg <= num_iter)
+        if use_graph:
+            if gexec is None:
+                try:
+                    gexec = _eig_graph_get(H, n, blocks, threads,
+                                           _eig_beta_dev)
+                except Exception:
+                    graph_ok = False                 # capture failed: eager
+                    continue
+            if v is not gexec.B[0] or vp is not gexec.B[2]:
+                # (re-)entry: load the graph's fixed buffers. Copy through
+                # temporaries -- after an eager window v/vp may alias B0/B2
+                # in either role, and a direct B0[:] = v could clobber vp.
+                v_in, vp_in = v + 0.0, vp + 0.0
+                gexec.B[0][:] = v_in
+                gexec.B[2][:] = vp_in
+                v, vp = gexec.B[0], gexec.B[2]
+            rows = gexec.replay()    # ONE launch + ONE sync for Kg iters
+            it += Kg
+            checked = it             # graph rows never touch `acc`
+            ctl.feed(rows)
         else:
-            _eig_scale((blocks,), (threads,),
-                       (v, vp, y, acc, np.int32(2 * n), np.int32(it)))
-        if (it + 1) % K == 0 or it == num_iter - 1:
+            y = H @ v                # cupyx CSR SpMV (canonical H)
+            _eig_step((blocks,), (threads,),
+                      (y, v, vp, acc, _eig_beta_dev, np.int32(n),
+                       np.int32(it)))
             if win:
-                # one common renormalization per window (see eig_rescale2)
+                vp, v = v, y         # unnormalized in-window: pointer swap
+            else:
+                _eig_scale((blocks,), (threads,),
+                           (v, vp, y, acc, np.int32(2 * n), np.int32(it)))
+            it += 1
+            if it % K != 0 and it != num_iter:
+                continue
+            if win:
                 _eig_rescale2((blocks,), (threads,),
-                              (v, vp, acc, np.int32(2 * n), np.int32(it)))
-            ctl.feed(acc[checked:it + 1].get())   # ONE sync per window
-            checked = it + 1
-            if ctl.stop:
-                break
-            lam = ctl.lam
-            win = (_EIG_WINDOWED and lam is not None and lam != 0.0
-                   and -12.0 < K * math.log10(abs(lam)) < 25.0)
+                              (v, vp, acc, np.int32(2 * n),
+                               np.int32(it - 1)))
+            ctl.feed(acc[checked:it].get())   # ONE sync per window
+            checked = it
+        if ctl.stop:
+            break
+        if ctl.beta != beta_last:
+            _eig_beta_dev[0] = np.float32(ctl.beta)
+            beta_last = ctl.beta
+        win = _EIG_WINDOWED and _win_ok(ctl.lam, max(K, Kg))
+    if ctl.lam is not None:
+        _eig_last_lam = ctl.lam
+    v = v + 0.0                      # detach from graph buffers before renorm
     v /= xp.linalg.norm(v)           # defensive renorm, outside the loop
     _eig_stats.update(iters=ctl.it, beta=ctl.beta, rho=ctl.rho,
                       lam=ctl.lam, stopped=ctl.stop,
                       last_res=(ctl.res_hist[-1] if ctl.res_hist else None),
-                      last_step=ctl.prev_step)
+                      last_step=ctl.prev_step,
+                      graph=(gexec is not None))
     return v.reshape(n, 1)
 
 
@@ -1391,10 +1544,12 @@ _invit_cache = {}  # invit: cached CSR row-index array (overlap-graph sparsity i
 
 def eig_reset():
     """Drop the cached eigenvector + seed counter (call between unrelated reconstructions)."""
-    global _eig_v0
+    global _eig_v0, _eig_last_lam
     _eig_v0 = None
+    _eig_last_lam = None
     _sync_state["n"] = 0
     _invit_cache.clear()
+    _eig_graph_cache.clear()
 
 
 def Eigensolver(H, num_iter, v0=None, tol=1e-7):

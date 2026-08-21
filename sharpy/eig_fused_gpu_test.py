@@ -97,6 +97,11 @@ for g in (16, 32, 64):
     a_fr = align(o_fused, refp)
     # tol=0: no early-out -> full budget; separates control-law misfire
     # (tol0 aligns) from kernel math bug (tol0 also fails)
+    Operators._EIG_GRAPH = True
+    o_g = run_solver(H, nit, fused=True, momentum=False).ravel()
+    stg = dict(Operators._eig_stats)
+    a_g = align(o_g, refp)
+    Operators._EIG_GRAPH = False
     o_full = run_solver(H, nit, fused=True, momentum=False, tol=0.0).ravel()
     st0 = dict(Operators._eig_stats)
     a_f0 = align(o_full, refp)
@@ -107,10 +112,13 @@ for g in (16, 32, 64):
     # rounding jitter. Threshold is the measured floor with margin.
     ok = a_f0 > 1 - 6e-3
     FAIL += 0 if ok else 1
+    okg = a_g > 1 - 6e-3
+    FAIL += 0 if okg else 1
     print(f"  n={g*g:>5}: stock/dense={a_sr:.7f} fused/dense={a_fr:.7f} "
-          f"(iters={st['iters']}, step={st['last_step']}) "
+          f"(iters={st['iters']}) graph/dense={a_g:.7f} "
+          f"(iters={stg['iters']}, graph={stg.get('graph')}) "
           f"fused-tol0/dense={a_f0:.7f} (iters={st0['iters']}) "
-          f"{'ok' if ok else 'FAIL'}")
+          f"{'ok' if ok else 'FAIL'}{'' if okg else ' GRAPH-FAIL'}")
 
 print("\n== (b) momentum correctness at small gap ==")
 for g in (32, 64):
@@ -119,26 +127,36 @@ for g in (32, 64):
     o_mom = run_solver(H, 20000, fused=True, momentum=True).ravel()
     st = dict(Operators._eig_stats)
     a = align(o_mom, refp)
+    Operators._EIG_GRAPH = True
+    o_mg = run_solver(H, 20000, fused=True, momentum=True).ravel()
+    stg = dict(Operators._eig_stats)
+    a_mg = align(o_mg, refp)
+    Operators._EIG_GRAPH = False
     o_m0 = run_solver(H, 3000, fused=True, momentum=True, tol=0.0).ravel()
     st0 = dict(Operators._eig_stats)
     a0 = align(o_m0, refp)
     ok = a0 > 1 - 2e-3          # f32 floor (see parity note); momentum
     FAIL += 0 if ok else 1      # stalls DEEPER than plain at the same gap
-    print(f"  n={g*g:>5}: mom/dense={a:.6f} (iters={st['iters']} beta={st['beta']:.3f} "
-          f"res={st['last_res']:.2e}) mom-tol0/dense={a0:.6f} (iters={st0['iters']} "
-          f"beta={st0['beta']:.3f} res={st0['last_res']:.2e}) {'ok' if ok else 'FAIL'}")
+    okg = a_mg > 1 - 2e-3
+    FAIL += 0 if okg else 1
+    print(f"  n={g*g:>5}: mom/dense={a:.6f} (iters={st['iters']} beta={st['beta']:.3f}) "
+          f"mom-graph/dense={a_mg:.6f} (iters={stg['iters']} graph={stg.get('graph')}) "
+          f"mom-tol0/dense={a0:.6f} (iters={st0['iters']}) "
+          f"{'ok' if ok else 'FAIL'}{'' if okg else ' GRAPH-FAIL'}")
 
 print("\n== (c) timing: cold (eig_reset each call) and warm, alternating ==")
 print(f"{'n':>6} {'mode':>16} {'cold ms':>9} {'warm ms':>9}")  # win = window-normalization
 for g in (16, 32, 64):
     H = make_H(g)
-    for name, fu, mo, wi in (("stock", False, False, False),
-                             ("fused win=off", True, False, False),
-                             ("fused win=on", True, False, True),
-                             ("mom win=off", True, True, False),
-                             ("mom win=on", True, True, True)):
+    for name, fu, mo, wi, gr in (("stock", False, False, False, False),
+                                 ("fused win=off", True, False, False, False),
+                                 ("fused win=on", True, False, True, False),
+                                 ("fused graph", True, False, True, True),
+                                 ("mom win=off", True, True, False, False),
+                                 ("mom win=on", True, True, True, False),
+                                 ("mom graph", True, True, True, True)):
         Operators._FUSED_EIG = fu; Operators._EIG_MOMENTUM = mo
-        Operators._EIG_WINDOWED = wi
+        Operators._EIG_WINDOWED = wi; Operators._EIG_GRAPH = gr
         def cold():
             Operators.eig_reset()
             Operators.Eigensolver(H, 4000, tol=1e-5)
