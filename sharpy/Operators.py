@@ -810,7 +810,51 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
     normalization = normalization.astype(xp.complex64, copy=False)
     frames_norm   = frames_norm.astype(xp.complex64, copy=False)
 
-    value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
+    if plan.get("fetch", False):
+        # Fetch-normalization path (SM, 2026-07-18): `normalization` is the OBJECT-SIZED nu canvas; the
+        # dotp_fetch kernel reads it at the absolute pixel (plan["ax0"/"ay0"] origins, toroidal
+        # compare-subtract wrap) instead of a frame-sized Splitc stack.
+        #
+        # Bit-exactness holds: sync_fetch_test.py gives max|dH| = 0 at 256/1024/4096 frames,
+        # re-confirmed on H200 NVL / cupy 13.6.0 (drp-srcf-gpu007, 2026-08-21).
+        # ⚠ The speed claim does NOT hold on H200. Measured there: 0.57 -> 0.68 ms at 1024x128^2
+        # and 3.74 -> 4.55 ms at 4096x128^2, i.e. the fetch path is ~1.2x SLOWER, not the ~0.9x
+        # recorded when this was written on other hardware. The reason to use it is MEMORY: the
+        # redundant ~overlap-factor stack is never built (537 MB -> 19 MB at 4096x128^2, 28x).
+        # Treat it as a memory-for-time trade, and re-time before quoting a speedup anywhere.
+        #
+        # OPT-IN (2026-08-21). This used to trigger on `normalization.ndim == 2 and "ax0" in plan`,
+        # which was inference, not intent: Gramiam_plan always adds "ax0", so ANY caller passing a
+        # 2-D (object-sized) normalization silently switched kernels. The MPI path in
+        # sharpy_mpi_skeleton.py / mpi_halo.py does exactly that (`norm_reg` is the (Nx,Ny) canvas),
+        # so a merge would have re-routed distributed Gramian calls onto an inference validated only
+        # single-process. Correctness there depends on `normalization` being the SAME canvas that
+        # ax0/ay0 and can_hw were computed against -- pass a rank-local sub-canvas with global
+        # origins and the kernel reads at the wrong offsets, silently (out-of-bounds reads return 0
+        # and are then divided, which the MPI caller's nan_to_num scrub would hide). Ask for this
+        # path explicitly with Gramiam_plan(..., fetch=True).
+        if normalization.ndim != 2:
+            raise ValueError(
+                "fetch-normalization requires a 2-D object-sized `normalization` canvas "
+                f"(got ndim={normalization.ndim}); build the plan with fetch=False for the stack path")
+        canH_chk, canW_chk = plan["can_hw"]
+        if normalization.shape != (canH_chk, canW_chk):
+            raise ValueError(
+                f"fetch-normalization canvas mismatch: normalization{tuple(normalization.shape)} vs "
+                f"plan can_hw=({canH_chk}, {canW_chk}). ax0/ay0 are absolute origins into the canvas "
+                "the plan was built for -- under MPI, pass the global canvas or rebuild the plan.")
+        col = plan["col"].astype(int); row = plan["row"].astype(int)
+        nnz = int(col.size)
+        value = xp.zeros((nnz, 1), dtype=xp.complex64)
+        fh, fw = int(frames.shape[1]), int(frames.shape[2])
+        canH, canW = plan["can_hw"]
+        cp.RawKernel(zQQz_raw_kernel, "dotp_fetch", jitify=True, options=("--std=c++17",))(
+            (nnz,), (128,),
+            (value, frames, frames_norm, illumination, normalization,
+             plan["ax0"], plan["ay0"], col, row, plan["dx"], plan["dy"],
+             plan["bw"], nnz, fh, fw, canH, canW))
+    else:
+        value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
 
     timers['Gramiam'] = timer()-t0
 
@@ -862,7 +906,18 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
     
     return H
 
-def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
+def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0, fetch=False):
+    """Build the neighbour/overlap plan consumed by the Gramian kernels.
+
+    fetch : bool, default False
+        Opt in to the fetch-normalization Gramian path (dotp_fetch), which reads nu directly from
+        the object-sized (Ny, Nx) canvas instead of a frame-sized Splitc stack -- bit-exact, ~0.9x
+        kernel time, and it never materialises the ~overlap-factor redundant stack (0.5 GB at
+        4096x128^2). Requires that the `normalization` later handed to Gramiam_calc_cuda be that
+        same 2-D canvas; Gramiam_calc_cuda raises if it is not. Default False so existing callers
+        -- notably the MPI path, which passes a 2-D `norm_reg` -- keep the stack path until the
+        distributed canvas/origin question is settled deliberately.
+    """
     from scipy.spatial import KDTree
 
     # Overlap thresholds — match original: abs(dx)<ny-2bw, abs(dy)<nx-2bw
@@ -941,8 +996,17 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     plan = {
         "col": col_t.astype(int), "row": row_t.astype(int),
         "dx": dx_t, "dy": dy_t, "val": val, "bw": bw,
-        "val2H": val2H, "gram_calc": None,
+        "val2H": val2H, "gram_calc": None, "fetch": bool(fetch),
     }
+
+    # Per-frame absolute canvas origins for the fetch-normalization kernel (dotp_fetch): lets the kernel
+    # read nu from the object-sized canvas instead of a frame-sized Splitc stack. Decoded with the exact
+    # map_frames corner semantics (float mod, then uint32 truncation) so the fetched pixel is bit-identical
+    # to what Splitc would have copied. Canvas layout per map_frames: row stride Nx -> (canH, canW)=(Ny, Nx).
+    _m0 = (np.mod(tx, Nx) + np.mod(ty, Ny) * Nx).astype(np.uint32)
+    plan["ax0"] = xp.asarray((_m0 % np.uint32(Nx)).astype(np.int64))
+    plan["ay0"] = xp.asarray((_m0 // np.uint32(Nx)).astype(np.int64))
+    plan["can_hw"] = (int(Ny), int(Nx))
 
     if GPU:
         nthreads = 128
