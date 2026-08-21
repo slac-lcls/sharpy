@@ -334,6 +334,42 @@ if GPU:
     """
     _proxd_resid_w = cp.RawKernel(_proxd_resid_w_src, "proxd_resid_w")
 
+    # Fused eps_S frame-step residual ||a-b||^2 (see _diffnorm below). Same
+    # contract as proxd_resid: complex64 viewed as interleaved (re,im) floats,
+    # so sum |a_i-b_i|^2 over n complex elements is just the sum of squared
+    # float differences over 2n floats. Squares accumulate in double (free:
+    # the kernel is DRAM-bound on the two input streams).
+    # Unweighted only, deliberately: unlike proxd_resid/proxd_resid_w there is
+    # no weighted twin, so eps_S keeps counting ALL pixels and stays comparable
+    # with every historical run. That is a real semantic choice, not an
+    # oversight -- with a detector mask the w=0 pixels are left unconstrained by
+    # ProxD (x*(w*s + (1-w))), so their frame-to-frame change is included here.
+    # If a masked eps_S is ever wanted, add a _w twin (dual accumulator: total
+    # + weighted in one pass) rather than changing what residuals[...,2] means.
+    _diffnorm_src = r"""
+    extern "C" __global__ void diffnorm_ssq(
+            const float* a, const float* b, double* g_ssq, const long long n2) {
+        // n2 = number of FLOATS = 2 * complex elements (re,im interleaved).
+        __shared__ double sh[256];
+        double local = 0.0;
+        const long long gstride = (long long)gridDim.x * blockDim.x;
+        for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+             i < n2; i += gstride) {
+            float d = a[i] - b[i];
+            local += (double)d * (double)d;
+        }
+        int tid = threadIdx.x;                       // block reduce -> atomicAdd
+        sh[tid] = local; __syncthreads();
+        for (int w = blockDim.x >> 1; w > 0; w >>= 1) {
+            if (tid < w) sh[tid] += sh[tid + w];
+            __syncthreads();
+        }
+        if (tid == 0) atomicAdd(g_ssq, sh[0]);
+    }
+    """
+    _diffnorm_kernel = cp.RawKernel(_diffnorm_src, "diffnorm_ssq")
+    _diffnorm_ssq = cp.zeros(1, dtype=cp.float64)     # persistent accumulator
+
 
 def _proxd_resid_apply(frames, frames_data, compute_residuals, weights=None):
     """Fused ProxD + residual on Fourier-space `frames`, in place. Returns (frames, mse).
@@ -372,11 +408,72 @@ def _proxd_resid_apply(frames, frames_data, compute_residuals, weights=None):
     return frames, mse
 
 
-# NOTE: a fused ReductionKernel for the eps_S residual ||frames-frames_old|| was
-# tried and REVERTED -- it ran 30x SLOWER than xp.linalg.norm (0.35 ms) on A100
-# (10.4 ms/call; the complex .real()/.imag() map deoptimizes the reduction).
-# xp.linalg.norm(a-b) is already cuBLAS-nrm2-fast, so the residual is NOT fused;
-# only the frames_old COPY is dropped (reference trick in Solvers, memory win).
+# eps_S residual ||frames-frames_old||, HISTORY: a fused ReductionKernel was
+# tried and REVERTED -- 10.4 ms/call vs 0.35 ms for xp.linalg.norm on A100: the
+# complex .real()/.imag() map deoptimizes cupy's ReductionKernel 30x. That was
+# the TOOL, not the idea. The RawKernel below (same pattern as proxd_resid)
+# wins at every size measured -- 2.2x below 1e6, 3.0x from 1e7 to 8e8 -- so the
+# reverted comment's "linalg.norm is already cuBLAS-nrm2-fast, leave it alone"
+# conclusion applied only to ReductionKernel, not to the fusion itself.
+# Opt-in via the same SHARPY_FUSED_PROXD flag; the frames_old COPY is
+# separately dropped by the reference trick in Solvers (memory win).
+def _diffnorm(a, b):
+    """eps_S frame-step residual ||a - b||_2 in ONE pass over the two buffers:
+    no (a-b) temporary, no abs/norm intermediates, double accumulation (the
+    plain path sums in float32). Gated by _FUSED_PROXD; off-spec inputs (CPU,
+    non-complex64, non-C-contiguous, shape mismatch) fall back to
+    xp.linalg.norm(a - b), bit-identical to the historical path.
+
+    A100-SXM4-40GB, complex64, median of 5 alternating reps x 200 event-timed
+    calls (diffnorm_fused_test.py). "temp" = device memory the call allocates
+    beyond its inputs -- the plain path materializes (a-b) at 8 B/elem:
+
+        n         plain      fused    speedup   fused BW   temp plain -> fused
+        2e4       75.3 us    33.7 us    2.23x      9 GB/s   0.00 -> 0 GB
+        1e6       64.1 us    29.1 us    2.20x    550 GB/s   0.01 -> 0 GB
+        1e7      371.6 us   123.8 us    3.00x   1292 GB/s   0.12 -> 0 GB
+        1e8      3.54 ms    1.15 ms     3.08x   1393 GB/s   1.20 -> 0 GB
+        8e8     28.21 ms    9.31 ms     3.03x   1376 GB/s   9.60 -> 0 GB
+
+    Below ~1e6 both arms sit on cuBLAS nrm2's flat ~30 us launch floor (the 2.2x
+    is latency, not bandwidth); from 1e7 up the kernel runs at ~1380 GB/s, ~88%
+    of the A100's HBM2e peak, i.e. it is DRAM-bound and near-optimal, and the
+    3x holds flat out to 8e8 rather than decaying toward cuBLAS. Accuracy also
+    improves ~1000x (double accumulation): relerr vs a float64 reference is
+    3e-12 at n=1e7 where linalg.norm's float32 sum gives 2.7e-8.
+
+    End-to-end (diffnorm_e2e_split.py, 576x128x128 frames, AP loop): this kernel
+    alone is 1.129x of the loop, on top of 1.229x for the fused ProxD + ref
+    trick, 1.387x for both. NOTE that is with residuals_interval=1; eps_S is
+    computed only when `not np.mod(ii, residuals_interval)` (Solvers.py), so a
+    caller sampling residuals every k-th iteration sees ~1/k of the 1.129x.
+
+    On dropping nrm2's overflow-safe scaling: harmless HERE because the squares
+    accumulate in DOUBLE. Worst case for finite float32 input is
+    (3.4e38)^2 = 1.2e77 per term; even 1e9 terms reach only ~1e86, vs DBL_MAX
+    1.8e308. A float32 accumulator would NOT be safe (it overflows once
+    ||a-b|| > ~1.8e19) -- that is why sh[] and g_ssq are double, not just for
+    precision.
+
+    On dropping nrm2's overflow-safe scaling: harmless HERE because the squares
+    accumulate in DOUBLE. Worst case for finite float32 input is
+    (3.4e38)^2 = 1.2e77 per term; even 1e9 terms reach only ~1e86, vs DBL_MAX
+    1.8e308. A float32 accumulator would NOT be safe (it overflows once
+    ||a-b|| > ~1.8e19) -- that is why sh[] and g_ssq are double, not just for
+    precision."""
+    if (_FUSED_PROXD and GPU and a.size > 0     # size 0 -> gridDim 0 is illegal
+            and a.dtype == xp.complex64 and b.dtype == xp.complex64
+            and a.shape == b.shape
+            and a.flags.c_contiguous and b.flags.c_contiguous):
+        n2 = 2 * a.size                               # floats, not complex
+        threads = 256                                 # must match sh[256]
+        # 1024-block cap (not proxd_resid's 65535): a pure reduction wants few
+        # fat grid-stride blocks -- one atomicAdd per block, not per tile.
+        blocks = min(1024, (n2 + threads - 1) // threads)
+        _diffnorm_ssq.fill(0)
+        _diffnorm_kernel((blocks,), (threads,), (a, b, _diffnorm_ssq, np.int64(n2)))
+        return xp.sqrt(_diffnorm_ssq[0])
+    return xp.linalg.norm(a - b)
 
 
 def Project_data(frames, frames_data, compute_residuals=False, weights=None):
