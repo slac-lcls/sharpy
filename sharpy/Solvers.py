@@ -35,7 +35,7 @@ from Operators import (
 )
 from ap_accel import line_search as _line_search
 from Operators import Replicate_frame, synchronize_illum_c,refine_illumination_pairwise,refine_illumination_function
-import Operators  # for the live _FUSED_PROXD flag + _diffnorm (fused eps_S residual)
+import Operators  # for the live _FUSED_PROXD flag (a fused eps_S residual was tried and REVERTED)
 import config
 if config.GPU:
     from wrap_ops import overlap_cuda,split_cuda
@@ -624,17 +624,22 @@ def Alternating_projections_c(
   
         timers["illuminate&split"] += timer() - t0
         
+        # NOTE: the flag must be set BEFORE Project_data consumes it. It used to be recomputed
+        # below, so mse_data was produced under the PREVIOUS iteration's flag and stored under
+        # this one: for 1 < residuals_interval < inf every firing after ii=0 recorded the eps
+        # placeholder in residuals[:,1] (and ii=1 paid for an mse nobody stored). This matches
+        # the ordering already used in Alternating_projections (:274) and the batched solver.
+        if residuals_interval < np.inf:
+            compute_residuals = not np.mod(ii, residuals_interval)
+
         frames, mse_data = Project_data(
             frames, frames_data, compute_residuals=compute_residuals
         )
-        
+
         if refine_illumination and sync:
             tic = timer()
             frames_norm = Precondition_calc(frames, bw=Gramiam['bw']) #illumination changes the norm
-            
-        if residuals_interval < np.inf:
-            compute_residuals = not np.mod(ii, residuals_interval)
-        
+
         # if GPU and ii<2:
         #     print('in loop, after Prox data memory used, and total normalized:', mempool.used_bytes()/frames_data.nbytes,mempool.total_bytes()/frames_data.nbytes )
         #     print('----')

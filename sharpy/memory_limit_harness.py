@@ -163,7 +163,7 @@ def probe_one(nx, nnx, Dx, fname):
             MAXITER,
             normalization=None,
             img_truth=truth,
-            residuals_interval=MAXITER,
+            residuals_interval=MAXITER,   # fires once at ii=0, not at the end (see scaling_harness)
             sync_interval=1,
             num_iter=10,
         )

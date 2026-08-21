@@ -142,7 +142,8 @@ def reconstruct(fname):
         MAXITER,
         normalization=None,
         img_truth=truth,
-        residuals_interval=MAXITER,   # only at the end — don't pay per-iter MSE cost
+        residuals_interval=MAXITER,   # fires once at ii=0 — the START, not the end (the rule is
+                                      # `not mod(ii, interval)`). Harmless: this return is unused.
         sync_interval=SYNC_INTERVAL,
         num_iter=NUM_EIG_ITER,
     )
