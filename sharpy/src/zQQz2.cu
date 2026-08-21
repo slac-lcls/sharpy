@@ -1,5 +1,5 @@
 #include "cupy/complex.cuh"
-#include <cub/block/block_reduce.cuh>
+#include <cupy/cub/cub/block/block_reduce.cuh>
 
 /*
  * Generalized zQQz: left/right illumination.

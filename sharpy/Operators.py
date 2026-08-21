@@ -810,7 +810,25 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
     normalization = normalization.astype(xp.complex64, copy=False)
     frames_norm   = frames_norm.astype(xp.complex64, copy=False)
 
-    value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
+    if normalization.ndim == 2 and "ax0" in plan:
+        # Fetch-normalization path (SM, 2026-07-18): `normalization` is the OBJECT-SIZED nu canvas; the
+        # dotp_fetch kernel reads it at the absolute pixel (plan["ax0"/"ay0"] origins, toroidal
+        # compare-subtract wrap) instead of a frame-sized Splitc stack. Bit-exact vs the stack path
+        # (sync_fetch_test.py: max|dH|=0 at 256/1024/4096 frames), ~0.9x kernel time, and the
+        # ~overlap-factor redundant stack (0.5 GB at 4096x128^2) is never built. A 3-D `normalization`
+        # keeps the original path, so existing callers are untouched.
+        col = plan["col"].astype(int); row = plan["row"].astype(int)
+        nnz = int(col.size)
+        value = xp.zeros((nnz, 1), dtype=xp.complex64)
+        fh, fw = int(frames.shape[1]), int(frames.shape[2])
+        canH, canW = plan["can_hw"]
+        cp.RawKernel(zQQz_raw_kernel, "dotp_fetch", jitify=True, options=("--std=c++17",))(
+            (nnz,), (128,),
+            (value, frames, frames_norm, illumination, normalization,
+             plan["ax0"], plan["ay0"], col, row, plan["dx"], plan["dy"],
+             plan["bw"], nnz, fh, fw, canH, canW))
+    else:
+        value = plan["gram_calc"](frames,frames_norm, illumination, normalization)
 
     timers['Gramiam'] = timer()-t0
 
@@ -943,6 +961,15 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
         "dx": dx_t, "dy": dy_t, "val": val, "bw": bw,
         "val2H": val2H, "gram_calc": None,
     }
+
+    # Per-frame absolute canvas origins for the fetch-normalization kernel (dotp_fetch): lets the kernel
+    # read nu from the object-sized canvas instead of a frame-sized Splitc stack. Decoded with the exact
+    # map_frames corner semantics (float mod, then uint32 truncation) so the fetched pixel is bit-identical
+    # to what Splitc would have copied. Canvas layout per map_frames: row stride Nx -> (canH, canW)=(Ny, Nx).
+    _m0 = (np.mod(tx, Nx) + np.mod(ty, Ny) * Nx).astype(np.uint32)
+    plan["ax0"] = xp.asarray((_m0 % np.uint32(Nx)).astype(np.int64))
+    plan["ay0"] = xp.asarray((_m0 // np.uint32(Nx)).astype(np.int64))
+    plan["can_hw"] = (int(Ny), int(Nx))
 
     if GPU:
         nthreads = 128
