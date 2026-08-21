@@ -68,18 +68,36 @@ def run():
     flags = {k: os.environ.get(k, "") for k in
              ("SHARPY_FUSED_EIG", "SHARPY_EIG_MOMENTUM", "SHARPY_EIG_GRAPH", "SHARPY_EIG_WINDOWED")}
 
+    # ⚠ Eigensolver caches its last eigenvector in the module global _eig_v0 and warm-starts the
+    # next call from it. Timing REPS back-to-back therefore measures ONE cold solve followed by
+    # REPS-1 warm ones and reports a bimodal median -- which is how the first version of this
+    # bench produced medians that disagreed run-to-run. Measure the two cases separately:
+    #   MODE=cold  reset the cache before every rep   (first sync of a reconstruction)
+    #   MODE=warm  keep it                            (every subsequent AP iteration -- the
+    #                                                   common case in the loop)
+    MODE = os.environ.get("MODE", "warm")
+
+    def reset():
+        if hasattr(ops, "_eig_v0"):
+            ops._eig_v0 = None
+
     v = ops.Eigensolver(H, NUM_ITER)                       # warm-up / compile
     cp.cuda.runtime.deviceSynchronize()
     ts = []
     for _ in range(REPS):
+        if MODE == "cold":
+            reset()
+        cp.cuda.runtime.deviceSynchronize()
         t0 = time.perf_counter()
         v = ops.Eigensolver(H, NUM_ITER)
         cp.cuda.runtime.deviceSynchronize()
         ts.append((time.perf_counter() - t0) * 1e3)
     ts = np.array(ts)
+    lbl = f"{LABEL}_{MODE}"          # NOT `LABEL = ...`: rebinding a module global inside the
+                                     # function makes it local for the whole body -> UnboundLocalError
     ph = np.angle(cp.asnumpy(xp.asarray(v).ravel()))
-    np.save(os.path.join(W, f"phase_{TAG}_{LABEL}.npy"), ph)
-    print(f"{LABEL:22s} n={n:6d} | {np.median(ts):8.3f} ms (min {ts.min():.3f}, "
+    np.save(os.path.join(W, f"phase_{TAG}_{lbl}.npy"), ph)
+    print(f"{lbl:22s} n={n:6d} | {np.median(ts):8.3f} ms (min {ts.min():.3f}, "
           f"spread {ts.std():.3f}) | flags {flags}", flush=True)
 
 
