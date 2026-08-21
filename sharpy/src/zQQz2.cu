@@ -1,5 +1,18 @@
 #include "cupy/complex.cuh"
-#include <cupy/cub/cub/block/block_reduce.cuh>
+// Portable bundled-CUB include -- see the long note in zQQz.cu. cupy 13.x moved the vendored
+// CCCL to cupy/_cccl/cub/...; the earlier CUDA-12 fix here pinned the <=12.x path, which now
+// fails on cupy 13.6.0.
+#if defined(__has_include)
+#  if __has_include(<cupy/_cccl/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/_cccl/cub/cub/block/block_reduce.cuh>
+#  elif __has_include(<cupy/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/cub/cub/block/block_reduce.cuh>
+#  else
+#    include <cub/block/block_reduce.cuh>
+#  endif
+#else
+#  include <cupy/cub/cub/block/block_reduce.cuh>
+#endif
 
 /*
  * Generalized zQQz: left/right illumination.

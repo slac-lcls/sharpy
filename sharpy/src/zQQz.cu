@@ -5,7 +5,22 @@
 //#include <cub/cub.cuh> 
 //#include <cupy/cub/cub/cub.cuh>
 //#include <cub/block/block_reduce.cuh>
-#include <cupy/cub/cub/block/block_reduce.cuh>
+// Bundled-CUB include, portable across cupy majors: cupy 13.x relocated the vendored CCCL to
+// cupy/_cccl/cub/..., while <=12.x used cupy/cub/... . Hardcoding either one breaks the other,
+// and the failure is a "catastrophic error: cannot open source file" that takes the WHOLE module
+// down -- so dotp fails to compile too, not just dotp_fetch, which makes it look like a bug in
+// the caller. Measured on cupy 13.6.0 / H200 (2026-08-21): compiles with jitify on and off.
+#if defined(__has_include)
+#  if __has_include(<cupy/_cccl/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/_cccl/cub/cub/block/block_reduce.cuh>
+#  elif __has_include(<cupy/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/cub/cub/block/block_reduce.cuh>
+#  else
+#    include <cub/block/block_reduce.cuh>
+#  endif
+#else
+#  include <cupy/cub/cub/block/block_reduce.cuh>
+#endif
 
 extern "C" __global__ void 
 dotp(
