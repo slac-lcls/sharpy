@@ -25,11 +25,17 @@ def run_case(g, nxf, step, seed=0, label=""):
     illum = xp.asarray((rng.standard_normal((nxf, nxf)) + 1j * rng.standard_normal((nxf, nxf))).astype(np.complex64))
     nu_can = xp.asarray((rng.random((Ny, Nx)) + 0.5).astype(np.float32)).astype(xp.complex64)
     norm_stack = ops.Splitc(nu_can, mapid)                    # the redundant frame-sized copy
-    plan = ops.Gramiam_plan(tx, ty, nframes, nxf, nxf, Nx, Ny, bw=0)
+    # TWO plans, because the path is now opt-in (fetch=) rather than inferred from normalization.ndim.
+    # Do NOT collapse these back into one plan: with a single fetch=False plan both calls below take
+    # the stack path and this test compares a computation to itself -- it would print BITEXACT=True
+    # while validating nothing.
+    plan_stack = ops.Gramiam_plan(tx, ty, nframes, nxf, nxf, Nx, Ny, bw=0)
+    plan_fetch = ops.Gramiam_plan(tx, ty, nframes, nxf, nxf, Nx, Ny, bw=0, fetch=True)
+    assert not plan_stack["fetch"] and plan_fetch["fetch"], "plan dispatch flags not set as intended"
     frames_norm = ops.Precondition_calc(frames)
 
-    H1 = ops.Gramiam_calc_cuda(frames, plan, illum, norm_stack, frames_norm)   # stack path (dotp)
-    H2 = ops.Gramiam_calc_cuda(frames, plan, illum, nu_can,     frames_norm)   # fetch path (dotp_fetch)
+    H1 = ops.Gramiam_calc_cuda(frames, plan_stack, illum, norm_stack, frames_norm)  # stack path (dotp)
+    H2 = ops.Gramiam_calc_cuda(frames, plan_fetch, illum, nu_can,     frames_norm)  # fetch path (dotp_fetch)
     d1, d2 = H1.data, H2.data
     bitexact = bool(xp.all(d1.view(xp.int64) == d2.view(xp.int64)))
     maxd = float(xp.max(xp.abs(d1 - d2)))
@@ -43,8 +49,8 @@ def run_case(g, nxf, step, seed=0, label=""):
         cp.cuda.runtime.deviceSynchronize()
         return (time.perf_counter() - t0) / n * 1e3
 
-    t_stack = clock(lambda: ops.Gramiam_calc_cuda(frames, plan, illum, norm_stack, frames_norm))
-    t_fetch = clock(lambda: ops.Gramiam_calc_cuda(frames, plan, illum, nu_can, frames_norm))
+    t_stack = clock(lambda: ops.Gramiam_calc_cuda(frames, plan_stack, illum, norm_stack, frames_norm))
+    t_fetch = clock(lambda: ops.Gramiam_calc_cuda(frames, plan_fetch, illum, nu_can, frames_norm))
     print("CASE %-20s frames %5d x %d^2 | BITEXACT=%s max|dH| %.3g | stack-path %.2f ms -> fetch-path "
           "%.2f ms | stack %.0f MB -> canvas %.0f MB" % (
           label, nframes, nxf, bitexact, maxd, t_stack, t_fetch,

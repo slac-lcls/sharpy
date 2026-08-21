@@ -810,13 +810,33 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
     normalization = normalization.astype(xp.complex64, copy=False)
     frames_norm   = frames_norm.astype(xp.complex64, copy=False)
 
-    if normalization.ndim == 2 and "ax0" in plan:
+    if plan.get("fetch", False):
         # Fetch-normalization path (SM, 2026-07-18): `normalization` is the OBJECT-SIZED nu canvas; the
         # dotp_fetch kernel reads it at the absolute pixel (plan["ax0"/"ay0"] origins, toroidal
         # compare-subtract wrap) instead of a frame-sized Splitc stack. Bit-exact vs the stack path
         # (sync_fetch_test.py: max|dH|=0 at 256/1024/4096 frames), ~0.9x kernel time, and the
-        # ~overlap-factor redundant stack (0.5 GB at 4096x128^2) is never built. A 3-D `normalization`
-        # keeps the original path, so existing callers are untouched.
+        # ~overlap-factor redundant stack (0.5 GB at 4096x128^2) is never built.
+        #
+        # OPT-IN (2026-08-21). This used to trigger on `normalization.ndim == 2 and "ax0" in plan`,
+        # which was inference, not intent: Gramiam_plan always adds "ax0", so ANY caller passing a
+        # 2-D (object-sized) normalization silently switched kernels. The MPI path in
+        # sharpy_mpi_skeleton.py / mpi_halo.py does exactly that (`norm_reg` is the (Nx,Ny) canvas),
+        # so a merge would have re-routed distributed Gramian calls onto an inference validated only
+        # single-process. Correctness there depends on `normalization` being the SAME canvas that
+        # ax0/ay0 and can_hw were computed against -- pass a rank-local sub-canvas with global
+        # origins and the kernel reads at the wrong offsets, silently (out-of-bounds reads return 0
+        # and are then divided, which the MPI caller's nan_to_num scrub would hide). Ask for this
+        # path explicitly with Gramiam_plan(..., fetch=True).
+        if normalization.ndim != 2:
+            raise ValueError(
+                "fetch-normalization requires a 2-D object-sized `normalization` canvas "
+                f"(got ndim={normalization.ndim}); build the plan with fetch=False for the stack path")
+        canH_chk, canW_chk = plan["can_hw"]
+        if normalization.shape != (canH_chk, canW_chk):
+            raise ValueError(
+                f"fetch-normalization canvas mismatch: normalization{tuple(normalization.shape)} vs "
+                f"plan can_hw=({canH_chk}, {canW_chk}). ax0/ay0 are absolute origins into the canvas "
+                "the plan was built for -- under MPI, pass the global canvas or rebuild the plan.")
         col = plan["col"].astype(int); row = plan["row"].astype(int)
         nnz = int(col.size)
         value = xp.zeros((nnz, 1), dtype=xp.complex64)
@@ -880,7 +900,18 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
     
     return H
 
-def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
+def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0, fetch=False):
+    """Build the neighbour/overlap plan consumed by the Gramian kernels.
+
+    fetch : bool, default False
+        Opt in to the fetch-normalization Gramian path (dotp_fetch), which reads nu directly from
+        the object-sized (Ny, Nx) canvas instead of a frame-sized Splitc stack -- bit-exact, ~0.9x
+        kernel time, and it never materialises the ~overlap-factor redundant stack (0.5 GB at
+        4096x128^2). Requires that the `normalization` later handed to Gramiam_calc_cuda be that
+        same 2-D canvas; Gramiam_calc_cuda raises if it is not. Default False so existing callers
+        -- notably the MPI path, which passes a 2-D `norm_reg` -- keep the stack path until the
+        distributed canvas/origin question is settled deliberately.
+    """
     from scipy.spatial import KDTree
 
     # Overlap thresholds — match original: abs(dx)<ny-2bw, abs(dy)<nx-2bw
@@ -959,7 +990,7 @@ def Gramiam_plan(translations_x, translations_y, nframes, nx, ny, Nx, Ny, bw=0):
     plan = {
         "col": col_t.astype(int), "row": row_t.astype(int),
         "dx": dx_t, "dy": dy_t, "val": val, "bw": bw,
-        "val2H": val2H, "gram_calc": None,
+        "val2H": val2H, "gram_calc": None, "fetch": bool(fetch),
     }
 
     # Per-frame absolute canvas origins for the fetch-normalization kernel (dotp_fetch): lets the kernel
