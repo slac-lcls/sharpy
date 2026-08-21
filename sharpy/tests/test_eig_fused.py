@@ -190,13 +190,19 @@ def test_no_spurious_stop_with_f32_iterates():
             # the ONLY legitimate tol=0 stop is the machine-exact one at the
             # f32 fixed point -- i.e. at genuine convergence. Stopping while
             # still far away is the norm-drift bug this test guards against.
-            w, V = np.linalg.eigh(H.toarray())
-            a = abs(np.vdot(V[:, -1], v64 / np.linalg.norm(v64)))
-            assert a > 1.0 - 1e-6, f"spurious stop at it={it}, align={a}"
             break
         v = (y / math.sqrt(ssq_y)).astype(np.complex64)  # f32 storage drift
-    else:
-        raise AssertionError("no fixed point reached in budget")
+    # Whether a bitwise fixed point is reached is PLATFORM-DEPENDENT (the
+    # f32 rounding sequence differs across BLAS builds; on some, jitter
+    # keeps the iterate moving forever and tol=0 never stops -- that is
+    # fine). The invariant on every platform: by now the iterate has
+    # converged, and if a stop fired it fired only there.
+    w, V = np.linalg.eigh(H.toarray())
+    vf = np.asarray(v, np.complex128)
+    a = abs(np.vdot(V[:, -1], vf / np.linalg.norm(vf)))
+    assert a > 1.0 - 1e-6, \
+        f"align={a} (stop={ctl.stop} at it={ctl.it}): " \
+        "either a spurious early stop or non-convergence" 
 
 
 def test_feed_is_scale_invariant():
