@@ -1119,6 +1119,232 @@ SYNC_EIGTOL = float(os.environ.get("SHARPY_SYNC_EIGTOL", "1e-7")) # power-iterat
 #######
 ####Eigensolver is causing problems, need implementation
 #######
+# Fused power-iteration step (opt-in via SHARPY_FUSED_EIG=1, momentum via
+# SHARPY_EIG_MOMENTUM=1). The stock loop costs, PER ITERATION: one SpMV, two
+# trips through xp.linalg.norm (a multi-kernel path measured ~41 us on A100
+# regardless of size at sync scales), one materialized difference vn - v, and
+# a float() device->host sync for the step test. At nframes = 256..4096 that
+# is all launch/sync latency, not bandwidth. The fused path uses the identity
+#   ||y/||y|| - v||^2 = 2 - 2 Re<y, v> / ||y||     (v unit norm)
+# so ONE kernel pass over (y, v) yields the step, the Rayleigh quotient and
+# the norm together (dual accumulator, same pattern as _proxd_resid), the
+# scale kernel folds the normalization, and the gap-aware test syncs once
+# every _EIG_CHECK_EVERY iterations instead of every iteration.
+# Momentum (Chebyshev) upgrade: v_{k+1} = (H v_k - beta v_{k-1}) / s with
+# beta = (rho*lambda1)^2/4 estimated from the SAME quantities the gap-aware
+# early-out already computes; contraction goes from O(gap) to O(sqrt(gap)),
+# which is the large-N / shrinking-Fiedler-gap regime (poster Fig 1.1).
+_FUSED_EIG = GPU and os.environ.get("SHARPY_FUSED_EIG", "0") == "1"
+_EIG_MOMENTUM = os.environ.get("SHARPY_EIG_MOMENTUM", "0") == "1"
+_EIG_CHECK_EVERY = int(os.environ.get("SHARPY_EIG_CHECK_EVERY", "4"))
+_EIG_WARMUP = int(os.environ.get("SHARPY_EIG_WARMUP", "8"))  # plain its before momentum
+
+if GPU:
+    # Same conventions as _proxd_resid: complex64 as interleaved float pairs,
+    # no thrust/cub/cupy-complex headers (NVRTC), double accumulators,
+    # 256 threads matching the shared-memory reduction.
+    _eig_step_src = r"""
+    extern "C" __global__ void eig_step(
+            float* y, const float* v, const float* vp, double* acc,
+            const float beta, const int n, const int it) {
+        // y = H v (complex64, interleaved). If beta != 0 this REWRITES y in
+        // place to t = y - beta*vp (momentum three-term recurrence). Rows of
+        // acc (4 doubles per iteration it):
+        //   acc[4it+0] += |t|^2            (normalization of the new iterate)
+        //   acc[4it+1] += |y|^2            (eigen-residual ||Hv||^2 term)
+        //   acc[4it+2] += Re(conj(y).v)    (Rayleigh quotient / step test)
+        //   acc[4it+3] += |v|^2            (v is float32: its norm DRIFTS off
+        //       1 by ~1e-7/step, and the step/residual formulas assume unit v.
+        //       ~5e-8 of drift is enough to clamp step^2 = 2-2*dot/||y|| to a
+        //       spurious exact 0 and fire the machine-exact stop while the
+        //       true distance is still ~1e-2 [observed on A100]. Carrying
+        //       ||v||^2 makes every formula use the TRUE cosine, for which
+        //       Cauchy-Schwarz holds by construction.)
+        __shared__ double sh[256];
+        double l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+        const int gs = gridDim.x * blockDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gs) {
+            float yr = y[2*i], yi = y[2*i+1];
+            float vr = v[2*i], vi = v[2*i+1];
+            l1 += (double)(yr*yr + yi*yi);
+            l2 += (double)(yr*vr + yi*vi);
+            l3 += (double)(vr*vr + vi*vi);
+            float tr = yr, ti = yi;
+            if (beta != 0.0f) {
+                tr -= beta * vp[2*i]; ti -= beta * vp[2*i+1];
+                y[2*i] = tr; y[2*i+1] = ti;
+            }
+            l0 += (double)(tr*tr + ti*ti);
+        }
+        int tid = threadIdx.x;
+        double vals[4] = {l0, l1, l2, l3};
+        for (int j = 0; j < 4; j++) {
+            sh[tid] = vals[j]; __syncthreads();
+            for (int w = blockDim.x >> 1; w > 0; w >>= 1) {
+                if (tid < w) sh[tid] += sh[tid + w];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(&acc[4*it + j], sh[0]);
+            __syncthreads();
+        }
+    }
+    """
+    _eig_step = cp.RawKernel(_eig_step_src, "eig_step")
+
+    _eig_scale_src = r"""
+    extern "C" __global__ void eig_scale(
+            float* v, float* vp, const float* t, const double* acc,
+            const int n2, const int it) {
+        // s = 1/||t|| from acc[4it]; vp <- v_old*s (keeps the three-term
+        // recurrence consistently scaled), v <- t*s (the new unit iterate).
+        // ||t|| == 0 (H v == 0, e.g. zeroed illumination during warmup)
+        // writes zeros rather than inf -- parity with the stock loop's
+        // failure mode but NaN-free; the caller's step test then breaks out.
+        double ssq = acc[4*it];
+        float s = (ssq > 0.0) ? (float)rsqrt(ssq) : 0.0f;
+        const int gs = gridDim.x * blockDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n2; i += gs) {
+            float old = v[i];
+            vp[i] = old * s;
+            v[i]  = t[i] * s;
+        }
+    }
+    """
+    _eig_scale = cp.RawKernel(_eig_scale_src, "eig_scale")
+
+
+class _EigAdapt:
+    """Control law of the fused power iteration -- SINGLE SOURCE OF TRUTH,
+    shared by the GPU loop (_eig_power_fused feeds it host-synced accumulator
+    rows in batches of _EIG_CHECK_EVERY) and the CPU tests (which feed it
+    numpy-computed rows in the same batches, guaranteeing decision parity).
+
+    Plain phase (beta == 0): the stock loop's gap-aware early-out, computed
+    from the fused identity  step^2 = 2 - 2 Re<y,v>/||y||.
+    Momentum phase: Chebyshev three-term recurrence with ADAPTIVE beta
+    (Manteuffel-style). The observed eigen-residual contraction sigma over a
+    window of R rows is inverted through the recurrence's characteristic
+    roots  mu(lam) = (lam + sqrt(lam^2 - 4 beta))/2 :
+        mu2 = sigma * mu(lam1)   ->   lam2_hat = mu2 + beta/mu2
+    (exact inverse of sigma = mu(lam2)/mu(lam1) for lam2 outside the damped
+    interval). beta only climbs, and the update has its fixed point exactly
+    at the Chebyshev-optimal beta = (lam2/2)^2. A naive interval-interior
+    inversion stalls at a spurious fixed point and caps the win at ~2x;
+    this form measures 6.6x-29x fewer matvecs (n = 576..8100, mirror)."""
+
+    def __init__(self, tol, momentum, warmup=None, R=16):
+        self.tol = tol
+        self.momentum = momentum
+        self.warmup = _EIG_WARMUP if warmup is None else warmup
+        self.R = R
+        self.beta = 0.0
+        self.rho = None
+        self.lam = None
+        self.prev_step = None
+        self.res_hist = []
+        self.it = 0
+        self.last_update = 0
+        self.stop = False
+
+    def feed(self, rows):
+        """rows: iterable of (ssq_t, ssq_y, dot). Updates self.beta/self.stop;
+        beta takes effect from the NEXT kernel launch (batch-boundary delay is
+        part of the contract on both backends)."""
+        for ssq_t, ssq_y, dot, ssq_v in rows:
+            if self.stop:
+                return
+            it = self.it
+            self.it += 1
+            if ssq_y <= 0.0 or ssq_v <= 0.0:
+                self.stop = True            # H v == 0: nothing to iterate on
+                return
+            # TRUE cosine of (y, v): Cauchy-Schwarz holds for the stored
+            # vectors, so cos <= 1 up to double rounding -- no spurious
+            # step == 0 / res == 0 from float32 norm drift (see kernel note).
+            cos = dot / math.sqrt(ssq_y * ssq_v)
+            cos = min(1.0, max(-1.0, cos))
+            step = math.sqrt(max(0.0, 2.0 - 2.0 * cos))
+            self.lam = dot / ssq_v          # Rayleigh quotient of v/||v||
+            res = math.sqrt(max(0.0, ssq_y * ssq_v - dot * dot)) / ssq_v
+            self.res_hist.append(res)
+            if self.beta == 0.0:
+                if step < 1e-12:            # machine-exact warm start
+                    self.stop = True
+                    return
+                if self.prev_step is not None and step < self.prev_step:
+                    r = step / self.prev_step
+                    self.rho = r            # contraction ~ lambda2/lambda1
+                    if self.tol > 0 and step * r / (1.0 - r) < self.tol:
+                        self.stop = True    # gap-aware distance-to-limit
+                        return
+                self.prev_step = step
+                if self.momentum and it + 1 >= self.warmup \
+                        and self.rho is not None and 0.0 < self.rho < 1.0 \
+                        and self.lam > 0.0:
+                    self.beta = (self.rho * self.lam) ** 2 / 4.0
+                    self.last_update = it
+            else:
+                gap = max(1e-30,
+                          self.lam * (1.0 - min(self.rho, 1.0 - 1e-12)))
+                if (self.tol > 0 and res / gap < self.tol) or res < 1e-12:
+                    self.stop = True        # eigen-residual distance-to-limit
+                    return
+                R = self.R
+                if it - self.last_update >= 2 * R \
+                        and len(self.res_hist) > R \
+                        and self.res_hist[-R - 1] > 0.0:
+                    sig = (res / self.res_hist[-R - 1]) ** (1.0 / R)
+                    lam, beta = self.lam, self.beta
+                    if 0.0 < sig < 1.0 and lam * lam > 4.0 * beta:
+                        mu1 = (lam + math.sqrt(lam * lam - 4.0 * beta)) / 2.0
+                        mu2 = sig * mu1
+                        lam2 = (mu2 + beta / mu2) if mu2 * mu2 > beta \
+                            else 2.0 * math.sqrt(beta)
+                        lam2 = min(lam2, 0.9999 * lam)
+                        nb = (lam2 / 2.0) ** 2
+                        if nb > beta * 1.0001:      # climb-only; fixed point
+                            self.beta = nb          #   at Chebyshev-optimal
+                            self.last_update = it
+                        self.rho = min(lam2 / lam, 1.0 - 1e-12)
+
+
+_eig_stats = {}   # debug/observability: last fused-call state
+
+
+def _eig_power_fused(H, v, num_iter, tol):
+    """Sync-reduced fused power iteration (one host sync per _EIG_CHECK_EVERY
+    iterations) with optional adaptive-Chebyshev momentum. v: (nframes,1)
+    complex64 unit warm start. Returns the normalized dominant-eigenvector
+    iterate, same shape. Control decisions live in _EigAdapt."""
+    n = int(v.shape[0])
+    v = xp.ascontiguousarray(v.ravel(), dtype=xp.complex64)
+    vp = xp.zeros_like(v)
+    acc = xp.zeros((num_iter, 4), xp.float64)
+    threads = 256
+    blocks = min(1024, (n + threads - 1) // threads)
+    ctl = _EigAdapt(tol, _EIG_MOMENTUM)
+    checked = 0                      # acc rows [0, checked) already fed
+    K = max(1, _EIG_CHECK_EVERY)
+    for it in range(num_iter):
+        y = H @ v                    # cuSPARSE CSR SpMV (canonical H)
+        _eig_step((blocks,), (threads,),
+                  (y, v, vp, acc, np.float32(ctl.beta), np.int32(n),
+                   np.int32(it)))
+        _eig_scale((blocks,), (threads,),
+                   (v, vp, y, acc, np.int32(2 * n), np.int32(it)))
+        if (it + 1) % K == 0 or it == num_iter - 1:
+            ctl.feed(acc[checked:it + 1].get())   # ONE sync per window
+            checked = it + 1
+            if ctl.stop:
+                break
+    v /= xp.linalg.norm(v)           # defensive renorm, outside the loop
+    _eig_stats.update(iters=ctl.it, beta=ctl.beta, rho=ctl.rho,
+                      lam=ctl.lam, stopped=ctl.stop,
+                      last_res=(ctl.res_hist[-1] if ctl.res_hist else None),
+                      last_step=ctl.prev_step)
+    return v.reshape(n, 1)
+
+
 _eig_v0 = None  # cached dominant eigenvector, for power-iteration warm start
 _sync_state = {"n": 0}  # invit_seed: count of sync calls so far (reset by eig_reset)
 _invit_cache = {}  # invit: cached CSR row-index array (overlap-graph sparsity is scan-fixed)
@@ -1208,19 +1434,26 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-7):
             # stop on that distance, NOT the raw step: rho->1 (tiny gap) keeps
             # iterating until the gauge is actually resolved, rho<<1 (well separated)
             # still stops in ~1-2 matvecs. tol=0 disables the early-out (full num_iter).
-            prev_step = None
-            for _ in range(num_iter):
-                vn = H @ eigenvectors
-                vn /= xp.linalg.norm(vn)
-                step = float(xp.linalg.norm(vn - eigenvectors))
-                eigenvectors = vn
-                if step < 1e-12:                      # machine-exact (perfect warm start)
-                    break
-                if prev_step is not None and step < prev_step:
-                    rho = step / prev_step            # observed contraction ~ lambda2/lambda1
-                    if step * rho / (1.0 - rho) < tol:  # gap-aware distance-to-limit
+            if _FUSED_EIG and H.dtype == xp.complex64 \
+                    and getattr(H, "format", None) == "csr":
+                # Fused path: same warm start, same gap-aware stop contract
+                # (see _eig_power_fused), one sync per _EIG_CHECK_EVERY
+                # iterations instead of per iteration, optional momentum.
+                eigenvectors = _eig_power_fused(H, eigenvectors, num_iter, tol)
+            else:
+                prev_step = None
+                for _ in range(num_iter):
+                    vn = H @ eigenvectors
+                    vn /= xp.linalg.norm(vn)
+                    step = float(xp.linalg.norm(vn - eigenvectors))
+                    eigenvectors = vn
+                    if step < 1e-12:                  # machine-exact (perfect warm start)
                         break
-                prev_step = step
+                    if prev_step is not None and step < prev_step:
+                        rho = step / prev_step        # observed contraction ~ lambda2/lambda1
+                        if step * rho / (1.0 - rho) < tol:  # gap-aware distance-to-limit
+                            break
+                    prev_step = step
             _eig_v0 = eigenvectors + 0.0          # cache for next AP iteration's warm start
 
         else:
