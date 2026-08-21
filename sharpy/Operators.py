@@ -813,9 +813,15 @@ def Gramiam_calc_cuda(frames,plan,illumination,normalization,frames_norm,timers=
     if plan.get("fetch", False):
         # Fetch-normalization path (SM, 2026-07-18): `normalization` is the OBJECT-SIZED nu canvas; the
         # dotp_fetch kernel reads it at the absolute pixel (plan["ax0"/"ay0"] origins, toroidal
-        # compare-subtract wrap) instead of a frame-sized Splitc stack. Bit-exact vs the stack path
-        # (sync_fetch_test.py: max|dH|=0 at 256/1024/4096 frames), ~0.9x kernel time, and the
-        # ~overlap-factor redundant stack (0.5 GB at 4096x128^2) is never built.
+        # compare-subtract wrap) instead of a frame-sized Splitc stack.
+        #
+        # Bit-exactness holds: sync_fetch_test.py gives max|dH| = 0 at 256/1024/4096 frames,
+        # re-confirmed on H200 NVL / cupy 13.6.0 (drp-srcf-gpu007, 2026-08-21).
+        # ⚠ The speed claim does NOT hold on H200. Measured there: 0.57 -> 0.68 ms at 1024x128^2
+        # and 3.74 -> 4.55 ms at 4096x128^2, i.e. the fetch path is ~1.2x SLOWER, not the ~0.9x
+        # recorded when this was written on other hardware. The reason to use it is MEMORY: the
+        # redundant ~overlap-factor stack is never built (537 MB -> 19 MB at 4096x128^2, 28x).
+        # Treat it as a memory-for-time trade, and re-time before quoting a speedup anywhere.
         #
         # OPT-IN (2026-08-21). This used to trigger on `normalization.ndim == 2 and "ax0" in plan`,
         # which was inference, not intent: Gramiam_plan always adds "ax0", so ANY caller passing a
