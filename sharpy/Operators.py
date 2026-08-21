@@ -1119,6 +1119,477 @@ SYNC_EIGTOL = float(os.environ.get("SHARPY_SYNC_EIGTOL", "1e-7")) # power-iterat
 #######
 ####Eigensolver is causing problems, need implementation
 #######
+# Fused power-iteration step (opt-in via SHARPY_FUSED_EIG=1, momentum via
+# SHARPY_EIG_MOMENTUM=1). The stock loop costs, PER ITERATION: one SpMV, two
+# trips through xp.linalg.norm (a multi-kernel path measured ~41 us on A100
+# regardless of size at sync scales), one materialized difference vn - v, and
+# a float() device->host sync for the step test. At nframes = 256..4096 that
+# is all launch/sync latency, not bandwidth. The fused path uses the identity
+#   ||y/||y|| - v||^2 = 2 - 2 Re<y, v> / ||y||     (v unit norm)
+# so ONE kernel pass over (y, v) yields the step, the Rayleigh quotient and
+# the norm together (dual accumulator, same pattern as _proxd_resid), the
+# scale kernel folds the normalization, and the gap-aware test syncs once
+# every _EIG_CHECK_EVERY iterations instead of every iteration.
+# Momentum (Chebyshev) upgrade: v_{k+1} = (H v_k - beta v_{k-1}) / s with
+# beta = (rho*lambda1)^2/4 estimated from the SAME quantities the gap-aware
+# early-out already computes; contraction goes from O(gap) to O(sqrt(gap)),
+# which is the large-N / shrinking-Fiedler-gap regime (poster Fig 1.1).
+_FUSED_EIG = GPU and os.environ.get("SHARPY_FUSED_EIG", "0") == "1"
+_EIG_MOMENTUM = os.environ.get("SHARPY_EIG_MOMENTUM", "0") == "1"
+_EIG_CHECK_EVERY = int(os.environ.get("SHARPY_EIG_CHECK_EVERY", "4"))
+_EIG_WARMUP = int(os.environ.get("SHARPY_EIG_WARMUP", "8"))  # plain its before momentum
+# Window-normalization: within a check window beta is frozen and every
+# control formula is a RATIO (cos, step, lam, res are all scale-invariant),
+# so the recurrence can run UNNORMALIZED in-window -- eig_scale becomes a
+# host-side pointer swap -- with one common renormalization of (cur, prev)
+# at the window edge. 3 launches/iter -> ~2. Guarded: in-window growth is
+# ~|lam|^K, so it is enabled per-window only while 1e-12 < |lam|^K < 1e25
+# (f32 component head-room on both sides); the first window and any
+# out-of-range window use per-iteration scaling.
+_EIG_WINDOWED = os.environ.get("SHARPY_EIG_WINDOWED", "1") == "1"
+# CUDA-graph capture of whole windows (opt-in). One graph replay replaces
+# K x (SpMV descriptor rebuild + kernel launches) of HOST work -- measured
+# ~92us/iter, dominated by the cupyx per-call cuSPARSE descriptor rebuild.
+# The captured graph prebuilds descriptors ONCE against pointer-stable
+# buffers (a 3-cycle rotation, so the capture length is a multiple of 3),
+# reads beta from a device scalar (kernel args are baked at capture), and is
+# CACHED across Eigensolver calls: sharpy's sync rebuilds H IN PLACE
+# (plan["val2H"] rewrites H.data on a persistent H), so the baked pointers
+# stay valid; the cache key still pins the data/indptr pointers to fail
+# closed if the assembly ever changes.
+_EIG_GRAPH = GPU and os.environ.get("SHARPY_EIG_GRAPH", "0") == "1"
+_EIG_GRAPH_K = 6                      # capture window; must be % 3 == 0
+_eig_graph_cache = {}                 # (id(H), ptrs, n) -> _EigGraph
+# Rayleigh-quotient cache for the window-growth guard, KEYED BY MATRIX like
+# the graph cache: a module-global scalar aliased across matrices (tile
+# solves call synchronize_frames_c on distinct Gramians back-to-back,
+# Operators_Tile) could admit an unnormalized first window at an unrelated
+# scale (review finding). Unknown matrix -> first window normalized.
+_eig_lam_cache = {}                   # same key -> last Rayleigh quotient
+
+if GPU:
+    # Same conventions as _proxd_resid: complex64 as interleaved float pairs,
+    # no thrust/cub/cupy-complex headers (NVRTC), double accumulators,
+    # 256 threads matching the shared-memory reduction.
+    _eig_step_src = r"""
+    extern "C" __global__ void eig_step(
+            float* y, const float* v, const float* vp, double* acc,
+            const float* betap, const int n, const int it) {
+        // beta arrives via DEVICE memory (betap[0]), not a kernel argument:
+        // CUDA-graph replays bake argument values at capture time, and beta
+        // changes between windows (momentum engagement + adaptation).
+        // y = H v (complex64, interleaved). If beta != 0 this REWRITES y in
+        // place to t = y - beta*vp (momentum three-term recurrence). Rows of
+        // acc (4 doubles per iteration it):
+        //   acc[4it+0] += |t|^2            (normalization of the new iterate)
+        //   acc[4it+1] += |y|^2            (eigen-residual ||Hv||^2 term)
+        //   acc[4it+2] += Re(conj(y).v)    (Rayleigh quotient / step test)
+        //   acc[4it+3] += |v|^2            (v is float32: its norm DRIFTS off
+        //       1 by ~1e-7/step, and the step/residual formulas assume unit v.
+        //       ~5e-8 of drift is enough to clamp step^2 = 2-2*dot/||y|| to a
+        //       spurious exact 0 and fire the machine-exact stop while the
+        //       true distance is still ~1e-2 [observed on A100]. Carrying
+        //       ||v||^2 makes every formula use the TRUE cosine, for which
+        //       Cauchy-Schwarz holds by construction.)
+        __shared__ double sh[256];
+        const float beta = betap[0];
+        double l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+        const int gs = gridDim.x * blockDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gs) {
+            // Promote every operand BEFORE the product: a float product
+            // rounds at 2^-24 and its termwise error lets the computed
+            // cos(y,v) exceed 1 by ~1e-7, re-firing the spurious machine-
+            // exact stop at true step ~4e-4 (review finding); it also
+            // overflows at |x| > 1.8e19 while the window guard permits
+            // component growth to ~1e25. Double products make Cauchy-
+            // Schwarz hold to ~1e-15 and cannot overflow under the guard.
+            double yr = (double)y[2*i], yi = (double)y[2*i+1];
+            double vr = (double)v[2*i], vi = (double)v[2*i+1];
+            l1 += yr*yr + yi*yi;
+            l2 += yr*vr + yi*vi;
+            l3 += vr*vr + vi*vi;
+            float tr = y[2*i], ti = y[2*i+1];
+            if (beta != 0.0f) {
+                tr -= beta * vp[2*i]; ti -= beta * vp[2*i+1];
+                y[2*i] = tr; y[2*i+1] = ti;
+            }
+            l0 += (double)tr*(double)tr + (double)ti*(double)ti;
+        }
+        int tid = threadIdx.x;
+        double vals[4] = {l0, l1, l2, l3};
+        for (int j = 0; j < 4; j++) {
+            sh[tid] = vals[j]; __syncthreads();
+            for (int w = blockDim.x >> 1; w > 0; w >>= 1) {
+                if (tid < w) sh[tid] += sh[tid + w];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(&acc[4*it + j], sh[0]);
+            __syncthreads();
+        }
+    }
+    """
+    _eig_step = cp.RawKernel(_eig_step_src, "eig_step")
+
+    _eig_scale_src = r"""
+    extern "C" __global__ void eig_scale(
+            float* v, float* vp, const float* t, const double* acc,
+            const int n2, const int it) {
+        // s = 1/||t|| from acc[4it]; vp <- v_old*s (keeps the three-term
+        // recurrence consistently scaled), v <- t*s (the new unit iterate).
+        // ||t|| == 0 (H v == 0, e.g. zeroed illumination during warmup)
+        // writes zeros rather than inf -- parity with the stock loop's
+        // failure mode but NaN-free; the caller's step test then breaks out.
+        double ssq = acc[4*it];
+        float s = (ssq > 0.0) ? (float)rsqrt(ssq) : 0.0f;
+        const int gs = gridDim.x * blockDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n2; i += gs) {
+            float old = v[i];
+            vp[i] = old * s;
+            v[i]  = t[i] * s;
+        }
+    }
+    """
+    _eig_scale = cp.RawKernel(_eig_scale_src, "eig_scale")
+
+    _eig_rescale2_src = r"""
+    extern "C" __global__ void eig_rescale2(
+            float* a, float* b, const double* acc, const int n2,
+            const int it) {
+        // Window-edge renormalization: s = 1/||cur|| from the last in-window
+        // |t|^2. BOTH the current and previous unnormalized iterates are
+        // scaled by the SAME s, preserving the three-term recurrence's
+        // relative scaling (and therefore the meaning of beta).
+        double ssq = acc[4*it];
+        float s = (ssq > 0.0) ? (float)rsqrt(ssq) : 0.0f;
+        const int gs = gridDim.x * blockDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n2; i += gs) {
+            a[i] *= s;
+            b[i] *= s;
+        }
+    }
+    """
+    _eig_rescale2 = cp.RawKernel(_eig_rescale2_src, "eig_rescale2")
+
+    _eig_spmv_src = r"""
+    extern "C" __global__ void eig_spmv(
+            const int* indptr, const int* indices, const float* data,
+            const float* x, float* y, const int n) {
+        // Row-per-thread complex64 CSR SpMV for the sync Gramian (tiny n,
+        // ~10 nnz/row, H resident in L2). Exists because cupy REFUSES
+        // cuSPARSE calls during stream capture (its spMV wrapper's
+        // setStream raises NotImplementedError while capturing), so the
+        // captured window needs a cusparse-free matvec. Bonus: no
+        // descriptor rebuild, no workspace query.
+        const int gs = gridDim.x * blockDim.x;
+        for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < n;
+             row += gs) {
+            float accr = 0.0f, acci = 0.0f;
+            const int e = indptr[row + 1];
+            for (int k = indptr[row]; k < e; k++) {
+                const int c = indices[k];
+                const float ar = data[2*k],   ai = data[2*k+1];
+                const float xr = x[2*c],      xi = x[2*c+1];
+                accr += ar * xr - ai * xi;
+                acci += ar * xi + ai * xr;
+            }
+            y[2*row]     = accr;
+            y[2*row + 1] = acci;
+        }
+    }
+    """
+    _eig_spmv = cp.RawKernel(_eig_spmv_src, "eig_spmv")
+    # Module-global device scalar for beta: cached CUDA graphs bake this
+    # POINTER at capture, so every call (eager or replay) must write the
+    # same memory. Allocated once; updated at window edges only.
+    _eig_beta_dev = cp.zeros((1,), cp.float32)
+
+
+class _EigAdapt:
+    """Control law of the fused power iteration -- SINGLE SOURCE OF TRUTH,
+    shared by the GPU loop (_eig_power_fused feeds it host-synced accumulator
+    rows in batches of _EIG_CHECK_EVERY) and the CPU tests (which feed it
+    numpy-computed rows in the same batches, guaranteeing decision parity).
+
+    Plain phase (beta == 0): the stock loop's gap-aware early-out, computed
+    from the fused identity  step^2 = 2 - 2 Re<y,v>/||y||.
+    Momentum phase: Chebyshev three-term recurrence with ADAPTIVE beta
+    (Manteuffel-style). The observed eigen-residual contraction sigma over a
+    window of R rows is inverted through the recurrence's characteristic
+    roots  mu(lam) = (lam + sqrt(lam^2 - 4 beta))/2 :
+        mu2 = sigma * mu(lam1)   ->   lam2_hat = mu2 + beta/mu2
+    (exact inverse of sigma = mu(lam2)/mu(lam1) for lam2 outside the damped
+    interval). beta only climbs, and the update has its fixed point exactly
+    at the Chebyshev-optimal beta = (lam2/2)^2. A naive interval-interior
+    inversion stalls at a spurious fixed point and caps the win at ~2x;
+    this form measures 6.6x-29x fewer matvecs (n = 576..8100, mirror)."""
+
+    def __init__(self, tol, momentum, warmup=None, R=16):
+        self.tol = tol
+        self.momentum = momentum
+        self.warmup = _EIG_WARMUP if warmup is None else warmup
+        self.R = R
+        self.beta = 0.0
+        self.rho = None
+        self.lam = None
+        self.prev_step = None
+        self.res_hist = []
+        self.it = 0
+        self.last_update = 0
+        self.res_min = None          # momentum stagnation detector state
+        self.last_improve = 0
+        self.stop = False
+
+    def feed(self, rows):
+        """rows: iterable of (ssq_t, ssq_y, dot, ssq_v). Updates
+        self.beta/self.stop; beta takes effect from the NEXT kernel launch
+        (batch-boundary delay is part of the contract on both backends).
+
+        Every row in a batch was GENERATED by kernels running the beta that
+        was in effect at launch, so branch selection and the mu-root
+        inversion use a snapshot of beta taken at batch entry (beta_gen);
+        updates to self.beta are staged for the next launch and never
+        reinterpret rows of the current batch (review finding)."""
+        beta_gen = self.beta
+        for ssq_t, ssq_y, dot, ssq_v in rows:
+            if self.stop:
+                return
+            it = self.it
+            self.it += 1
+            if not (math.isfinite(ssq_y) and math.isfinite(ssq_v)
+                    and math.isfinite(dot)
+                    and ssq_y > 0.0 and ssq_v > 0.0):
+                # H v == 0, or a non-finite row (overflowed/NaN iterate):
+                # stop rather than iterate on garbage. NaN fails every
+                # comparison so `<= 0.0` let it through -- and inf PASSES
+                # `> 0.0`, so finiteness must be tested explicitly.
+                self.stop = True
+                return
+            # TRUE cosine of (y, v): Cauchy-Schwarz holds for the stored
+            # vectors, so cos <= 1 up to double rounding -- no spurious
+            # step == 0 / res == 0 from float32 norm drift (see kernel note).
+            cos = dot / math.sqrt(ssq_y * ssq_v)
+            cos = min(1.0, max(-1.0, cos))
+            step = math.sqrt(max(0.0, 2.0 - 2.0 * cos))
+            self.lam = dot / ssq_v          # Rayleigh quotient of v/||v||
+            res = math.sqrt(max(0.0, ssq_y * ssq_v - dot * dot)) / ssq_v
+            self.res_hist.append(res)
+            if beta_gen == 0.0:
+                if step < 1e-12:            # machine-exact warm start
+                    self.stop = True
+                    return
+                if self.prev_step is not None and step < self.prev_step:
+                    r = step / self.prev_step
+                    self.rho = r            # contraction ~ lambda2/lambda1
+                    if self.tol > 0 and step * r / (1.0 - r) < self.tol:
+                        self.stop = True    # gap-aware distance-to-limit
+                        return
+                self.prev_step = step
+                if self.momentum and self.beta == 0.0 \
+                        and it + 1 >= self.warmup \
+                        and self.rho is not None and 0.0 < self.rho < 1.0 \
+                        and self.lam > 0.0:
+                    self.beta = (self.rho * self.lam) ** 2 / 4.0
+                    self.last_update = it   # staged: next launch onward
+            else:
+                gap = max(1e-30,
+                          self.lam * (1.0 - min(self.rho, 1.0 - 1e-12)))
+                if (self.tol > 0 and res / gap < self.tol) or res < 1e-12:
+                    self.stop = True        # eigen-residual distance-to-limit
+                    return
+                # Stagnation stop: in float32 the eigen-residual floors at
+                # ~|lam|*sqrt(n)*eps_f32 while a small gap can put res/gap
+                # permanently above tol -- without this test a converged
+                # momentum solve burns its whole budget (the pre-fix runs
+                # only stopped there because the rounding artifact faked
+                # res == 0). Converged-to-floor == no meaningful decrease
+                # over 3R rows.
+                # 1% threshold: floor jitter reaches a few tenths of a
+                # percent and a looser test lets it reset the stagnation
+                # clock indefinitely (observed as a full-budget warm call).
+                if self.res_min is None or res < 0.99 * self.res_min:
+                    self.res_min = res
+                    self.last_improve = it
+                elif it - self.last_improve >= 3 * self.R:
+                    self.stop = True        # residual floor reached
+                    return
+                R = self.R
+                if it - self.last_update >= 2 * R \
+                        and len(self.res_hist) > R \
+                        and self.res_hist[-R - 1] > 0.0:
+                    sig = (res / self.res_hist[-R - 1]) ** (1.0 / R)
+                    lam, beta = self.lam, beta_gen   # rows ran beta_gen
+                    if 0.0 < sig < 1.0 and lam * lam > 4.0 * beta:
+                        mu1 = (lam + math.sqrt(lam * lam - 4.0 * beta)) / 2.0
+                        mu2 = sig * mu1
+                        lam2 = (mu2 + beta / mu2) if mu2 * mu2 > beta \
+                            else 2.0 * math.sqrt(beta)
+                        lam2 = min(lam2, 0.9999 * lam)
+                        nb = (lam2 / 2.0) ** 2
+                        if nb > self.beta * 1.0001:  # climb-only vs STAGED
+                            self.beta = nb           #   beta; fixed point at
+                            self.last_update = it    #   Chebyshev-optimal
+                        self.rho = min(lam2 / lam, 1.0 - 1e-12)
+
+
+class _EigGraph:
+    """A captured CUDA graph of _EIG_GRAPH_K fused power/momentum iterations.
+
+    Buffers B0/B1/B2 rotate roles (v, y, vp) with period 3; the capture
+    length is a multiple of 3 so every replay starts and ends with
+    v == B0, vp == B2. Each replay: zero the window accumulators, K x
+    (eig_spmv -> eig_step), then one eig_rescale2(B0, B2) -- the window-
+    normalization edge. The matvec is the RawKernel eig_spmv rather than
+    cuSPARSE: cupy raises NotImplementedError for cuSPARSE calls during
+    stream capture, and the RawKernel needs no descriptors or workspace
+    anyway. References to H's data/indices/indptr are held so the baked
+    device pointers cannot be pool-recycled while the graph lives."""
+
+    def __init__(self, H, n, blocks, threads, beta_dev):
+        K = _EIG_GRAPH_K
+        assert K % 3 == 0
+        self.K = K
+        self.B = [cp.zeros((n,), cp.complex64) for _ in range(3)]
+        self.accw = cp.zeros((K, 4), cp.float64)
+        self.Hp, self.Hi, self.Hd = H.indptr, H.indices, H.data
+        st = cp.cuda.Stream(non_blocking=True)
+        with st:
+            st.begin_capture()
+            self.accw.fill(0)
+            for j in range(K):
+                _eig_spmv((blocks,), (threads,),
+                          (self.Hp, self.Hi, self.Hd, self.B[j % 3],
+                           self.B[(j + 1) % 3], np.int32(n)))
+                _eig_step((blocks,), (threads,),
+                          (self.B[(j + 1) % 3], self.B[j % 3],
+                           self.B[(j + 2) % 3], self.accw, beta_dev,
+                           np.int32(n), np.int32(j)))
+            _eig_rescale2((blocks,), (threads,),
+                          (self.B[0], self.B[2], self.accw,
+                           np.int32(2 * n), np.int32(K - 1)))
+            self.graph = st.end_capture()
+
+    def replay(self):
+        self.graph.launch()          # current (null) stream
+        return self.accw.get()       # rows for _EigAdapt.feed
+
+
+def _eig_hkey(H, n):
+    """Matrix identity key shared by the graph and lam caches: val2H rewrites
+    H.data in place on a persistent H, so hits are the norm; a reassembled H
+    misses and fails closed (fresh capture / normalized first window)."""
+    return (id(H), H.data.data.ptr, H.indices.data.ptr, H.indptr.data.ptr, n)
+
+
+def _eig_graph_get(H, n, blocks, threads, beta_dev):
+    """Cached _EigGraph, keyed by _eig_hkey."""
+    key = _eig_hkey(H, n)
+    g = _eig_graph_cache.get(key)
+    if g is None:
+        while len(_eig_graph_cache) >= 4:      # tiny FIFO bound
+            _eig_graph_cache.pop(next(iter(_eig_graph_cache)))
+        g = _EigGraph(H, n, blocks, threads, beta_dev)
+        _eig_graph_cache[key] = g
+    return g
+
+
+_eig_stats = {}   # debug/observability: last fused-call state
+
+
+def _eig_power_fused(H, v, num_iter, tol):
+    """Sync-reduced fused power iteration (one host sync per window) with
+    optional adaptive-Chebyshev momentum and optional CUDA-graph window
+    replay. v: (nframes,1) complex64 unit warm start. Returns the normalized
+    dominant-eigenvector iterate, same shape. Decisions live in _EigAdapt;
+    windows run unnormalized when the |lam|^K guard allows (window-
+    normalization), and graph mode additionally replays a captured window
+    (K=_EIG_GRAPH_K) as ONE launch."""
+    n = int(v.shape[0])
+    v = xp.ascontiguousarray(v.ravel(), dtype=xp.complex64)
+    vp = xp.zeros_like(v)
+    acc = xp.zeros((num_iter, 4), xp.float64)
+    threads = 256
+    blocks = min(1024, (n + threads - 1) // threads)
+    ctl = _EigAdapt(tol, _EIG_MOMENTUM)
+    checked = 0                      # acc rows [0, checked) already fed
+    K = max(1, _EIG_CHECK_EVERY)
+    Kg = _EIG_GRAPH_K
+
+    def _win_ok(lam, k):
+        return (lam is not None and lam != 0.0
+                and -12.0 < k * math.log10(abs(lam)) < 25.0)
+
+    beta_last = 0.0
+    _eig_beta_dev[0] = np.float32(0.0)
+    hkey = _eig_hkey(H, n) if getattr(H, "format", None) == "csr" else None
+    # warm calls may enter windowed/graph mode at it=0 using THIS MATRIX's
+    # cached Rayleigh quotient; an unknown matrix starts normalized.
+    win = _EIG_WINDOWED and hkey is not None \
+        and _win_ok(_eig_lam_cache.get(hkey), max(K, Kg))
+    gexec = None
+    graph_ok = (_EIG_GRAPH and getattr(H, "format", None) == "csr"
+                and H.indices.dtype == xp.int32 and H.indptr.dtype == xp.int32)
+    it = 0
+    while it < num_iter and not ctl.stop:
+        use_graph = graph_ok and win and (it + Kg <= num_iter)
+        if use_graph:
+            if gexec is None:
+                try:
+                    gexec = _eig_graph_get(H, n, blocks, threads,
+                                           _eig_beta_dev)
+                except Exception:
+                    graph_ok = False                 # capture failed: eager
+                    continue
+            if v is not gexec.B[0] or vp is not gexec.B[2]:
+                # (re-)entry: load the graph's fixed buffers. Copy through
+                # temporaries -- after an eager window v/vp may alias B0/B2
+                # in either role, and a direct B0[:] = v could clobber vp.
+                v_in, vp_in = v + 0.0, vp + 0.0
+                gexec.B[0][:] = v_in
+                gexec.B[2][:] = vp_in
+                v, vp = gexec.B[0], gexec.B[2]
+            rows = gexec.replay()    # ONE launch + ONE sync for Kg iters
+            it += Kg
+            checked = it             # graph rows never touch `acc`
+            ctl.feed(rows)
+        else:
+            y = H @ v                # cupyx CSR SpMV (canonical H)
+            _eig_step((blocks,), (threads,),
+                      (y, v, vp, acc, _eig_beta_dev, np.int32(n),
+                       np.int32(it)))
+            if win:
+                vp, v = v, y         # unnormalized in-window: pointer swap
+            else:
+                _eig_scale((blocks,), (threads,),
+                           (v, vp, y, acc, np.int32(2 * n), np.int32(it)))
+            it += 1
+            if it % K != 0 and it != num_iter:
+                continue
+            if win:
+                _eig_rescale2((blocks,), (threads,),
+                              (v, vp, acc, np.int32(2 * n),
+                               np.int32(it - 1)))
+            ctl.feed(acc[checked:it].get())   # ONE sync per window
+            checked = it
+        if ctl.stop:
+            break
+        if ctl.beta != beta_last:
+            _eig_beta_dev[0] = np.float32(ctl.beta)
+            beta_last = ctl.beta
+        win = _EIG_WINDOWED and _win_ok(ctl.lam, max(K, Kg))
+    if ctl.lam is not None and hkey is not None:
+        while len(_eig_lam_cache) >= 8:       # tiny FIFO bound
+            _eig_lam_cache.pop(next(iter(_eig_lam_cache)))
+        _eig_lam_cache[hkey] = ctl.lam
+    v = v + 0.0                      # detach from graph buffers before renorm
+    v /= xp.linalg.norm(v)           # defensive renorm, outside the loop
+    _eig_stats.update(iters=ctl.it, beta=ctl.beta, rho=ctl.rho,
+                      lam=ctl.lam, stopped=ctl.stop,
+                      last_res=(ctl.res_hist[-1] if ctl.res_hist else None),
+                      last_step=ctl.prev_step,
+                      graph=(gexec is not None))
+    return v.reshape(n, 1)
+
+
 _eig_v0 = None  # cached dominant eigenvector, for power-iteration warm start
 _sync_state = {"n": 0}  # invit_seed: count of sync calls so far (reset by eig_reset)
 _invit_cache = {}  # invit: cached CSR row-index array (overlap-graph sparsity is scan-fixed)
@@ -1130,6 +1601,8 @@ def eig_reset():
     _eig_v0 = None
     _sync_state["n"] = 0
     _invit_cache.clear()
+    _eig_graph_cache.clear()
+    _eig_lam_cache.clear()
 
 
 def Eigensolver(H, num_iter, v0=None, tol=1e-7):
@@ -1208,19 +1681,26 @@ def Eigensolver(H, num_iter, v0=None, tol=1e-7):
             # stop on that distance, NOT the raw step: rho->1 (tiny gap) keeps
             # iterating until the gauge is actually resolved, rho<<1 (well separated)
             # still stops in ~1-2 matvecs. tol=0 disables the early-out (full num_iter).
-            prev_step = None
-            for _ in range(num_iter):
-                vn = H @ eigenvectors
-                vn /= xp.linalg.norm(vn)
-                step = float(xp.linalg.norm(vn - eigenvectors))
-                eigenvectors = vn
-                if step < 1e-12:                      # machine-exact (perfect warm start)
-                    break
-                if prev_step is not None and step < prev_step:
-                    rho = step / prev_step            # observed contraction ~ lambda2/lambda1
-                    if step * rho / (1.0 - rho) < tol:  # gap-aware distance-to-limit
+            if _FUSED_EIG and H.dtype == xp.complex64 \
+                    and getattr(H, "format", None) == "csr":
+                # Fused path: same warm start, same gap-aware stop contract
+                # (see _eig_power_fused), one sync per _EIG_CHECK_EVERY
+                # iterations instead of per iteration, optional momentum.
+                eigenvectors = _eig_power_fused(H, eigenvectors, num_iter, tol)
+            else:
+                prev_step = None
+                for _ in range(num_iter):
+                    vn = H @ eigenvectors
+                    vn /= xp.linalg.norm(vn)
+                    step = float(xp.linalg.norm(vn - eigenvectors))
+                    eigenvectors = vn
+                    if step < 1e-12:                  # machine-exact (perfect warm start)
                         break
-                prev_step = step
+                    if prev_step is not None and step < prev_step:
+                        rho = step / prev_step        # observed contraction ~ lambda2/lambda1
+                        if step * rho / (1.0 - rho) < tol:  # gap-aware distance-to-limit
+                            break
+                    prev_step = step
             _eig_v0 = eigenvectors + 0.0          # cache for next AP iteration's warm start
 
         else:
