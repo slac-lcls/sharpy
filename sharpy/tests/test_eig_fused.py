@@ -197,3 +197,39 @@ def test_no_spurious_stop_with_f32_iterates():
         v = (y / math.sqrt(ssq_y)).astype(np.complex64)  # f32 storage drift
     else:
         raise AssertionError("no fixed point reached in budget")
+
+
+def test_feed_is_scale_invariant():
+    # The window-normalization trick rests on every _EigAdapt formula being a
+    # per-row ratio: multiplying a row's four sums by a common c^2 (i.e.
+    # feeding an UNNORMALIZED iterate) must change no decision. Feed the same
+    # trajectory normalized and wildly rescaled; require identical evolution.
+    H = _shifted_gramian(g=12)
+    v0 = np.ones(H.shape[0])
+    rng = np.random.RandomState(5)
+    ctl_a = Operators._EigAdapt(1e-8, momentum=True, warmup=8)
+    ctl_b = Operators._EigAdapt(1e-8, momentum=True, warmup=8)
+    v = np.asarray(v0, complex); v /= np.linalg.norm(v)
+    vp = np.zeros_like(v)
+    for it in range(400):
+        y = H @ v
+        ssq_y = float(np.vdot(y, y).real)
+        dot = float(np.vdot(y, v).real)
+        ssq_v = float(np.vdot(v, v).real)
+        t = y - ctl_a.beta * vp if ctl_a.beta != 0.0 else y
+        ssq_t = float(np.vdot(t, t).real)
+        row = (ssq_t, ssq_y, dot, ssq_v)
+        c2 = float(np.exp(rng.uniform(-20, 20)))     # common per-row factor
+        ctl_a.feed([row])
+        ctl_b.feed([tuple(c2 * x for x in row)])
+        assert ctl_a.stop == ctl_b.stop
+        # exact invariance holds in exact arithmetic; in floats the climb-only
+        # threshold is a knife-edge that can defer one instance's beta update
+        # by a window -- allow that, but nothing structurally larger.
+        assert abs(ctl_a.beta - ctl_b.beta) <= 5e-3 * max(1.0, ctl_a.beta)
+        if ctl_a.stop:
+            break
+        s = 1.0 / math.sqrt(ssq_t)
+        vp = v * s
+        v = t * s
+    assert ctl_a.it == ctl_b.it

@@ -129,13 +129,16 @@ for g in (32, 64):
           f"beta={st0['beta']:.3f} res={st0['last_res']:.2e}) {'ok' if ok else 'FAIL'}")
 
 print("\n== (c) timing: cold (eig_reset each call) and warm, alternating ==")
-print(f"{'n':>6} {'mode':>16} {'cold ms':>9} {'warm ms':>9}")
+print(f"{'n':>6} {'mode':>16} {'cold ms':>9} {'warm ms':>9}")  # win = window-normalization
 for g in (16, 32, 64):
     H = make_H(g)
-    for name, fu, mo in (("stock", False, False),
-                         ("fused", True, False),
-                         ("fused+momentum", True, True)):
+    for name, fu, mo, wi in (("stock", False, False, False),
+                             ("fused win=off", True, False, False),
+                             ("fused win=on", True, False, True),
+                             ("mom win=off", True, True, False),
+                             ("mom win=on", True, True, True)):
         Operators._FUSED_EIG = fu; Operators._EIG_MOMENTUM = mo
+        Operators._EIG_WINDOWED = wi
         def cold():
             Operators.eig_reset()
             Operators.Eigensolver(H, 4000, tol=1e-5)

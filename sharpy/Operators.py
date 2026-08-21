@@ -1138,6 +1138,15 @@ _FUSED_EIG = GPU and os.environ.get("SHARPY_FUSED_EIG", "0") == "1"
 _EIG_MOMENTUM = os.environ.get("SHARPY_EIG_MOMENTUM", "0") == "1"
 _EIG_CHECK_EVERY = int(os.environ.get("SHARPY_EIG_CHECK_EVERY", "4"))
 _EIG_WARMUP = int(os.environ.get("SHARPY_EIG_WARMUP", "8"))  # plain its before momentum
+# Window-normalization: within a check window beta is frozen and every
+# control formula is a RATIO (cos, step, lam, res are all scale-invariant),
+# so the recurrence can run UNNORMALIZED in-window -- eig_scale becomes a
+# host-side pointer swap -- with one common renormalization of (cur, prev)
+# at the window edge. 3 launches/iter -> ~2. Guarded: in-window growth is
+# ~|lam|^K, so it is enabled per-window only while 1e-12 < |lam|^K < 1e25
+# (f32 component head-room on both sides); the first window and any
+# out-of-range window use per-iteration scaling.
+_EIG_WINDOWED = os.environ.get("SHARPY_EIG_WINDOWED", "1") == "1"
 
 if GPU:
     # Same conventions as _proxd_resid: complex64 as interleaved float pairs,
@@ -1211,6 +1220,25 @@ if GPU:
     }
     """
     _eig_scale = cp.RawKernel(_eig_scale_src, "eig_scale")
+
+    _eig_rescale2_src = r"""
+    extern "C" __global__ void eig_rescale2(
+            float* a, float* b, const double* acc, const int n2,
+            const int it) {
+        // Window-edge renormalization: s = 1/||cur|| from the last in-window
+        // |t|^2. BOTH the current and previous unnormalized iterates are
+        // scaled by the SAME s, preserving the three-term recurrence's
+        // relative scaling (and therefore the meaning of beta).
+        double ssq = acc[4*it];
+        float s = (ssq > 0.0) ? (float)rsqrt(ssq) : 0.0f;
+        const int gs = gridDim.x * blockDim.x;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n2; i += gs) {
+            a[i] *= s;
+            b[i] *= s;
+        }
+    }
+    """
+    _eig_rescale2 = cp.RawKernel(_eig_rescale2_src, "eig_rescale2")
 
 
 class _EigAdapt:
@@ -1325,18 +1353,29 @@ def _eig_power_fused(H, v, num_iter, tol):
     ctl = _EigAdapt(tol, _EIG_MOMENTUM)
     checked = 0                      # acc rows [0, checked) already fed
     K = max(1, _EIG_CHECK_EVERY)
+    win = False                      # first window: per-iteration scaling
     for it in range(num_iter):
         y = H @ v                    # cuSPARSE CSR SpMV (canonical H)
         _eig_step((blocks,), (threads,),
                   (y, v, vp, acc, np.float32(ctl.beta), np.int32(n),
                    np.int32(it)))
-        _eig_scale((blocks,), (threads,),
-                   (v, vp, y, acc, np.int32(2 * n), np.int32(it)))
+        if win:
+            vp, v = v, y             # unnormalized in-window: pointer swap
+        else:
+            _eig_scale((blocks,), (threads,),
+                       (v, vp, y, acc, np.int32(2 * n), np.int32(it)))
         if (it + 1) % K == 0 or it == num_iter - 1:
+            if win:
+                # one common renormalization per window (see eig_rescale2)
+                _eig_rescale2((blocks,), (threads,),
+                              (v, vp, acc, np.int32(2 * n), np.int32(it)))
             ctl.feed(acc[checked:it + 1].get())   # ONE sync per window
             checked = it + 1
             if ctl.stop:
                 break
+            lam = ctl.lam
+            win = (_EIG_WINDOWED and lam is not None and lam != 0.0
+                   and -12.0 < K * math.log10(abs(lam)) < 25.0)
     v /= xp.linalg.norm(v)           # defensive renorm, outside the loop
     _eig_stats.update(iters=ctl.it, beta=ctl.beta, rho=ctl.rho,
                       lam=ctl.lam, stopped=ctl.stop,
