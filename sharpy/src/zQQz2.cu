@@ -1,5 +1,18 @@
 #include "cupy/complex.cuh"
-#include <cub/block/block_reduce.cuh>
+// Portable bundled-CUB include -- see the note in zQQz.cu. A bare <cub/...> resolves only if a
+// system CUB happens to be on the NVRTC include path; cupy ships its own (cupy/_cccl/cub/... on
+// 13.x, cupy/cub/... on <=12.x), which is the one that is actually guaranteed to be there.
+#if defined(__has_include)
+#  if __has_include(<cupy/_cccl/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/_cccl/cub/cub/block/block_reduce.cuh>
+#  elif __has_include(<cupy/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/cub/cub/block/block_reduce.cuh>
+#  else
+#    include <cub/block/block_reduce.cuh>
+#  endif
+#else
+#  include <cupy/cub/cub/block/block_reduce.cuh>
+#endif
 
 /*
  * Generalized zQQz: left/right illumination.

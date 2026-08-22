@@ -5,7 +5,24 @@
 //#include <cub/cub.cuh> 
 //#include <cupy/cub/cub/cub.cuh>
 //#include <cub/block/block_reduce.cuh>
-#include <cupy/cub/cub/block/block_reduce.cuh>
+// Bundled-CUB include, portable across cupy majors. cupy 13.x relocated the vendored CCCL to
+// cupy/_cccl/cub/...; <=12.x used cupy/cub/...; a system cub is a third possibility. Hardcoding
+// any one of them breaks the others, and the failure is a hard NVRTC "catastrophic error: cannot
+// open source file" that takes the WHOLE module down -- so EVERY kernel in this file stops
+// compiling, and the traceback surfaces at whichever caller happened to run first, which makes
+// it look like a bug in the caller rather than a missing header.
+// Measured on cupy 13.6.0 / H200 NVL (drp-srcf-gpu007, 2026-08-21): compiles with jitify on and off.
+#if defined(__has_include)
+#  if __has_include(<cupy/_cccl/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/_cccl/cub/cub/block/block_reduce.cuh>
+#  elif __has_include(<cupy/cub/cub/block/block_reduce.cuh>)
+#    include <cupy/cub/cub/block/block_reduce.cuh>
+#  else
+#    include <cub/block/block_reduce.cuh>
+#  endif
+#else
+#  include <cupy/cub/cub/block/block_reduce.cuh>
+#endif
 
 extern "C" __global__ void 
 dotp(
