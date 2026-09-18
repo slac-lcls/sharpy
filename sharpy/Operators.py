@@ -453,8 +453,7 @@ def _diffnorm(a, b):
     (3.4e38)^2 = 1.2e77 per term; even 1e9 terms reach only ~1e86, vs DBL_MAX
     1.8e308. A float32 accumulator would NOT be safe (it overflows once
     ||a-b|| > ~1.8e19) -- that is why sh[] and g_ssq are double, not just for
-    precision.
-
+    precision."""
     if (_FUSED_PROXD and GPU and a.size > 0     # size 0 -> gridDim 0 is illegal
             and a.dtype == xp.complex64 and b.dtype == xp.complex64
             and a.shape == b.shape
