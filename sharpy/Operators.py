@@ -1616,29 +1616,45 @@ def refine_illumination_function(
     img, illumination,illumination_truth, frames,translations,Split, Overlap, GPU,lens_mask,i
 ):
     """
-    refine_illumination based on
+    Regularized least-squares probe update (the "traditional" refine_illumination):
+
+        illumination = (sum_n frames_n conj(O_n) + eps*illumination0)
+                       / (sum_n |O_n|^2 + eps*eye(nx, ny))
+
+    with O_n = Split(img) the current object frames and eps decaying as 2**(-i).
+    (eps*eye: the denominator is regularized only on the diagonal pixels of the
+    probe array; kept as is for parity with the GPU callers.)
 
     Parameters
     ----------
     img : TYPE
         input image.
     illumination : TYPE
-        initial illumination.
+        initial illumination (also the regularization target).
+    illumination_truth : TYPE
+        unused (kept for the GPU call sites; only referenced in commented code).
     frames : TYPE
         frames estimate.
+    translations : TYPE
+        frame translations, only used with GPU=True (split_cuda argument).
     Split : TYPE
-        Split operator.
+        Split operator. With GPU=True the in-place split_cuda kernel,
+        otherwise a functional operator returning the frames (Split_Overlap_plan).
     Overlap : TYPE
-        overlap operator.
-    lens_mask : TYPE, optional
-        lens mask in F-space to remove grid pathology. The default is None.
+        overlap operator (unused here; the caller refreshes the normalization).
+    GPU : bool
+        selects the Split calling convention (split_cuda vs functional Split).
+    lens_mask : TYPE
+        lens mask in F-space to remove grid pathology, or None.
+    i : int
+        iteration index for the regularization schedule eps0 * 2**(-i).
 
     Returns
     -------
     illumination : TYPE
-        refined illumination.
-    normalization : TYPE
-        refined normalization.
+        refined illumination. The overlap normalization is NOT returned: the
+        caller recomputes it from the new probe (Overlap of the replicated
+        |illumination|^2, or overlap_cuda on the GPU path).
 
     """
     eps_illum = None #need implementation
@@ -1656,6 +1672,10 @@ def refine_illumination_function(
         norm_frames = xp.zeros(frames.shape,dtype = xp.complex64) #dtype?
         Split(img * xp.conj(img),norm_frames,translations,0)
         norm_frames = xp.sum(norm_frames, 0) 
+    else:
+        # least-squares denominator sum_n |O_n|^2, the same quantity the GPU
+        # branch accumulates through split_cuda (was missing: NameError)
+        norm_frames = xp.sum(xp.abs(frames_split) ** 2, 0)
 
     if type(eps_illum) == type(None):
             eps_illum = xp.max(xp.abs(norm_frames)) * eps0 * 2**(-i)
