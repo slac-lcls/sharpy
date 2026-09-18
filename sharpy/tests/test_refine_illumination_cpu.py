@@ -40,6 +40,7 @@ from Operators import (  # noqa: E402
     Split_Overlap_plan,
     Gramiam_plan,
     Illuminate_frames,
+    Replicate_frame,
     refine_illumination_function,
 )
 import Solvers  # noqa: E402
@@ -150,6 +151,50 @@ def test_alternating_projections_cpu_refine_illumination_with_sync():
     assert res[-1, 1] < 0.1 * res[0, 1]
     assert res[-1, 0] < 0.1
     assert _probe_error(illum, sim["probe"]) < 0.1
+
+
+def test_sync_receives_normalization_of_the_probe_it_is_given():
+    # The Gramian's ket side is conj(P) z / N with N = Overlap(|P|^2)
+    # (synchronize_frames_c: framesr = framesl * inormalization_split), i.e. H is
+    # the Gramian of the overlap projector P Split (1/N) Overlap conj(P). After a
+    # probe update the loop must therefore hand synchronize_frames_c an
+    # inormalization_split built from the SAME probe it hands it -- with a stale
+    # N, H is the Gramian of no projector. The invariant is checked directly:
+    # its effect on the reconstruction is not measurable on a problem this size
+    # (63 stale-vs-refreshed A/B runs over scan density, Poisson noise, phase
+    # contrast and starting probe: NMSE ratio 0.985-1.011, sign flipping), so an
+    # outcome assertion would be asserting noise.
+    sim = _simulation()
+    nframes = sim["tx"].size
+    probe_bad = _gaussian_probe(sim["nx"], 1.6 * sim["nx"] / 4.0)
+    gramiam = Gramiam_plan(
+        sim["tx"], sim["ty"], nframes, sim["nx"], sim["nx"], sim["Nx"], sim["Ny"]
+    )
+
+    def inorm_of(probe):
+        return sim["Split"](1 / sim["Overlap"](Replicate_frame(np.abs(probe) ** 2, nframes)))
+
+    # spy on the name the loop calls (Solvers imports it from Operators)
+    calls = []
+    real = Solvers.synchronize_frames_c
+
+    def spy(frames, illumination, frames_norm, normalization, plan, **kw):
+        calls.append((illumination + 0, normalization + 0))
+        return real(frames, illumination, frames_norm, normalization, plan, **kw)
+
+    Solvers.synchronize_frames_c = spy
+    try:
+        _run_ap(sim, True, probe_bad, maxiter=5, sync=True, gramiam=gramiam)
+    finally:
+        Solvers.synchronize_frames_c = real
+
+    assert len(calls) == 5
+    for illum_k, inorm_k in calls:
+        assert np.allclose(inorm_k, inorm_of(illum_k), rtol=1e-6, atol=0)
+    # the check is not vacuous: the probe did move, and the stale (initial-probe)
+    # value would have failed it
+    assert not np.allclose(calls[-1][0], calls[0][0])
+    assert not np.allclose(calls[-1][1], inorm_of(probe_bad), rtol=1e-3)
 
 
 if __name__ == "__main__":
