@@ -321,9 +321,23 @@ def Alternating_projections(
 
         if refine_illumination:
             print("refining illum")
-            illumination, normalization = refine_illumination_function(
-                img, illumination, frames, Split, Overlap, lens_mask=None
+            # Split/Overlap here are the functional plan operators
+            # (Split_Overlap_plan), not the in-place split_cuda/overlap_cuda
+            # kernels, so GPU=False selects that calling convention inside
+            # refine_illumination_function whatever xp is. int(ii): the loop
+            # index is an xp integer and 2**(-ii) rejects those.
+            illumination = refine_illumination_function(
+                img, illumination, illumination_truth=None, frames=frames,
+                translations=None, Split=Split, Overlap=Overlap, GPU=False,
+                lens_mask=None, i=int(ii),
             )
+            # the probe changed: refresh the overlap normalization (same
+            # expression as the init above) and, with sync, its split inverse
+            normalization = Overlap(
+                Replicate_frame(xp.abs(illumination) ** 2, frames.shape[0])
+            )
+            if sync == True:
+                inormalization_split = Split(1/(normalization))
         # else:
         #    print('not refining')
 
