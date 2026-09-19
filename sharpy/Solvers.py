@@ -382,7 +382,7 @@ def Alternating_projections(
 
         t0 = timer()
         if compute_residuals:
-            residuals[ii // residuals_interval, 2] = xp.linalg.norm(frames - frames_old)
+            residuals[ii // residuals_interval, 2] = Operators._diffnorm(frames, frames_old)
             # residuals[ii//residuals_interval,2] = xp.inner((frames-frames_old).ravel(),(frames-frames_old).ravel())
 
         timers["mse_step"] += timer() - t0
@@ -767,7 +767,7 @@ def Alternating_projections_c(
         # compute residuals
         t0 = timer()
         if compute_residuals:
-            residuals[ii // residuals_interval, 2] = xp.linalg.norm(frames - frames_old)
+            residuals[ii // residuals_interval, 2] = Operators._diffnorm(frames, frames_old)
             # residuals[ii//residuals_interval,2] = xp.inner((frames-frames_old).ravel(),(frames-frames_old).ravel())
 
         timers["mse_step"] += timer() - t0
@@ -1421,7 +1421,7 @@ def Alternating_projections_position(
         if compute_residuals:
             k = ii // residuals_interval
             residuals[k, 1] = mse_data
-            residuals[k, 2] = xp.linalg.norm(frames - frames_old)
+            residuals[k, 2] = Operators._diffnorm(frames, frames_old)
             if img_truth is not None:
                 residuals[k, 0] = mse_calc(img_truth, img)
             if track_xi:

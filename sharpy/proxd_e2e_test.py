@@ -84,7 +84,8 @@ def run(fused, maxiter):
         False, maxiter, None, truth, 1)
     sync(); dt = time.time() - t0
     r = res.get() if GPU else res
-    return r[-1, 0], dt, float(Solvers.timers.get("ProxD", 0.0)), dict(Solvers.timers)
+    return (r[-1, 0], r[-1, 2], dt,
+            float(Solvers.timers.get("ProxD", 0.0)), dict(Solvers.timers))
 
 
 MAXITER = int(os.environ.get("MAXITER", 100))
@@ -95,11 +96,17 @@ from statistics import median
 # ALTERNATE plain/fused across reps so GPU clock-ramp / pool state biases both equally
 dts = {False: [], True: []}
 proxds = {False: [], True: []}
+msteps = {False: [], True: []}      # mse_step timer = the eps_S residual line
+copies = {False: [], True: []}      # frames_old copy (ref trick drops it fused)
 nmses = {}
+epss = {}
 for rep in range(REPS):
     for fused in (False, True):
-        nmse, dt, proxd, T = run(fused, MAXITER)
+        nmse, eps_s, dt, proxd, T = run(fused, MAXITER)
         dts[fused].append(dt); proxds[fused].append(proxd); nmses[fused] = nmse
+        epss[fused] = eps_s
+        msteps[fused].append(float(T.get("mse_step", 0.0)))
+        copies[fused].append(float(T.get("copies", 0.0)))
 
 print(f"\nmedian over {REPS} alternating reps, {MAXITER} iters each")
 print(f"{'':10} {'NMSE':>11} {'ms/iter':>9} {'ProxD/iter':>11} {'ProxD%loop':>11}")
@@ -112,6 +119,17 @@ db, df = median(dts[False]), median(dts[True])
 pb, pf = median(proxds[False]), median(proxds[True])
 print(f"\nNMSE match: {abs(nmses[False]-nmses[True])/max(abs(nmses[False]),1e-30) < 1e-3}"
       f"  (plain {nmses[False]:.4e} / fused {nmses[True]:.4e})")
+print(f"eps_S match: {abs(epss[False]-epss[True])/max(abs(epss[False]),1e-30) < 1e-3}"
+      f"  (plain {epss[False]:.4e} / fused {epss[True]:.4e})")
 print(f"END-TO-END loop speedup: {db/df:.3f}x   ({1e3*db/MAXITER:.3f} -> {1e3*df/MAXITER:.3f} ms/iter)")
 print(f"ProxD phase (incl 2 FFTs) speedup: {pb/pf:.3f}x   ({1e3*pb/MAXITER:.3f} -> {1e3*pf/MAXITER:.3f} ms/iter)")
+mb, mf = median(msteps[False]), median(msteps[True])
+cb, cf = median(copies[False]), median(copies[True])
+print(f"eps_S residual step (mse_step timer): {mb/max(mf,1e-12):.3f}x   "
+      f"({1e3*mb/MAXITER:.3f} -> {1e3*mf/MAXITER:.3f} ms/iter; _diffnorm vs linalg.norm)")
+print("  ^ host-side wall timer around ASYNC launches: it under-attributes GPU time"
+      " (work lands on whatever later call syncs). Use diffnorm_fused_test.py for the"
+      " event-timed A/B and diffnorm_e2e_split.py to separate _diffnorm from the ProxD kernel.")
+print(f"frames_old copy   (copies   timer): {1e3*cb/MAXITER:.3f} -> {1e3*cf/MAXITER:.3f} ms/iter"
+      f"  (ref trick drops the copy on the fused arm)")
 print("note: Solvers.timers['ProxD'] wraps Propagate+middle+IPropagate, so it is FFT-dominated.")
