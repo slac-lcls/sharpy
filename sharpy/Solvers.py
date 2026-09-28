@@ -22,6 +22,7 @@ In operator terms each iteration is:
         -> [synchronize_frames_c] -> Overlap  (-> next iterate)
 """
 
+import re as _re
 import numpy as np
 from timeit import default_timer as timer
 from Operators import (
@@ -1018,6 +1019,91 @@ def plot_intermediate(images):
 # Alternating projections with position retrieval
 # (Section IV of arXiv:1209.4924; port of doraar0_shift.m + fit_shift.m)
 ############################################
+_DRIFT_MODEL_RE = _re.compile(r"^(?:(linear|poly2)\+)?time(\d*)$")
+
+
+def drift_basis(model, translations_x, translations_y):
+    """Columns of the drift design matrix B for `model` (see fit_drift_global).
+
+    Returns (nframes, k). The shift is xi = B @ c, one coefficient vector per
+    axis; the constant column is deliberately absent (global translation is the
+    unobservable position gauge).
+
+    Two families of column, on two different indices of a frame:
+      WHERE it sits -- s = (translations - mean)/scale, unit-normalized;
+      WHEN  it ran  -- t = (i - mean i)/max|i - mean i| over the frame index i,
+                       frames being stored in acquisition order.
+    Time columns are Chebyshev polynomials T_1..T_n(t), each mean-removed,
+    orthogonalized against the columns already in B, and rescaled to
+    max|col| = 1. All three matter, and all three are about the SEARCH rather
+    than the span, because the coefficients are found by COORDINATE-DESCENT
+    grid search, which stalls on a correlated basis:
+      * Chebyshev rather than raw powers -- T_m are near-orthogonal on a
+        uniform index grid, t^m are badly correlated.
+      * orthogonalized against the s columns -- on a raster t is very nearly
+        (on a plain raster, exactly) a combination of the s columns, so without
+        this B is near-singular and the search gets a flat direction. Span is
+        unchanged, so the reachability statements in fit_drift_global's
+        docstring are unaffected. NB this improves the conditioning but does
+        NOT rescue the combined models from the coordinate descent -- see the
+        search caveat in fit_drift_global.
+      * mean-removed -- no time column then carries the unobservable gauge.
+      * max-normalized -- one unit of any coefficient is one pixel of drift at
+        the end of the scan, so a single `drift_max` half-width means the same
+        thing for every column.
+    A time column that the earlier columns already span (t on a plain raster,
+    say) is dropped rather than renormalized, since scaling numerical roundoff
+    up to O(1) would hand the grid search a column of noise. B can therefore
+    have fewer than the nominal number of columns; that costs nothing, because
+    a dropped column adds nothing to the span.
+    """
+    m = _DRIFT_MODEL_RE.match(model or "")
+    if model in ("linear", "poly2"):
+        space, order = model, 0
+    elif m is not None:
+        space, order = m.group(1), int(m.group(2) or 1)
+        if order < 1:
+            raise ValueError("drift model %r: time order must be >= 1" % (model,))
+    else:
+        raise ValueError(
+            "unknown drift model %r; expected 'linear', 'poly2', 'time[n]', "
+            "'linear+time[n]' or 'poly2+time[n]' (n = time polynomial order, "
+            "default 1)" % (model,)
+        )
+
+    sx = translations_x - xp.mean(translations_x)
+    sy = translations_y - xp.mean(translations_y)
+    scale = max(float(xp.max(xp.abs(sx))), float(xp.max(xp.abs(sy))), 1.0)
+    sx = sx / scale
+    sy = sy / scale
+
+    cols = []
+    if space in ("linear", "poly2"):
+        cols += [sx, sy]
+    if space == "poly2":
+        cols += [sx * sx, sx * sy, sy * sy]
+
+    if order:
+        t = xp.arange(sx.shape[0], dtype=sx.dtype)
+        t = t - xp.mean(t)
+        t = t / max(float(xp.max(xp.abs(t))), 1.0)
+        tk_prev, tk = xp.ones_like(t), t          # T_0, T_1
+        for _ in range(order):
+            c = tk - xp.mean(tk)                  # drop the gauge
+            amp0 = float(xp.max(xp.abs(c)))
+            if cols:                              # project off the gauge and
+                A = xp.stack([xp.ones_like(c)] + cols, axis=1)  # existing basis
+                coef = xp.linalg.lstsq(A, c, rcond=None)[0]
+                c = c - A @ coef
+            amp = float(xp.max(xp.abs(c)))        # s columns are not orthogonal
+            tk_prev, tk = tk, 2.0 * t * tk - tk_prev       # Chebyshev recurrence
+            if amp <= 1e-8 * max(amp0, 1e-30):
+                continue    # already in the span of the earlier columns: adds
+                            # nothing, and normalizing it would amplify roundoff
+            cols.append(c / amp)
+    return xp.stack(cols, axis=1)
+
+
 def fit_drift_global(
     frames_data, illumination, translations_x, translations_y, nx, ny, Nx, Ny,
     model="linear", drift_max=5.0, ngrid=11, sweeps=3, ap_iters=10,
@@ -1031,28 +1117,107 @@ def fit_drift_global(
     catches drift far beyond the ~1/k_max basin of the local solver; the residual
     is then polished by the per-frame solver in the AP loop.
 
-    The shift is modelled as xi = B @ c on the centered nominal scan coordinate
-    s = (translations - mean):
-      model="linear" : B = [sx, sy]              -> A.s  (magnification/rotation/
-                       shear; 4 coeffs) = the real-space analog of Eckert's
-                       affine rigid source projection of the scan grid.
-      model="poly2"  : B = [sx, sy, sx^2, sx*sy, sy^2]  (10 coeffs) for curved drift.
+    The shift is modelled as xi = B @ c (see `drift_basis` for the columns) on
+    the centered nominal scan coordinate s -- WHERE a frame sits -- and/or on
+    the centered frame index t -- WHEN it was measured, frames being stored in
+    acquisition order:
+      model="linear"       : B = [sx, sy]  -> A.s  (magnification/rotation/
+                             shear; 4 coeffs) = the real-space analog of
+                             Eckert's affine rigid source projection of the grid.
+      model="poly2"        : B = [sx, sy, sx^2, sx*sy, sy^2] (10 coeffs), curved.
+      model="time<n>"      : B = [T_1(t) .. T_n(t)], Chebyshev in acquisition
+                             time (2n coeffs). "time" == "time1" = pure creep.
+      model="linear+time<n>", "poly2+time<n>"
+                           : a scan-grid error AND time drift together.
+
+    WHY a time axis at all -- and how much it actually buys. The s columns index
+    a frame by WHERE it sits, so a drift in TIME is representable only when the
+    trajectory makes time a low-order polynomial in position. In plain raster
+    order time IS affine in position, and "linear" fits a linear creep exactly.
+    A SERPENTINE raster -- how a raster is really run, reversing the fast axis
+    every row -- breaks that: linear-in-time drift becomes a staircase along the
+    slow axis plus a TRIANGULAR WAVE along the fast one, and the triangular part
+    is out of reach. Measured, gauge-removed rms residual for a 4 px
+    peak-to-peak linear creep on a serpentine raster:
+
+        rows x cols   [sx,sy]   poly2   +time
+          40 x 40       0.029   0.029   0.000
+           8 x 200      0.144   0.141   0.000
+           4 x 100      0.289   0.259   0.000
+           2 x 800      0.578   0.000   0.000   (2 rows: the fold IS sx*sy)
+
+    i.e. the unreachable part is the WITHIN-ROW increment, ~total/n_rows. On a
+    many-row raster the existing basis already absorbs a linear creep and the
+    time column buys almost nothing; it only matters when the rows are few.
+
+    The bigger hole is NONLINEARITY in time, which no amount of s buys and a
+    single t column does not fix either. Exponential settling (what a stage or
+    a thermal enclosure does after being disturbed -- the commonest real drift
+    after linear), same 4 px peak-to-peak, 40 x 40:
+
+        [sx,sy]  poly2   time1   time2   time3   time4   time6
+          0.559  0.262   0.558   0.259   0.096   0.030   0.002
+
+    i.e. ONE time column buys nothing here -- it is the ORDER that pays, and
+    not until 3 or 4. Reach for time3/time4 rather than "time" unless the creep
+    really is linear. This one is geometry-independent: it is a property of the
+    drift, not of the scan.
+
+    OSCILLATORY drift is out of reach of every model here (a 3-cycle sine leaves
+    ~1.3 px for all of them, including time6): a handful of global scalars
+    cannot represent vibration. That is the regime for the per-frame solver, not
+    for this routine.
+
+    REACHABILITY IS NOT RECOVERY. Both tables above are projection residuals --
+    what span(B) can represent, a floor no search can beat. Whether the
+    coordinate descent FINDS those coefficients is separate, and two measured
+    cases say it often does not (serpentine 4 x 28, 112 frames, 4 px p2p):
+
+      * it overshoots when the model is wrong. A linear creep that "linear"
+        cannot reach below 0.291 px comes back 2.26 px out -- outside span(B)
+        the misfit optimum is not near the truth, so the search walks away from
+        it rather than stopping at the projection.
+      * it underperforms when the model is right but large. "time" recovers
+        that same creep to 0.000 px, but SETTLING stays far off its floor no
+        matter how hard the search is driven (err_x, same scene):
+
+            model  sweeps  ngrid  ap_iters   err_x   span floor
+            time4       3     11        10   1.125        0.031
+            time4       6     21        10   0.759        0.031
+            time4       6     21        25   0.474        0.031
+            time2       6     21        25   0.704        0.268
+
+        20x the search effort buys 2.4x, still 15x off the floor -- so this is
+        not a grid that wants refining, it wants a different search. Left here
+        as the starting point for that work.
+      * MORE COLUMNS CAN BE WORSE. "linear+time" spans that linear creep
+        exactly and still returns 2.24 px, against 0.000 px for "time" alone,
+        because the descent fits the s columns first and never leaves that
+        basin. Prefer the SMALLEST model that contains the drift you expect;
+        a superset is not a safe default here.
 
     Returns per-frame (xi_x, xi_y). The constant (global translation) term is
-    omitted -- it is the unobservable position gauge.
+    omitted -- it is the unobservable position gauge. ("poly2" is the exception:
+    sx^2 and sy^2 carry a constant the gauge leaves undetermined; the time
+    columns are centered so they do not.)
+
+    CAVEAT -- the basis is a MODELLING ASSUMPTION, not an identity. Everything
+    recoverable here lives in span(B): a drift perfectly smooth in time but
+    outside the model class is not reachable, and the fit returns the best
+    in-class approximation with nothing to signal that the class was wrong. That
+    is a real asymmetry with the tomography side, where the Helgason-Ludwig
+    consistency conditions give an EXACT low-order moment identity that the data
+    must satisfy whatever the drift is -- a model-free handle. Ptychography has
+    no known equivalent, so here the model class carries the whole assumption.
+    Widen the class (or fall back to the per-frame solver) rather than reading a
+    low residual as evidence that the class was right.
     """
     from Operators import Splitc, Overlapc, map_frames
     from position_retrieval import shift_probe_fourier
 
     mapid = map_frames(translations_x, translations_y, nx, ny, Nx, Ny)
-    sx = translations_x - xp.mean(translations_x)
-    sy = translations_y - xp.mean(translations_y)
-    scale = max(float(xp.max(xp.abs(sx))), float(xp.max(xp.abs(sy))), 1.0)
-    sx = sx / scale
-    sy = sy / scale
-    cols = [sx, sy, sx * sx, sx * sy, sy * sy] if model == "poly2" else [sx, sy]
-    k = len(cols)
-    B = xp.stack(cols, axis=1)  # (nframes, k)
+    B = drift_basis(model, translations_x, translations_y)  # (nframes, k)
+    k = B.shape[1]
 
     def xi_of(C):
         return B @ C[:k], B @ C[k:]
@@ -1182,9 +1347,14 @@ def Alternating_projections_position(
         structured drift; a *free* per-frame refine afterward over-fits it, so
         either set position_start >= maxiter (fit only) or keep per-frame updates
         for genuine random jitter only.
-    drift_model : {"linear", "poly2"}
+    drift_model : {"linear", "poly2", "time<n>", "linear+time<n>",
+                   "poly2+time<n>"}
         Drift basis: "linear" = affine of the nominal scan (A.s; the real-space
-        analog of Eckert's rigid source projection); "poly2" adds quadratic terms.
+        analog of Eckert's rigid source projection); "poly2" adds quadratic
+        terms; "time<n>" fits an order-n polynomial in ACQUISITION TIME instead,
+        for creep a position basis cannot see (serpentine scans, and any drift
+        nonlinear in time); the "+" forms fit both. See fit_drift_global for
+        which to pick -- a superset is not a safe default.
     drift_max : float
         Max drift (px) the global search spans per coefficient.
     xi_x_init, xi_y_init : (nframes,), optional
