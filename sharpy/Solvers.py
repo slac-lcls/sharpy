@@ -1178,9 +1178,18 @@ def fit_drift_global(
         the misfit optimum is not near the truth, so the search walks away from
         it rather than stopping at the projection.
       * it underperforms when the model is right but large. "time" recovers
-        that same creep to 0.000 px, but on SETTLING, where "time4" has a
-        0.031 px floor, the default sweeps/ngrid return 1.13 px, and
-        sweeps=6, ngrid=21, ap_iters=25 only gets to 0.47 px.
+        that same creep to 0.000 px, but SETTLING stays far off its floor no
+        matter how hard the search is driven (err_x, same scene):
+
+            model  sweeps  ngrid  ap_iters   err_x   span floor
+            time4       3     11        10   1.125        0.031
+            time4       6     21        10   0.759        0.031
+            time4       6     21        25   0.474        0.031
+            time2       6     21        25   0.704        0.268
+
+        20x the search effort buys 2.4x, still 15x off the floor -- so this is
+        not a grid that wants refining, it wants a different search. Left here
+        as the starting point for that work.
       * MORE COLUMNS CAN BE WORSE. "linear+time" spans that linear creep
         exactly and still returns 2.24 px, against 0.000 px for "time" alone,
         because the descent fits the s columns first and never leaves that

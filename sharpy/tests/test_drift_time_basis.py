@@ -201,12 +201,23 @@ def test_relative_residual_is_the_same_on_both_axes():
     the absolute error scales with the per-axis amplitude. (Stated because the
     opposite -- the slow axis faring better -- is the intuitive guess, and it
     is wrong.)
+
+    The BOUNDARY, asserted too so the equality above is not over-read: this
+    holds when both axes carry the same drift SHAPE. Genuinely different
+    profiles per axis do give different fractions (0.250 for a linear creep vs
+    0.637 for settling), and that reports the drift shape, not any folding
+    asymmetry between the axes.
     """
     tx, ty = scan_order(4, 100, serpentine=True)
     f = drift_profile("linear", 400, P2P)
     for model in ("linear", "poly2"):
         rel = [unreachable(model, tx, ty, a * f) / np.std(a * f) for a in (1.0, 0.4)]
         assert abs(rel[0] - rel[1]) < 1e-9, model
+
+    g = drift_profile("settling", 400, P2P)
+    rel_lin = unreachable("linear", tx, ty, f) / np.std(f)
+    rel_set = unreachable("linear", tx, ty, g) / np.std(g)
+    assert rel_set > 2 * rel_lin, (rel_lin, rel_set)
 
 
 def test_existing_models_are_bit_exact():
