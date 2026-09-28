@@ -328,16 +328,20 @@ def _scene(serpentine=True, **kw):
 
     tx, ty = scan_order(cfg["rows"], cfg["cols"], cfg["step_x"], cfg["step_y"],
                         serpentine=serpentine)
+    tx, ty = xp.asarray(tx), xp.asarray(ty)
     probe = make_probe(nx, nx, r1=0.075, r2=0.255)
     if isinstance(probe, tuple):
         probe = probe[0]
-    probe = apodize_probe(np.asarray(probe / np.abs(probe).max(), np.complex64))
-    truth = transmission_object(nimg, nimg, contrast=4.1)
+    probe = apodize_probe(
+        xp.asarray(probe / xp.abs(probe).max(), dtype=xp.complex64)
+    )
+    truth = xp.asarray(transmission_object(nimg, nimg, contrast=4.1))
     mapid = map_frames(tx, ty, nx, nx, nimg, nimg)
 
     def intensities(xi_x, xi_y):
+        xi_x, xi_y = xp.asarray(xi_x), xp.asarray(xi_y)
         z = Splitc(truth, mapid) * shift_probe_fourier(probe, xi_x, xi_y)
-        return (np.abs(np.fft.fft2(z)) ** 2).astype(np.float64)
+        return (xp.abs(xp.fft.fft2(z)) ** 2).astype(xp.float64)
 
     return tx, ty, probe, nx, nimg, intensities
 
