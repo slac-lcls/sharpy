@@ -1091,10 +1091,10 @@ def drift_basis(model, translations_x, translations_y):
         for _ in range(order):
             c = tk - xp.mean(tk)                  # drop the gauge
             amp0 = float(xp.max(xp.abs(c)))
-            if cols:                              # project off what B already
-                A = xp.stack(cols, axis=1)        # spans -- least squares, not
-                coef = xp.linalg.lstsq(A, c, rcond=None)[0]   # sequential
-                c = c - A @ coef                  # Gram-Schmidt, because the
+            if cols:                              # project off the gauge and
+                A = xp.stack([xp.ones_like(c)] + cols, axis=1)  # existing basis
+                coef = xp.linalg.lstsq(A, c, rcond=None)[0]
+                c = c - A @ coef
             amp = float(xp.max(xp.abs(c)))        # s columns are not orthogonal
             tk_prev, tk = tk, 2.0 * t * tk - tk_prev       # Chebyshev recurrence
             if amp <= 1e-8 * max(amp0, 1e-30):
